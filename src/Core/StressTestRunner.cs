@@ -29,6 +29,7 @@ namespace WinParted.Core
                 RunStress4_CrossDiskCloneSafety(tempDir, log);
                 RunStress5_PartitionTableSafetyAndRecovery(tempDir, log);
                 RunStress6_AppleAndMacDataSafety(tempDir, log);
+                RunStress7_PhysicalDiskScriptAndFormatType(tempDir, log);
 
                 log("STRESS_TEST_ALL_PASSED");
                 return true;
@@ -588,6 +589,88 @@ namespace WinParted.Core
             VerifyDataPayloads(disk, disk.Partitions[2], hfsPayloads, "Classic HFS after MoveLeft+Relabel");
 
             log("  -> Stress 6 PASSED (APFS, HFS+, Classic HFS detection, GPT GUIDs, 100% payload & UUID integrity across grow/shrink/move/relabel).");
+        }
+
+        private static void RunStress7_PhysicalDiskScriptAndFormatType(string tempDir, Action<string> log)
+        {
+            log("[Stress 7] Physical USB Ext4 Format Scripts, MBR/GPT Type IDs & Superblock Reload...");
+
+            var fmtExt4 = new PendingOperation
+            {
+                Type = OperationType.FormatPartition,
+                TargetDiskNumber = 2,
+                TargetPartitionNumber = 1,
+                OriginalStartOffset = 1 * MiB,
+                OriginalLength = 16 * MiB,
+                NewFileSystem = FileSystemType.Ext4,
+                NewLabel = "USB-EXT4",
+                NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(FileSystemType.Ext4),
+                NewMbrType = RawDiskEngine.GetDefaultMbrType(FileSystemType.Ext4)
+            };
+
+            string gptScript = OperationQueueManager.BuildDiskPartScript(fmtExt4, PartitionTableStyle.GPT);
+            if (gptScript.IndexOf("select partition 1", StringComparison.OrdinalIgnoreCase) < 0 ||
+                gptScript.IndexOf("set id=0fc63daf-8483-4772-8e79-3d69d8477de4 override", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                throw new Exception("GPT Ext4 format DiskPart script missing Linux partition type GUID update: " + gptScript);
+            }
+
+            string mbrScript = OperationQueueManager.BuildDiskPartScript(fmtExt4, PartitionTableStyle.MBR);
+            if (mbrScript.IndexOf("select partition 1", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrScript.IndexOf("set id=83 override", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                throw new Exception("MBR Ext4 format DiskPart script missing 0x83 type ID update: " + mbrScript);
+            }
+
+            var createExt4 = MakeCreateOp(2, "", 1 * MiB, 16 * MiB, FileSystemType.Ext4, "USB-NEW-EXT4");
+            string mbrCreateScript = OperationQueueManager.BuildDiskPartScript(createExt4, PartitionTableStyle.MBR);
+            if (mbrCreateScript.IndexOf("create partition primary", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrCreateScript.IndexOf("set id=83 override", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                throw new Exception("MBR Ext4 create DiskPart script missing 0x83 type ID: " + mbrCreateScript);
+            }
+
+            // Simulate formatting an MBR FAT32 USB partition -> Ext4
+            string usbImg = Path.Combine(tempDir, "stress7_usb_mbr.img");
+            var usbDisk = RawDiskEngine.CreateBlankVirtualDisk(usbImg, 32 * MiB, PartitionTableStyle.MBR);
+            usbDisk.DiskNumber = 97;
+            var qm = new OperationQueueManager();
+            qm.SetBaselineDisks(null, new[] { usbDisk });
+            qm.Enqueue(MakeCreateOp(97, usbImg, 1 * MiB, 20 * MiB, FileSystemType.FAT32, "USBDRIVE"));
+            qm.ApplyAll();
+
+            usbDisk = RawDiskEngine.LoadVirtualDisk(usbImg, 97);
+            if (usbDisk.Partitions.Count != 1 || usbDisk.Partitions[0].FileSystem != FileSystemType.FAT32)
+                throw new Exception("Expected initial FAT32 partition on USB MBR image.");
+
+            qm.SetBaselineDisks(null, new[] { usbDisk });
+            qm.Enqueue(new PendingOperation
+            {
+                Type = OperationType.FormatPartition,
+                TargetDiskNumber = 97,
+                TargetDiskPath = usbImg,
+                TargetPartitionNumber = usbDisk.Partitions[0].PartitionNumber,
+                OriginalStartOffset = usbDisk.Partitions[0].StartingOffset,
+                OriginalLength = usbDisk.Partitions[0].PartitionLength,
+                NewFileSystem = FileSystemType.Ext4,
+                NewLabel = "USB-EXT4",
+                NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(FileSystemType.Ext4),
+                NewMbrType = RawDiskEngine.GetDefaultMbrType(FileSystemType.Ext4),
+                Summary = "Format USB FAT32 to Ext4"
+            });
+            qm.ApplyAll();
+
+            var formattedUsb = RawDiskEngine.LoadVirtualDisk(usbImg, 97);
+            if (formattedUsb.Partitions.Count != 1)
+                throw new Exception("Formatted USB image lost partition.");
+            var p = formattedUsb.Partitions[0];
+            if (p.FileSystem != FileSystemType.Ext4 || p.MbrPartitionType != 0x83 || p.Label != "USB-EXT4" || string.IsNullOrEmpty(p.UUID))
+            {
+                throw new Exception(string.Format("USB Ext4 format verification failed: FS={0}, MbrType=0x{1:X2}, Label='{2}', UUID='{3}'",
+                    p.FileSystem, p.MbrPartitionType, p.Label, p.UUID));
+            }
+
+            log("  -> Stress 7 PASSED (Physical USB GPT/MBR Ext4 format script & FAT32->Ext4 superblock/type verification).");
         }
 
         private static PendingOperation MakeCreateOp(int diskNum, string diskPath, long start, long len, FileSystemType fs, string label)

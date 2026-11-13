@@ -170,6 +170,17 @@ namespace WinParted.Models
         public static Color GetFillColor(FileSystemType fs)
         {
             Color border = GetBorderColor(fs);
+            if (WinParted.UI.ThemeManager.IsDarkMode)
+            {
+                if (fs == FileSystemType.Unallocated)
+                    return Color.FromArgb(36, 41, 52);
+                const int dr = 32, dg = 37, db = 47;
+                return Color.FromArgb(
+                    dr + (border.R - dr) * 35 / 100,
+                    dg + (border.G - dg) * 35 / 100,
+                    db + (border.B - db) * 35 / 100);
+            }
+
             if (fs == FileSystemType.Unallocated)
                 return Color.FromArgb(241, 245, 249);
             return Color.FromArgb(
@@ -181,6 +192,15 @@ namespace WinParted.Models
         public static Color GetUsedColor(FileSystemType fs)
         {
             Color border = GetBorderColor(fs);
+            if (WinParted.UI.ThemeManager.IsDarkMode)
+            {
+                const int dr = 32, dg = 37, db = 47;
+                return Color.FromArgb(
+                    dr + (border.R - dr) * 62 / 100,
+                    dg + (border.G - dg) * 62 / 100,
+                    db + (border.B - db) * 62 / 100);
+            }
+
             return Color.FromArgb(
                 Math.Min(255, border.R + (255 - border.R) * 2 / 5),
                 Math.Min(255, border.G + (255 - border.G) * 2 / 5),

@@ -33,9 +33,9 @@ namespace WinParted.UI
         {
             DoubleBuffered = true;
             ResizeRedraw = true;
-            MinimumSize = new Size(300, 96);
-            Height = 112;
-            BackColor = Color.FromArgb(248, 250, 252);
+            MinimumSize = new Size(300, 128);
+            Height = 136;
+            BackColor = ThemeManager.BackPrimary;
             _toolTip.AutoPopDelay = 8000;
             _toolTip.InitialDelay = 300;
         }
@@ -78,8 +78,8 @@ namespace WinParted.UI
             Rectangle outer = new Rectangle(8, 10, Width - 16, Height - 20);
             if (outer.Width <= 20 || outer.Height <= 20) return;
 
-            using (var bgBrush = new SolidBrush(Color.White))
-            using (var bgPen = new Pen(Color.FromArgb(203, 213, 225), 1))
+            using (var bgBrush = new SolidBrush(ThemeManager.BackSurface))
+            using (var bgPen = new Pen(ThemeManager.BorderColor, 1))
             {
                 g.FillRectangle(bgBrush, outer);
                 g.DrawRectangle(bgPen, outer);
@@ -88,7 +88,7 @@ namespace WinParted.UI
             if (_layout.Count == 0)
             {
                 using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                using (var br = new SolidBrush(Color.FromArgb(100, 116, 139)))
+                using (var br = new SolidBrush(ThemeManager.TextSecondary))
                     g.DrawString("No partitions or disk selected", Font, br, outer, sf);
                 return;
             }
@@ -103,9 +103,9 @@ namespace WinParted.UI
                 totalWeight += w;
             }
 
-            float innerPad = 5f;
+            float innerPad = 6f;
             float availWidth = outer.Width - innerPad * 2f;
-            float minSliceWidth = Math.Min(48f, availWidth / Math.Max(1, _layout.Count));
+            float minSliceWidth = Math.Min(96f, availWidth / Math.Max(1, _layout.Count));
 
             float[] widths = new float[_layout.Count];
             float sumWidths = 0;
@@ -156,7 +156,9 @@ namespace WinParted.UI
             {
                 if (part.IsUnallocated)
                 {
-                    using (var hatch = new HatchBrush(HatchStyle.BackwardDiagonal, Color.FromArgb(203, 213, 225), Color.FromArgb(241, 245, 249)))
+                    Color hatchFore = ThemeManager.IsDarkMode ? Color.FromArgb(62, 71, 89) : Color.FromArgb(203, 213, 225);
+                    Color hatchBack = ThemeManager.IsDarkMode ? Color.FromArgb(36, 41, 52) : Color.FromArgb(241, 245, 249);
+                    using (var hatch = new HatchBrush(HatchStyle.BackwardDiagonal, hatchFore, hatchBack))
                         g.FillPath(hatch, path);
                 }
                 else
@@ -179,12 +181,14 @@ namespace WinParted.UI
 
                 if (isHovered && !isSelected)
                 {
-                    using (var hoverBr = new SolidBrush(Color.FromArgb(24, 15, 23, 42)))
+                    Color hoverColor = ThemeManager.IsDarkMode ? Color.FromArgb(28, 255, 255, 255) : Color.FromArgb(24, 15, 23, 42);
+                    using (var hoverBr = new SolidBrush(hoverColor))
                         g.FillPath(hoverBr, path);
                 }
 
-                float penWidth = isSelected ? 3.0f : 1.6f;
-                Color penCol = isSelected ? Color.FromArgb(15, 23, 42) : borderColor;
+                float penWidth = isSelected ? 2.8f : 1.6f;
+                Color selectedPenCol = ThemeManager.IsDarkMode ? Color.FromArgb(248, 250, 252) : Color.FromArgb(15, 23, 42);
+                Color penCol = isSelected ? selectedPenCol : borderColor;
                 using (var pen = new Pen(penCol, penWidth))
                 {
                     if (part.IsUnallocated)
@@ -197,14 +201,15 @@ namespace WinParted.UI
                     RectangleF innerGlow = RectangleF.Inflate(rect, -2.5f, -2.5f);
                     if (innerGlow.Width > 4 && innerGlow.Height > 4)
                     {
-                        using (var innerPen = new Pen(Color.White, 1.5f))
+                        Color glowCol = ThemeManager.IsDarkMode ? ThemeManager.AccentBlue : Color.White;
+                        using (var innerPen = new Pen(glowCol, 1.5f))
                         using (var innerPath = CreateRoundedRect(innerGlow, 3f))
                             g.DrawPath(innerPen, innerPath);
                     }
                 }
 
-                // Draw labels if wide enough
-                if (rect.Width >= 42)
+                // Draw labels if wide enough using dynamic font height measurement
+                if (rect.Width >= 52)
                 {
                     string topText = part.IsUnallocated
                         ? "Unallocated"
@@ -216,20 +221,33 @@ namespace WinParted.UI
                     string midText = FileSystemColors.GetDisplayName(part.FileSystem);
                     string botText = ByteFormatter.FormatBytes(part.PartitionLength);
 
-                    using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Near, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
-                    using (var titleFont = new Font("Segoe UI", 8.5f, FontStyle.Bold))
-                    using (var subFont = new Font("Segoe UI", 7.5f, FontStyle.Regular))
-                    using (var darkBr = new SolidBrush(Color.FromArgb(15, 23, 42)))
-                    using (var mutedBr = new SolidBrush(Color.FromArgb(51, 65, 85)))
+                    using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+                    using (var titleFont = new Font("Segoe UI", 9f, FontStyle.Bold))
+                    using (var subFont = new Font("Segoe UI", 8.2f, FontStyle.Regular))
+                    using (var darkBr = new SolidBrush(ThemeManager.TextPrimary))
+                    using (var mutedBr = new SolidBrush(ThemeManager.TextSecondary))
                     {
-                        RectangleF r1 = new RectangleF(rect.X + 4, rect.Y + 8, rect.Width - 8, 18);
-                        RectangleF r2 = new RectangleF(rect.X + 4, rect.Y + 27, rect.Width - 8, 16);
-                        RectangleF r3 = new RectangleF(rect.X + 4, rect.Y + 45, rect.Width - 8, 16);
+                        float h1 = Math.Max(20f, titleFont.GetHeight(g) + 4f);
+                        float h2 = Math.Max(18f, subFont.GetHeight(g) + 3f);
+                        float h3 = h2;
+                        float totalH = (rect.Width >= 64) ? (h1 + h2 + h3 + 4f) : (h1 + h3 + 4f);
+                        float startY = rect.Y + Math.Max(4f, (rect.Height - totalH) / 2f);
 
+                        RectangleF r1 = new RectangleF(rect.X + 5, startY, rect.Width - 10, h1);
                         g.DrawString(topText, titleFont, darkBr, r1, sf);
-                        if (rect.Width >= 54)
+
+                        if (rect.Width >= 64)
+                        {
+                            RectangleF r2 = new RectangleF(rect.X + 5, startY + h1 + 2f, rect.Width - 10, h2);
+                            RectangleF r3 = new RectangleF(rect.X + 5, startY + h1 + h2 + 4f, rect.Width - 10, h3);
                             g.DrawString(midText, subFont, mutedBr, r2, sf);
-                        g.DrawString(botText, subFont, darkBr, r3, sf);
+                            g.DrawString(botText, subFont, darkBr, r3, sf);
+                        }
+                        else
+                        {
+                            RectangleF r3 = new RectangleF(rect.X + 5, startY + h1 + 2f, rect.Width - 10, h3);
+                            g.DrawString(botText, subFont, darkBr, r3, sf);
+                        }
                     }
                 }
             }

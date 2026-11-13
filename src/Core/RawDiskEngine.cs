@@ -64,15 +64,18 @@ namespace WinParted.Core
 
         public static void WriteBytes(DiskInfo disk, long offset, byte[] data)
         {
-            if (!disk.IsVirtualImage || string.IsNullOrEmpty(disk.BackingFilePath))
-                throw new InvalidOperationException("Direct raw byte writing is restricted to Virtual Disk images unless executed through elevated disk operations.");
-
-            using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath))
             {
-                fs.Seek(offset, SeekOrigin.Begin);
-                fs.Write(data, 0, data.Length);
-                fs.Flush();
+                using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                {
+                    fs.Seek(offset, SeekOrigin.Begin);
+                    fs.Write(data, 0, data.Length);
+                    fs.Flush();
+                }
+                return;
             }
+
+            Win32DiskInterop.WriteRawDiskSectors(disk.DevicePath, disk.DiskNumber, offset, data, disk.LogicalSectorSize);
         }
 
         public static DiskInfo LoadVirtualDisk(string filePath, int diskNumber)
@@ -741,7 +744,9 @@ namespace WinParted.Core
         public static void InspectPartitionSuperblock(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 4096) return;
+            if (!disk.IsVirtualImage && !disk.CanRawRead) return;
 
+            FileSystemType priorGuessedFs = part.FileSystem;
             int probeSize = (int)Math.Min(131072, part.PartitionLength);
             byte[] data;
             try
@@ -750,9 +755,14 @@ namespace WinParted.Core
             }
             catch
             {
+                part.FileSystem = priorGuessedFs;
                 return;
             }
-            if (data.Length < 512) return;
+            if (data.Length < 512)
+            {
+                part.FileSystem = priorGuessedFs;
+                return;
+            }
 
             // Check NTFS ("NTFS    " at +3)
             if (MatchesAscii(data, 3, "NTFS    "))
@@ -1104,16 +1114,32 @@ namespace WinParted.Core
                     long extUsed = part.UsedBytes ?? (long)(part.PartitionLength * 0.30);
                     uint usedBlocks = (uint)(extUsed / blockSize);
                     uint freeBlocks = blocksCount > usedBlocks ? blocksCount - usedBlocks : 0;
+                    uint inodesCount = Math.Max(128u, blocksCount / 4u);
+                    uint freeInodes = inodesCount > 11u ? inodesCount - 11u : inodesCount;
 
-                    BitConverter.GetBytes(blocksCount * 4).CopyTo(buf, 0x400);  // s_inodes_count
-                    BitConverter.GetBytes(blocksCount).CopyTo(buf, 0x404);      // s_blocks_count_lo
-                    BitConverter.GetBytes(freeBlocks).CopyTo(buf, 0x40C);       // s_free_blocks_count_lo
-                    BitConverter.GetBytes(2u).CopyTo(buf, 0x418);               // s_log_block_size = 2 => 4096
-                    BitConverter.GetBytes((ushort)0xEF53).CopyTo(buf, 0x438);   // s_magic
+                    BitConverter.GetBytes(inodesCount).CopyTo(buf, 0x400);              // s_inodes_count
+                    BitConverter.GetBytes(blocksCount).CopyTo(buf, 0x404);              // s_blocks_count_lo
+                    BitConverter.GetBytes(blocksCount / 20u).CopyTo(buf, 0x408);        // s_r_blocks_count_lo
+                    BitConverter.GetBytes(freeBlocks).CopyTo(buf, 0x40C);               // s_free_blocks_count_lo
+                    BitConverter.GetBytes(freeInodes).CopyTo(buf, 0x410);               // s_free_inodes_count
+                    BitConverter.GetBytes(2u).CopyTo(buf, 0x418);                       // s_log_block_size = 2 => 4096
+                    BitConverter.GetBytes(2u).CopyTo(buf, 0x41C);                       // s_log_cluster_size = 2
+                    BitConverter.GetBytes(32768u).CopyTo(buf, 0x420);                   // s_blocks_per_group
+                    BitConverter.GetBytes(32768u).CopyTo(buf, 0x424);                   // s_clusters_per_group
+                    BitConverter.GetBytes(Math.Min(inodesCount, 8192u)).CopyTo(buf, 0x428); // s_inodes_per_group
+                    BitConverter.GetBytes((ushort)0xFFFF).CopyTo(buf, 0x436);           // s_max_mnt_count
+                    BitConverter.GetBytes((ushort)0xEF53).CopyTo(buf, 0x438);           // s_magic
+                    BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x43A);                // s_state = clean
+                    BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x43C);                // s_errors = continue
+                    BitConverter.GetBytes(1u).CopyTo(buf, 0x44C);                       // s_rev_level = EXT4_DYNAMIC_REV
+                    BitConverter.GetBytes(11u).CopyTo(buf, 0x454);                      // s_first_ino
+                    BitConverter.GetBytes((ushort)256).CopyTo(buf, 0x458);              // s_inode_size
                     uint compat = (part.FileSystem == FileSystemType.Ext3 || part.FileSystem == FileSystemType.Ext4) ? 0x0004u : 0x0000u;
                     uint incompat = (part.FileSystem == FileSystemType.Ext4) ? 0x0242u : 0x0002u;
+                    uint roCompat = (part.FileSystem == FileSystemType.Ext4) ? 0x0003u : 0x0001u;
                     BitConverter.GetBytes(compat).CopyTo(buf, 0x45C);
                     BitConverter.GetBytes(incompat).CopyTo(buf, 0x460);
+                    BitConverter.GetBytes(roCompat).CopyTo(buf, 0x464);
 
                     Guid extUuid = Guid.NewGuid();
                     extUuid.ToByteArray().CopyTo(buf, 0x468);
@@ -1323,7 +1349,7 @@ namespace WinParted.Core
                 if (usedBlocks > newBlocks) usedBlocks = newBlocks;
                 uint newFree = newBlocks - usedBlocks;
 
-                BitConverter.GetBytes(newBlocks * 4).CopyTo(buf, 0x400);
+                BitConverter.GetBytes(Math.Max(128u, newBlocks / 4u)).CopyTo(buf, 0x400);
                 BitConverter.GetBytes(newBlocks).CopyTo(buf, 0x404);
                 BitConverter.GetBytes(newFree).CopyTo(buf, 0x40C);
                 part.UsedBytes = usedBlocks * (long)blockSize;
@@ -1612,9 +1638,6 @@ namespace WinParted.Core
 
         public static void WipeRange(DiskInfo disk, long startOffset, long length, WipePattern pattern)
         {
-            if (!disk.IsVirtualImage)
-                throw new InvalidOperationException("Direct wiping is enabled for Virtual Disk images.");
-
             const int chunkSize = 1048576;
             byte[] buf = new byte[chunkSize];
             var rng = new Random();
@@ -1624,20 +1647,41 @@ namespace WinParted.Core
                 for (int i = 0; i < buf.Length; i++) buf[i] = 0xFF;
             }
 
-            using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath))
             {
-                long written = 0;
-                while (written < length)
+                using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
                 {
-                    int n = (int)Math.Min(chunkSize, length - written);
-                    if (pattern == WipePattern.RandomDoD)
-                        rng.NextBytes(buf);
+                    long written = 0;
+                    while (written < length)
+                    {
+                        int n = (int)Math.Min(chunkSize, length - written);
+                        if (pattern == WipePattern.RandomDoD)
+                            rng.NextBytes(buf);
 
-                    fs.Seek(startOffset + written, SeekOrigin.Begin);
-                    fs.Write(buf, 0, n);
-                    written += n;
+                        fs.Seek(startOffset + written, SeekOrigin.Begin);
+                        fs.Write(buf, 0, n);
+                        written += n;
+                    }
+                    fs.Flush();
                 }
-                fs.Flush();
+                return;
+            }
+
+            long rawWritten = 0;
+            while (rawWritten < length)
+            {
+                int n = (int)Math.Min(chunkSize, length - rawWritten);
+                if (pattern == WipePattern.RandomDoD)
+                    rng.NextBytes(buf);
+
+                byte[] slice = buf;
+                if (n != buf.Length)
+                {
+                    slice = new byte[n];
+                    Array.Copy(buf, slice, n);
+                }
+                WriteBytes(disk, startOffset + rawWritten, slice);
+                rawWritten += n;
             }
         }
 
@@ -1694,7 +1738,7 @@ namespace WinParted.Core
             }
         }
 
-        private static byte GetDefaultMbrType(FileSystemType fs)
+        public static byte GetDefaultMbrType(FileSystemType fs)
         {
             switch (fs)
             {
