@@ -27,6 +27,8 @@ namespace WinParted.UI
         private Label _lblArchBadge;
         private Button _btnElevate;
         private CheckBox _chkSmartScale;
+        private CheckBox _chkDarkMode;
+        private ToolStripMenuItem _miDarkMode;
         private PartitionRibbonControl _ribbon;
         private Panel _deviceInfoPanel;
         private Label _lblDeviceInfo;
@@ -40,11 +42,11 @@ namespace WinParted.UI
         public MainForm()
         {
             Text = "WinParted — Windows Partition Manager (GParted Edition)";
-            Size = new Size(1220, 780);
-            MinimumSize = new Size(960, 620);
+            Size = new Size(1280, 820);
+            MinimumSize = new Size(1020, 660);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9f);
-            BackColor = Color.FromArgb(248, 250, 252);
+            BackColor = ThemeManager.BackPrimary;
 
             BuildUi();
             LoadInitialDisks();
@@ -74,8 +76,16 @@ namespace WinParted.UI
             miDeviceInfo.CheckedChanged += (s, e) => _deviceInfoPanel.Visible = miDeviceInfo.Checked;
             var miSmartScale = new ToolStripMenuItem("Smart Partition Scale") { Checked = true, CheckOnClick = true };
             miSmartScale.CheckedChanged += (s, e) => { _chkSmartScale.Checked = miSmartScale.Checked; _ribbon.SmartScale = miSmartScale.Checked; };
+            _miDarkMode = new ToolStripMenuItem("Dark Mode (Easy on Eyes)") { Checked = ThemeManager.IsDarkMode, CheckOnClick = true };
+            _miDarkMode.CheckedChanged += (s, e) =>
+            {
+                if (_miDarkMode.Checked != ThemeManager.IsDarkMode)
+                    ThemeManager.ToggleTheme();
+            };
             mView.DropDownItems.Add(miDeviceInfo);
             mView.DropDownItems.Add(miSmartScale);
+            mView.DropDownItems.Add(new ToolStripSeparator());
+            mView.DropDownItems.Add(_miDarkMode);
 
             var mDevice = new ToolStripMenuItem("Device");
             mDevice.DropDownItems.Add("Create Partition Table (GPT)...", null, (s, e) => QueueCreatePartitionTable(PartitionTableStyle.GPT));
@@ -117,49 +127,75 @@ namespace WinParted.UI
             MainMenuStrip = menu;
 
             // 2. Top Drive Bar
-            var topPanel = new Panel { Dock = DockStyle.Top, Height = 44, BackColor = Color.White, Padding = new Padding(8, 7, 8, 6) };
-            topPanel.Controls.Add(new Label { Text = "Drive:", Location = new Point(10, 12), AutoSize = true, Font = new Font("Segoe UI", 9.5f, FontStyle.Bold) });
+            var topPanel = new Panel { Dock = DockStyle.Top, Height = 48, Tag = "SurfacePanel" };
+            var topFlow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Padding = new Padding(8, 7, 8, 5)
+            };
+            topPanel.Controls.Add(topFlow);
 
-            _cmbDrives = new ComboBox { Location = new Point(58, 9), Width = 440, DropDownStyle = ComboBoxStyle.DropDownList };
+            topFlow.Controls.Add(new Label { Text = "Drive:", AutoSize = true, Margin = new Padding(2, 7, 6, 0), Font = new Font("Segoe UI", 9.5f, FontStyle.Bold) });
+
+            _cmbDrives = new ComboBox { Width = 380, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 4, 12, 0) };
             _cmbDrives.SelectedIndexChanged += (s, e) => OnDriveSelected();
-            topPanel.Controls.Add(_cmbDrives);
+            topFlow.Controls.Add(_cmbDrives);
 
-            _chkSmartScale = new CheckBox { Text = "Smart Scale", Location = new Point(512, 11), AutoSize = true, Checked = true };
+            _chkSmartScale = new CheckBox { Text = "Smart Scale", AutoSize = true, Checked = true, Margin = new Padding(0, 6, 12, 0) };
             _chkSmartScale.CheckedChanged += (s, e) => { if (_ribbon != null) _ribbon.SmartScale = _chkSmartScale.Checked; };
-            topPanel.Controls.Add(_chkSmartScale);
+            topFlow.Controls.Add(_chkSmartScale);
+
+            _chkDarkMode = new CheckBox { Text = "Dark Mode", AutoSize = true, Checked = ThemeManager.IsDarkMode, Margin = new Padding(0, 6, 14, 0) };
+            _chkDarkMode.CheckedChanged += (s, e) =>
+            {
+                if (_chkDarkMode.Checked != ThemeManager.IsDarkMode)
+                    ThemeManager.ToggleTheme();
+            };
+            topFlow.Controls.Add(_chkDarkMode);
 
             _lblArchBadge = new Label
             {
                 Text = Win32DiskInterop.GetArchitectureBadge(),
-                Location = new Point(620, 12),
                 AutoSize = true,
-                ForeColor = Win32DiskInterop.IsAdministrator() ? Color.FromArgb(22, 101, 52) : Color.FromArgb(180, 83, 9),
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
+                Margin = new Padding(0, 7, 14, 0),
+                ForeColor = Win32DiskInterop.IsAdministrator() ? ThemeManager.AccentGreen : ThemeManager.AccentAmber,
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                Tag = "KeepForeColor"
             };
-            topPanel.Controls.Add(_lblArchBadge);
+            topFlow.Controls.Add(_lblArchBadge);
 
             _btnElevate = new Button
             {
                 Text = "Run as Admin",
-                Location = new Point(920, 8),
-                Size = new Size(105, 26),
+                AutoSize = true,
+                MinimumSize = new Size(108, 28),
+                Padding = new Padding(8, 2, 8, 2),
+                Margin = new Padding(0, 2, 8, 0),
                 Visible = !Win32DiskInterop.IsAdministrator(),
-                BackColor = Color.FromArgb(254, 243, 199),
-                FlatStyle = FlatStyle.Flat
+                Tag = "ElevateButton"
             };
             _btnElevate.Click += (s, e) =>
             {
                 if (Win32DiskInterop.RelaunchAsAdministrator())
                     Close();
             };
-            topPanel.Controls.Add(_btnElevate);
+            topFlow.Controls.Add(_btnElevate);
 
-            var btnNewDemo = new Button { Text = "Reset Demo Disk", Location = new Point(1035, 8), Size = new Size(125, 26) };
+            var btnNewDemo = new Button
+            {
+                Text = "Reset Demo Disk",
+                AutoSize = true,
+                MinimumSize = new Size(128, 28),
+                Padding = new Padding(8, 2, 8, 2),
+                Margin = new Padding(0, 2, 0, 0)
+            };
             btnNewDemo.Click += (s, e) => CreateAndMountDemoDisk();
-            topPanel.Controls.Add(btnNewDemo);
+            topFlow.Controls.Add(btnNewDemo);
 
             // 3. Action ToolStrip
-            var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, BackColor = Color.FromArgb(241, 245, 249), Padding = new Padding(4, 2, 4, 2) };
+            var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(4, 3, 4, 3) };
             _tbNew = new ToolStripButton("New", null, (s, e) => QueueNewPartition()) { ToolTipText = "Create new partition in unallocated space" };
             _tbDelete = new ToolStripButton("Delete", null, (s, e) => QueueDeletePartition()) { ToolTipText = "Delete selected partition" };
             _tbResize = new ToolStripButton("Resize/Move", null, (s, e) => QueueResizeMovePartition()) { ToolTipText = "Resize or move selected partition" };
@@ -169,7 +205,7 @@ namespace WinParted.UI
             _tbFlags = new ToolStripButton("Flags", null, (s, e) => QueueManageFlags());
             _tbWipe = new ToolStripButton("Wipe", null, (s, e) => QueueWipePartition());
             _tbUndo = new ToolStripButton("Undo", null, (s, e) => UndoOperation());
-            _tbApply = new ToolStripButton("Apply All", null, (s, e) => ApplyOperations()) { Font = new Font("Segoe UI", 9f, FontStyle.Bold), ForeColor = Color.FromArgb(22, 163, 74) };
+            _tbApply = new ToolStripButton("Apply All", null, (s, e) => ApplyOperations()) { Font = new Font("Segoe UI", 9f, FontStyle.Bold), ForeColor = ThemeManager.AccentGreen, Tag = "ApplyHighlight" };
             var tbHex = new ToolStripButton("Hex/LBA", null, (s, e) => OpenHexInspector());
             var tbAlign = new ToolStripButton("4K Audit", null, (s, e) => OpenAlignmentAudit());
             var tbRefresh = new ToolStripButton("Refresh", null, (s, e) => RefreshAllDisks());
@@ -184,7 +220,7 @@ namespace WinParted.UI
             });
 
             // 4. Visual Ribbon
-            _ribbon = new PartitionRibbonControl { Dock = DockStyle.Top, Height = 114 };
+            _ribbon = new PartitionRibbonControl { Dock = DockStyle.Top, Height = 136 };
             _ribbon.SelectedPartitionChanged += (s, part) => OnRibbonSelectionChanged(part);
             _ribbon.PartitionDoubleClicked += (s, part) =>
             {
@@ -201,11 +237,11 @@ namespace WinParted.UI
             // 5. Device Info Side Panel + Main Split
             var centerContainer = new Panel { Dock = DockStyle.Fill };
 
-            _deviceInfoPanel = new Panel { Dock = DockStyle.Left, Width = 240, BackColor = Color.White, Padding = new Padding(10), BorderStyle = BorderStyle.FixedSingle };
-            _lblDeviceInfo = new Label { Dock = DockStyle.Fill, Font = new Font("Segoe UI", 8.5f), ForeColor = Color.FromArgb(30, 41, 59) };
+            _deviceInfoPanel = new Panel { Dock = DockStyle.Left, Width = 275, AutoScroll = true, Padding = new Padding(10), BorderStyle = BorderStyle.FixedSingle, Tag = "SurfacePanel" };
+            _lblDeviceInfo = new Label { Location = new Point(10, 10), AutoSize = true, MaximumSize = new Size(245, 0), Font = new Font("Segoe UI", 8.8f) };
             _deviceInfoPanel.Controls.Add(_lblDeviceInfo);
 
-            var mainSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 310 };
+            var mainSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 330 };
 
             _gridPartitions = new DataGridView
             {
@@ -213,13 +249,18 @@ namespace WinParted.UI
                 ReadOnly = true,
                 AllowUserToAddRows = false,
                 AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 MultiSelect = false,
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
                 RowHeadersVisible = false,
-                BackgroundColor = Color.White,
-                BorderStyle = BorderStyle.None
+                BorderStyle = BorderStyle.None,
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+                ColumnHeadersHeight = 40
             };
+            _gridPartitions.RowTemplate.Height = 36;
+            _gridPartitions.DefaultCellStyle.Padding = new Padding(6, 4, 6, 4);
+            _gridPartitions.DefaultCellStyle.WrapMode = DataGridViewTriState.False;
             _gridPartitions.Columns.Add("Partition", "Partition");
             _gridPartitions.Columns.Add("Name", "Name / Letter");
             _gridPartitions.Columns.Add("FS", "File System");
@@ -231,6 +272,17 @@ namespace WinParted.UI
             _gridPartitions.Columns.Add("Align", "Alignment");
             _gridPartitions.Columns.Add("LBA", "LBA Range");
 
+            SetGridColumnSizing("Partition", 105, 95);
+            SetGridColumnSizing("Name", 125, 115);
+            SetGridColumnSizing("FS", 120, 105);
+            SetGridColumnSizing("Label", 115, 110);
+            SetGridColumnSizing("Size", 85, 80);
+            SetGridColumnSizing("Used", 85, 80);
+            SetGridColumnSizing("Unused", 85, 80);
+            SetGridColumnSizing("Flags", 110, 100);
+            SetGridColumnSizing("Align", 95, 90);
+            SetGridColumnSizing("LBA", 135, 125);
+
             _gridPartitions.SelectionChanged += (s, e) => OnGridSelectionChanged();
             _gridPartitions.CellPainting += OnGridCellPainting;
             _gridPartitions.MouseDown += OnGridMouseDown;
@@ -238,8 +290,8 @@ namespace WinParted.UI
             mainSplit.Panel1.Controls.Add(_gridPartitions);
 
             // Pending Operations Bottom Panel
-            var opsHeader = new Panel { Dock = DockStyle.Top, Height = 28, BackColor = Color.FromArgb(241, 245, 249), Padding = new Padding(8, 4, 8, 4) };
-            opsHeader.Controls.Add(new Label { Text = "Pending Operations Queue (Changes are staged safely until you click 'Apply All')", Dock = DockStyle.Left, AutoSize = true, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold) });
+            var opsHeader = new Panel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(8, 6, 8, 4), Tag = "ElevatedPanel" };
+            opsHeader.Controls.Add(new Label { Text = "Pending Operations Queue (Changes are staged safely until you click 'Apply All')", Dock = DockStyle.Left, AutoSize = true, Font = new Font("Segoe UI", 8.8f, FontStyle.Bold) });
 
             _lvOperations = new ListView
             {
@@ -248,11 +300,11 @@ namespace WinParted.UI
                 FullRowSelect = true,
                 GridLines = true
             };
-            _lvOperations.Columns.Add("#", 40);
-            _lvOperations.Columns.Add("Target Disk", 110);
-            _lvOperations.Columns.Add("Operation Summary", 330);
-            _lvOperations.Columns.Add("Details", 390);
-            _lvOperations.Columns.Add("Risk", 80);
+            _lvOperations.Columns.Add("#", 44);
+            _lvOperations.Columns.Add("Target Disk", 115);
+            _lvOperations.Columns.Add("Operation Summary", 340);
+            _lvOperations.Columns.Add("Details", 400);
+            _lvOperations.Columns.Add("Risk", 90);
             _lvOperations.DoubleClick += (s, e) =>
             {
                 if (_lvOperations.SelectedItems.Count > 0 && _lvOperations.SelectedItems[0].Tag is PendingOperation)
@@ -269,8 +321,8 @@ namespace WinParted.UI
             centerContainer.Controls.Add(_deviceInfoPanel);
 
             // 6. Status Bar
-            var statusPanel = new Panel { Dock = DockStyle.Bottom, Height = 24, BackColor = Color.FromArgb(226, 232, 240), Padding = new Padding(8, 3, 8, 3) };
-            _lblStatus = new Label { Dock = DockStyle.Fill, Text = "Ready", Font = new Font("Segoe UI", 8.5f) };
+            var statusPanel = new Panel { Dock = DockStyle.Bottom, Height = 28, Padding = new Padding(8, 4, 8, 4), Tag = "StatusBar" };
+            _lblStatus = new Label { Dock = DockStyle.Fill, Text = "Ready", Font = new Font("Segoe UI", 8.8f), TextAlign = ContentAlignment.MiddleLeft };
             statusPanel.Controls.Add(_lblStatus);
 
             // Context Menu
@@ -296,6 +348,51 @@ namespace WinParted.UI
             Controls.Add(topPanel);
             Controls.Add(menu);
             Controls.Add(statusPanel);
+
+            ThemeManager.ThemeChanged += OnThemeChangedHandler;
+            FormClosed += (s, e) => ThemeManager.ThemeChanged -= OnThemeChangedHandler;
+            ApplyMainFormTheme();
+        }
+
+        private void OnThemeChangedHandler(object sender, EventArgs e)
+        {
+            ApplyMainFormTheme();
+        }
+
+        private void SetGridColumnSizing(string colName, int minWidth, float fillWeight)
+        {
+            var col = _gridPartitions.Columns[colName];
+            if (col != null)
+            {
+                col.MinimumWidth = minWidth;
+                col.FillWeight = fillWeight;
+            }
+        }
+
+        private void ApplyMainFormTheme()
+        {
+            ThemeManager.ApplyTheme(this);
+            ThemeManager.ApplyContextMenu(_partContextMenu);
+            if (_miDarkMode != null && _miDarkMode.Checked != ThemeManager.IsDarkMode)
+                _miDarkMode.Checked = ThemeManager.IsDarkMode;
+            if (_chkDarkMode != null && _chkDarkMode.Checked != ThemeManager.IsDarkMode)
+                _chkDarkMode.Checked = ThemeManager.IsDarkMode;
+            if (_lblArchBadge != null)
+                _lblArchBadge.ForeColor = Win32DiskInterop.IsAdministrator() ? ThemeManager.AccentGreen : ThemeManager.AccentAmber;
+            if (_tbApply != null)
+                _tbApply.ForeColor = ThemeManager.AccentGreen;
+
+            if (_gridPartitions != null)
+            {
+                foreach (DataGridViewRow row in _gridPartitions.Rows)
+                {
+                    var p = row.Tag as PartitionEntry;
+                    if (p != null)
+                        row.DefaultCellStyle.ForeColor = p.IsUnallocated ? ThemeManager.TextSecondary : ThemeManager.TextPrimary;
+                }
+            }
+            if (_ribbon != null)
+                _ribbon.Invalidate();
         }
 
         private void LoadInitialDisks()
@@ -485,9 +582,9 @@ namespace WinParted.UI
                         string.Format("{0:N0}..{1:N0}", p.StartLba, p.EndLba)
                     );
                     var row = _gridPartitions.Rows[rowIdx];
+                    row.Height = 36;
                     row.Tag = p;
-                    if (p.IsUnallocated)
-                        row.DefaultCellStyle.ForeColor = Color.FromArgb(100, 116, 139);
+                    row.DefaultCellStyle.ForeColor = p.IsUnallocated ? ThemeManager.TextSecondary : ThemeManager.TextPrimary;
                     if (remembered != null && p.StartingOffset == remembered.StartingOffset && p.PartitionLength == remembered.PartitionLength)
                         rowToSelect = row;
                 }
@@ -517,14 +614,18 @@ namespace WinParted.UI
                 var p = _gridPartitions.Rows[e.RowIndex].Tag as PartitionEntry;
                 if (p == null) return;
                 e.Paint(e.CellBounds, DataGridViewPaintParts.All & ~DataGridViewPaintParts.ContentForeground);
-                Rectangle swatch = new Rectangle(e.CellBounds.X + 6, e.CellBounds.Y + 5, 12, e.CellBounds.Height - 10);
+                int swatchSize = 14;
+                int swatchY = e.CellBounds.Y + Math.Max(4, (e.CellBounds.Height - swatchSize) / 2);
+                Rectangle swatch = new Rectangle(e.CellBounds.X + 8, swatchY, swatchSize, swatchSize);
                 using (var br = new SolidBrush(FileSystemColors.GetBorderColor(p.FileSystem)))
                     e.Graphics.FillRectangle(br, swatch);
-                using (var pen = new Pen(Color.FromArgb(71, 85, 105)))
+                using (var pen = new Pen(ThemeManager.BorderColor))
                     e.Graphics.DrawRectangle(pen, swatch);
 
-                Rectangle textRect = new Rectangle(e.CellBounds.X + 24, e.CellBounds.Y, e.CellBounds.Width - 26, e.CellBounds.Height);
-                TextRenderer.DrawText(e.Graphics, Convert.ToString(e.FormattedValue), e.CellStyle.Font, textRect, e.CellStyle.ForeColor,
+                bool isSelected = (e.State & DataGridViewElementStates.Selected) != 0;
+                Color textColor = isSelected ? e.CellStyle.SelectionForeColor : e.CellStyle.ForeColor;
+                Rectangle textRect = new Rectangle(e.CellBounds.X + 28, e.CellBounds.Y, Math.Max(10, e.CellBounds.Width - 32), e.CellBounds.Height);
+                TextRenderer.DrawText(e.Graphics, Convert.ToString(e.FormattedValue), e.CellStyle.Font, textRect, textColor,
                     TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
                 e.Handled = true;
             }
@@ -688,6 +789,7 @@ namespace WinParted.UI
                         NewLabel = dlg.ResultLabel,
                         NewPartitionName = dlg.ResultPartitionName,
                         NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(dlg.ResultFileSystem),
+                        NewMbrType = RawDiskEngine.GetDefaultMbrType(dlg.ResultFileSystem),
                         Summary = string.Format("Create {0} partition ({1}) on {2}",
                             FileSystemColors.GetDisplayName(dlg.ResultFileSystem), ByteFormatter.FormatBytes(dlg.ResultLengthBytes),
                             _currentPreviewDisk.IsVirtualImage ? "Virtual Disk" : "Disk " + _currentPreviewDisk.DiskNumber),
@@ -765,21 +867,38 @@ namespace WinParted.UI
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
 
-            using (var dlg = new Form { Text = "Format Partition — " + sel.ShortDeviceName, Size = new Size(380, 210), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false })
+            using (var dlg = new Form { Text = "Format Partition — " + sel.ShortDeviceName, Size = new Size(440, 230), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
             {
-                dlg.Controls.Add(new Label { Text = "File system:", Location = new Point(16, 20), AutoSize = true });
-                var cmbFs = new ComboBox { Location = new Point(120, 17), Width = 220, DropDownStyle = ComboBoxStyle.DropDownList };
+                var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+                dlg.Controls.Add(root);
+
+                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 44, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 0) };
+                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(92, 30), Margin = new Padding(8, 0, 0, 0) };
+                var btnOk = new Button { Text = "Queue Format", DialogResult = DialogResult.OK, Size = new Size(110, 30), Tag = "PrimaryButton" };
+                btnFlow.Controls.Add(btnCancel);
+                btnFlow.Controls.Add(btnOk);
+                root.Controls.Add(btnFlow);
+
+                var tbl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
+                tbl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+                tbl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+                tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                root.Controls.Add(tbl);
+
+                tbl.Controls.Add(new Label { Text = "File system:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 0);
+                var cmbFs = new ComboBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 6, 0, 8) };
                 cmbFs.Items.AddRange(new object[] { FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.exFAT, FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Btrfs, FileSystemType.XFS, FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS });
                 cmbFs.SelectedIndex = 0;
-                dlg.Controls.Add(cmbFs);
+                tbl.Controls.Add(cmbFs, 1, 0);
 
-                dlg.Controls.Add(new Label { Text = "Volume label:", Location = new Point(16, 56), AutoSize = true });
-                var txtLbl = new TextBox { Location = new Point(120, 53), Width = 220, Text = sel.Label };
-                dlg.Controls.Add(txtLbl);
+                tbl.Controls.Add(new Label { Text = "Volume label:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 1);
+                var txtLbl = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Text = sel.Label, Margin = new Padding(0, 6, 0, 8) };
+                tbl.Controls.Add(txtLbl, 1, 1);
 
-                var btnOk = new Button { Text = "Queue Format", DialogResult = DialogResult.OK, Location = new Point(156, 115), Size = new Size(92, 30) };
-                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(254, 115), Size = new Size(86, 30) };
-                dlg.Controls.AddRange(new Control[] { btnOk, btnCancel });
+                dlg.AcceptButton = btnOk;
+                dlg.CancelButton = btnCancel;
+                ThemeManager.ApplyTheme(dlg);
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
                     var fs = (FileSystemType)cmbFs.SelectedItem;
@@ -794,6 +913,7 @@ namespace WinParted.UI
                         NewFileSystem = fs,
                         NewLabel = txtLbl.Text.Trim(),
                         NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(fs),
+                        NewMbrType = RawDiskEngine.GetDefaultMbrType(fs),
                         Summary = string.Format("Format {0} as {1}", sel.ShortDeviceName, FileSystemColors.GetDisplayName(fs)),
                         DetailDescription = string.Format("Label: '{0}'", txtLbl.Text.Trim()),
                         RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "High"
@@ -807,19 +927,36 @@ namespace WinParted.UI
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
 
-            using (var dlg = new Form { Text = "Label Partition — " + sel.ShortDeviceName, Size = new Size(380, 190), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false })
+            using (var dlg = new Form { Text = "Label Partition — " + sel.ShortDeviceName, Size = new Size(440, 220), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
             {
-                dlg.Controls.Add(new Label { Text = "Volume Label:", Location = new Point(16, 20), AutoSize = true });
-                var txtLbl = new TextBox { Location = new Point(120, 17), Width = 220, Text = sel.Label };
-                dlg.Controls.Add(txtLbl);
+                var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+                dlg.Controls.Add(root);
 
-                dlg.Controls.Add(new Label { Text = "GPT Name:", Location = new Point(16, 54), AutoSize = true });
-                var txtName = new TextBox { Location = new Point(120, 51), Width = 220, Text = sel.PartitionName, Enabled = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT };
-                dlg.Controls.Add(txtName);
+                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 44, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 0) };
+                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(90, 30), Margin = new Padding(8, 0, 0, 0) };
+                var btnOk = new Button { Text = "OK", DialogResult = DialogResult.OK, Size = new Size(90, 30), Tag = "PrimaryButton" };
+                btnFlow.Controls.Add(btnCancel);
+                btnFlow.Controls.Add(btnOk);
+                root.Controls.Add(btnFlow);
 
-                var btnOk = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(166, 100), Size = new Size(84, 28) };
-                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(256, 100), Size = new Size(84, 28) };
-                dlg.Controls.AddRange(new Control[] { btnOk, btnCancel });
+                var tbl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
+                tbl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+                tbl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+                tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                root.Controls.Add(tbl);
+
+                tbl.Controls.Add(new Label { Text = "Volume Label:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 0);
+                var txtLbl = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Text = sel.Label, Margin = new Padding(0, 6, 0, 8) };
+                tbl.Controls.Add(txtLbl, 1, 0);
+
+                tbl.Controls.Add(new Label { Text = "GPT Name:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 1);
+                var txtName = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Text = sel.PartitionName, Enabled = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT, Margin = new Padding(0, 6, 0, 8) };
+                tbl.Controls.Add(txtName, 1, 1);
+
+                dlg.AcceptButton = btnOk;
+                dlg.CancelButton = btnCancel;
+                ThemeManager.ApplyTheme(dlg);
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
                     TryEnqueue(new PendingOperation
@@ -1083,10 +1220,11 @@ namespace WinParted.UI
         private void ExportDiskPartScript()
         {
             string script = _queueManager.ExportFullDiskPartScript();
-            using (var dlg = new Form { Text = "Generated Windows DiskPart Script", Size = new Size(640, 420), StartPosition = FormStartPosition.CenterParent })
+            using (var dlg = new Form { Text = "Generated Windows DiskPart Script", Size = new Size(660, 440), StartPosition = FormStartPosition.CenterParent })
             {
                 var txt = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, Font = new Font("Consolas", 9.5f), Text = script };
                 dlg.Controls.Add(txt);
+                ThemeManager.ApplyTheme(dlg);
                 dlg.ShowDialog(this);
             }
         }

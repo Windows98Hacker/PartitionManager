@@ -163,7 +163,7 @@ namespace WinParted.Core
                         GptTypeGuid = op.NewGptTypeGuid != Guid.Empty ? op.NewGptTypeGuid : GptPartitionTypeGuids.ForFileSystem(op.NewFileSystem),
                         GptPartitionGuid = Guid.NewGuid(),
                         GptAttributes = op.NewGptAttributes,
-                        MbrPartitionType = op.NewMbrType,
+                        MbrPartitionType = op.NewMbrType != 0 ? op.NewMbrType : RawDiskEngine.GetDefaultMbrType(op.NewFileSystem),
                         MbrBootable = op.NewMbrBoot,
                         UsedBytes = 0,
                         FreeBytes = op.Length
@@ -201,6 +201,7 @@ namespace WinParted.Core
                         else
                             targetFmt.GptTypeGuid = GptPartitionTypeGuids.ForFileSystem(op.NewFileSystem);
                         targetFmt.FlagsSummary = Win32DiskInterop.FormatGptFlags(targetFmt.GptTypeGuid, targetFmt.GptAttributes);
+                        targetFmt.MbrPartitionType = op.NewMbrType != 0 ? op.NewMbrType : RawDiskEngine.GetDefaultMbrType(op.NewFileSystem);
                         targetFmt.UsedBytes = 0;
                         targetFmt.FreeBytes = targetFmt.PartitionLength;
                     }
@@ -313,6 +314,9 @@ namespace WinParted.Core
                 {
                     ExecutePhysicalDiskOperation(disk, op);
                     log.Add("[OK] Physical Disk: " + op.Summary);
+                    var freshPhysical = Win32DiskInterop.EnumeratePhysicalDisks();
+                    var virtuals = _baselineDisks.Where(d => d.IsVirtualImage).ToList();
+                    SetBaselineDisks(freshPhysical, virtuals);
                 }
 
                 executed.Add(op);
@@ -445,15 +449,63 @@ namespace WinParted.Core
             if (!Win32DiskInterop.IsAdministrator())
                 throw new UnauthorizedAccessException("Administrator privileges are required to modify live physical disks. Relaunch as Administrator or test safely using a Virtual Disk (.img).");
 
+            var targetPart = disk.Partitions.FirstOrDefault(p => Math.Abs(p.StartingOffset - op.OriginalStartOffset) < 2L * 1048576L)
+                             ?? disk.Partitions.FirstOrDefault(p => p.PartitionNumber == op.TargetPartitionNumber);
+            if (targetPart != null)
+                op.TargetPartitionNumber = targetPart.PartitionNumber;
+
             // Protect active system boot partition
-            var targetPart = disk.Partitions.FirstOrDefault(p => p.StartingOffset == op.OriginalStartOffset);
             if (targetPart != null && targetPart.IsSystemOrBoot &&
                 (op.Type == OperationType.DeletePartition || op.Type == OperationType.FormatPartition || op.Type == OperationType.WipePartition || op.Type == OperationType.CreatePartitionTable))
             {
                 throw new InvalidOperationException("Safety Guardrail: Cannot delete, format, or wipe the active Windows boot/system partition while Windows is running on it.");
             }
 
-            string script = string.IsNullOrEmpty(op.DiskPartScript) ? BuildDiskPartScript(op) : op.DiskPartScript;
+            if (op.Type == OperationType.ChangeLabel)
+            {
+                if (targetPart == null)
+                    throw new InvalidOperationException("Target partition was not found for relabeling.");
+                string targetFs = MapDiskPartFs(targetPart.FileSystem);
+                if (!string.IsNullOrEmpty(targetFs) && !string.IsNullOrEmpty(targetPart.DriveLetter))
+                {
+                    if (!Win32DiskInterop.SetVolumeLabel(targetPart.DriveLetter.TrimEnd('\\') + "\\", op.NewLabel ?? string.Empty))
+                        throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(), "SetVolumeLabel failed.");
+                }
+                else
+                {
+                    Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, false);
+                    targetPart.Label = op.NewLabel ?? string.Empty;
+                    RawDiskEngine.UpdateFileSystemLabelInPlace(disk, targetPart);
+                }
+                return;
+            }
+
+            if (op.Type == OperationType.WipePartition)
+            {
+                if (targetPart == null)
+                    throw new InvalidOperationException("Target partition was not found for wiping.");
+                Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
+                RawDiskEngine.WipeRange(disk, targetPart.StartingOffset, targetPart.PartitionLength, op.WipePattern);
+                return;
+            }
+
+            string mappedFs = MapDiskPartFs(op.NewFileSystem);
+            bool isNonWindowsCreateOrFormat =
+                (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition) &&
+                string.IsNullOrEmpty(mappedFs) &&
+                op.NewFileSystem != FileSystemType.MicrosoftReserved;
+
+            if (op.Type == OperationType.FormatPartition && isNonWindowsCreateOrFormat && targetPart != null)
+            {
+                Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
+                targetPart.FileSystem = op.NewFileSystem;
+                targetPart.Label = op.NewLabel ?? string.Empty;
+                targetPart.UsedBytes = 0;
+                targetPart.FreeBytes = targetPart.PartitionLength;
+                RawDiskEngine.WriteFileSystemHeader(disk, targetPart);
+            }
+
+            string script = string.IsNullOrEmpty(op.DiskPartScript) ? BuildDiskPartScript(op, disk.PartitionStyle) : op.DiskPartScript;
             string tempScript = Path.Combine(Path.GetTempPath(), "winparted_" + Guid.NewGuid().ToString("N") + ".txt");
             try
             {
@@ -483,14 +535,60 @@ namespace WinParted.Core
                     try { File.Delete(tempScript); } catch { }
                 }
             }
+
+            if (isNonWindowsCreateOrFormat)
+            {
+                var liveDisks = Win32DiskInterop.EnumeratePhysicalDisks();
+                var liveDisk = liveDisks.FirstOrDefault(d => d.DiskNumber == disk.DiskNumber) ?? disk;
+                long expectedStart = op.Type == OperationType.CreatePartition
+                    ? op.StartOffset
+                    : (targetPart != null ? targetPart.StartingOffset : op.OriginalStartOffset);
+
+                var livePart = liveDisk.Partitions
+                    .Where(p => !p.IsUnallocated)
+                    .OrderBy(p => Math.Abs(p.StartingOffset - expectedStart))
+                    .FirstOrDefault();
+
+                if (livePart == null)
+                    throw new InvalidOperationException("Unable to locate target partition on Disk " + disk.DiskNumber + " after DiskPart layout update.");
+
+                liveDisk.CanRawRead = true;
+                RawDiskEngine.InspectPartitionSuperblock(liveDisk, livePart);
+
+                if (op.Type == OperationType.CreatePartition ||
+                    (op.NewFileSystem != FileSystemType.RAW && livePart.FileSystem != op.NewFileSystem))
+                {
+                    Win32DiskInterop.PreparePartitionForRawWrite(liveDisk.DiskNumber, livePart.StartingOffset, true);
+                    livePart.FileSystem = op.NewFileSystem;
+                    livePart.Label = op.NewLabel ?? string.Empty;
+                    livePart.UsedBytes = 0;
+                    livePart.FreeBytes = livePart.PartitionLength;
+                    RawDiskEngine.WriteFileSystemHeader(liveDisk, livePart);
+                    RawDiskEngine.InspectPartitionSuperblock(liveDisk, livePart);
+                }
+
+                if (op.NewFileSystem != FileSystemType.RAW && livePart.FileSystem != op.NewFileSystem)
+                {
+                    throw new InvalidDataException(string.Format(
+                        "Post-format verification failed on Disk {0} Part #{1}: expected {2}, read back {3}.",
+                        liveDisk.DiskNumber, livePart.PartitionNumber, op.NewFileSystem, livePart.FileSystem));
+                }
+            }
         }
 
-        public static string BuildDiskPartScript(PendingOperation op)
+        public static string BuildDiskPartScript(PendingOperation op, PartitionTableStyle tableStyle = PartitionTableStyle.GPT)
         {
             var sb = new StringBuilder();
             sb.AppendLine("select disk " + op.TargetDiskNumber);
             long sizeMb = Math.Max(1, op.Length / 1048576L);
             long offsetKb = op.StartOffset / 1024L;
+
+            Guid resolvedGptGuid = op.NewGptTypeGuid != Guid.Empty
+                ? op.NewGptTypeGuid
+                : GptPartitionTypeGuids.ForFileSystem(op.NewFileSystem);
+            byte resolvedMbrId = op.NewMbrType != 0
+                ? op.NewMbrType
+                : RawDiskEngine.GetDefaultMbrType(op.NewFileSystem);
 
             switch (op.Type)
             {
@@ -512,6 +610,14 @@ namespace WinParted.Core
                     {
                         string lbl = string.IsNullOrEmpty(op.NewLabel) ? "" : " label=\"" + op.NewLabel + "\"";
                         sb.AppendLine(string.Format("format fs={0} quick{1}", fsArg, lbl));
+                        sb.AppendLine("assign noerr");
+                    }
+                    else if (op.NewFileSystem != FileSystemType.MicrosoftReserved)
+                    {
+                        if (tableStyle == PartitionTableStyle.GPT && resolvedGptGuid != Guid.Empty)
+                            sb.AppendLine("set id=" + resolvedGptGuid.ToString("D") + " override");
+                        else if (tableStyle == PartitionTableStyle.MBR && resolvedMbrId != 0)
+                            sb.AppendLine(string.Format("set id={0:X2} override", resolvedMbrId));
                     }
                     break;
 
@@ -522,11 +628,17 @@ namespace WinParted.Core
 
                 case OperationType.FormatPartition:
                     sb.AppendLine("select partition " + op.TargetPartitionNumber);
+                    if (tableStyle == PartitionTableStyle.GPT && resolvedGptGuid != Guid.Empty)
+                        sb.AppendLine("set id=" + resolvedGptGuid.ToString("D") + " override");
+                    else if (tableStyle == PartitionTableStyle.MBR && resolvedMbrId != 0)
+                        sb.AppendLine(string.Format("set id={0:X2} override", resolvedMbrId));
+
                     string fmtFs = MapDiskPartFs(op.NewFileSystem);
                     if (!string.IsNullOrEmpty(fmtFs))
                     {
                         string lbl = string.IsNullOrEmpty(op.NewLabel) ? "" : " label=\"" + op.NewLabel + "\"";
                         sb.AppendLine(string.Format("format fs={0} quick{1}", fmtFs, lbl));
+                        sb.AppendLine("assign noerr");
                     }
                     break;
 

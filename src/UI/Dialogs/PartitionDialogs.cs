@@ -55,69 +55,87 @@ namespace WinParted.UI.Dialogs
             if (_minSizeBytes > _regionTotalBytes) _minSizeBytes = _regionTotalBytes;
 
             Text = isCreateMode ? "Create New Partition" : "Resize / Move Partition — " + targetSlice.ShortDeviceName;
-            Size = new Size(560, 470);
+            Size = new Size(650, 540);
+            MinimumSize = new Size(620, 510);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            BackColor = Color.FromArgb(248, 250, 252);
+            Font = new Font("Segoe UI", 9f);
 
             long initialBefore = isCreateMode ? 0 : Math.Max(0, targetSlice.StartingOffset - _regionStartBytes);
             long initialSize = isCreateMode ? _regionTotalBytes : targetSlice.PartitionLength;
             if (initialBefore + initialSize > _regionTotalBytes)
                 initialSize = _regionTotalBytes - initialBefore;
 
-            _sliderBar = new SliderPreviewPanel(_regionTotalBytes, _minSizeBytes, initialBefore, initialSize,
-                isCreateMode ? FileSystemType.NTFS : targetSlice.FileSystem, usedBytes);
-            _sliderBar.Location = new Point(16, 14);
-            _sliderBar.Size = new Size(512, 64);
-            _sliderBar.RangeChanged += (s, e) => SyncFromBytes(_sliderBar.BeforeBytes, _sliderBar.SizeBytes);
-            Controls.Add(_sliderBar);
+            var rootPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+            Controls.Add(rootPanel);
 
-            int y = 92;
-            _lblRangeInfo = new Label
+            var bottomButtons = new FlowLayoutPanel
             {
-                Location = new Point(16, y),
-                Size = new Size(512, 20),
-                Font = new Font("Segoe UI", 8.5f),
-                ForeColor = Color.FromArgb(51, 65, 85)
+                Dock = DockStyle.Bottom,
+                Height = 44,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(0, 6, 0, 0)
             };
-            Controls.Add(_lblRangeInfo);
-            y += 28;
+            var btnCancel = new Button
+            {
+                Text = "Cancel",
+                DialogResult = DialogResult.Cancel,
+                Size = new Size(96, 32),
+                Margin = new Padding(8, 0, 0, 0)
+            };
+            var btnOk = new Button
+            {
+                Text = isCreateMode ? "Add Partition" : "Resize / Move",
+                DialogResult = DialogResult.OK,
+                Size = new Size(118, 32),
+                Tag = "PrimaryButton"
+            };
+            btnOk.Click += (s, e) => CommitValues();
+            bottomButtons.Controls.Add(btnCancel);
+            bottomButtons.Controls.Add(btnOk);
+            rootPanel.Controls.Add(bottomButtons);
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+
+            var formTable = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 8,
+                Padding = new Padding(0, 8, 0, 0)
+            };
+            formTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            formTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
             long maxMiB = Math.Max(1, _regionTotalBytes / 1048576L);
             long minMiB = Math.Max(1, _minSizeBytes / 1048576L);
 
-            _numBeforeMiB = AddNumericRow("Free space preceding (MiB):", 16, y, 0, maxMiB - minMiB);
-            y += 32;
-            _numSizeMiB = AddNumericRow("New size (MiB):", 16, y, minMiB, maxMiB);
-            y += 32;
-            _numAfterMiB = AddNumericRow("Free space following (MiB):", 16, y, 0, maxMiB - minMiB);
-            y += 38;
+            _numBeforeMiB = AddNumericRow(formTable, 0, "Free space preceding (MiB):", 0, maxMiB - minMiB);
+            _numSizeMiB = AddNumericRow(formTable, 1, "New size (MiB):", minMiB, maxMiB);
+            _numAfterMiB = AddNumericRow(formTable, 2, "Free space following (MiB):", 0, maxMiB - minMiB);
 
             _numBeforeMiB.ValueChanged += (s, e) => OnNumericBeforeChanged();
             _numSizeMiB.ValueChanged += (s, e) => OnNumericSizeChanged();
             _numAfterMiB.ValueChanged += (s, e) => OnNumericAfterChanged();
 
-            Controls.Add(new Label { Text = "Align to:", Location = new Point(16, y + 3), AutoSize = true });
             _cmbAlign = new ComboBox
             {
-                Location = new Point(210, y),
-                Width = 180,
-                DropDownStyle = ComboBoxStyle.DropDownList
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Margin = new Padding(8, 6, 0, 6)
             };
             _cmbAlign.Items.AddRange(new object[] { "MiB (1024 KiB - Recommended)", "Cylinder (8 MiB)", "None (Sector 512 B)" });
             _cmbAlign.SelectedIndex = 0;
-            Controls.Add(_cmbAlign);
-            y += 32;
+            AddRow(formTable, 3, "Align to:", _cmbAlign);
 
-            Controls.Add(new Label { Text = "File system:", Location = new Point(16, y + 3), AutoSize = true });
             _cmbFs = new ComboBox
             {
-                Location = new Point(210, y),
-                Width = 180,
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                Enabled = isCreateMode
+                Enabled = isCreateMode,
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Margin = new Padding(8, 6, 0, 6)
             };
             var fsOptions = new[]
             {
@@ -133,69 +151,76 @@ namespace WinParted.UI.Dialogs
                 if (_cmbFs.SelectedItem is FileSystemType)
                     _sliderBar.SetFileSystem((FileSystemType)_cmbFs.SelectedItem);
             };
-            Controls.Add(_cmbFs);
-            y += 32;
+            AddRow(formTable, 4, "File system:", _cmbFs);
 
-            Controls.Add(new Label { Text = "Partition name (GPT):", Location = new Point(16, y + 3), AutoSize = true });
             _txtPartName = new TextBox
             {
-                Location = new Point(210, y),
-                Width = 318,
                 Text = isCreateMode ? "Basic data partition" : (targetSlice.PartitionName ?? string.Empty),
-                Enabled = isCreateMode && disk.PartitionStyle == PartitionTableStyle.GPT
+                Enabled = isCreateMode && disk.PartitionStyle == PartitionTableStyle.GPT,
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Margin = new Padding(8, 6, 0, 6)
             };
-            Controls.Add(_txtPartName);
-            y += 32;
+            AddRow(formTable, 5, "Partition name (GPT):", _txtPartName);
 
-            Controls.Add(new Label { Text = "Volume label:", Location = new Point(16, y + 3), AutoSize = true });
             _txtLabel = new TextBox
             {
-                Location = new Point(210, y),
-                Width = 318,
                 Text = isCreateMode ? "New Volume" : (targetSlice.Label ?? string.Empty),
-                Enabled = isCreateMode
+                Enabled = isCreateMode,
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Margin = new Padding(8, 6, 0, 6)
             };
-            Controls.Add(_txtLabel);
-            y += 44;
+            AddRow(formTable, 6, "Volume label:", _txtLabel);
 
-            var btnOk = new Button
+            rootPanel.Controls.Add(formTable);
+
+            _lblRangeInfo = new Label
             {
-                Text = isCreateMode ? "Add Partition" : "Resize / Move",
-                DialogResult = DialogResult.OK,
-                Location = new Point(340, y),
-                Size = new Size(92, 30),
-                BackColor = Color.FromArgb(37, 99, 235),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat
+                Dock = DockStyle.Top,
+                AutoSize = false,
+                Height = 28,
+                Font = new Font("Segoe UI", 8.5f),
+                TextAlign = ContentAlignment.MiddleLeft
             };
-            var btnCancel = new Button
-            {
-                Text = "Cancel",
-                DialogResult = DialogResult.Cancel,
-                Location = new Point(438, y),
-                Size = new Size(90, 30)
-            };
-            btnOk.Click += (s, e) => CommitValues();
-            Controls.Add(btnOk);
-            Controls.Add(btnCancel);
-            AcceptButton = btnOk;
-            CancelButton = btnCancel;
+            rootPanel.Controls.Add(_lblRangeInfo);
+
+            _sliderBar = new SliderPreviewPanel(_regionTotalBytes, _minSizeBytes, initialBefore, initialSize,
+                isCreateMode ? FileSystemType.NTFS : targetSlice.FileSystem, usedBytes);
+            _sliderBar.Dock = DockStyle.Top;
+            _sliderBar.Height = 72;
+            _sliderBar.Tag = "SliderPanel";
+            _sliderBar.RangeChanged += (s, e) => SyncFromBytes(_sliderBar.BeforeBytes, _sliderBar.SizeBytes);
+            rootPanel.Controls.Add(_sliderBar);
 
             SyncFromBytes(initialBefore, initialSize);
+            ThemeManager.ApplyTheme(this);
         }
 
-        private NumericUpDown AddNumericRow(string label, int x, int y, long min, long max)
+        private void AddRow(TableLayoutPanel table, int rowIdx, string labelText, Control input)
         {
-            Controls.Add(new Label { Text = label, Location = new Point(x, y + 3), AutoSize = true });
+            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            var lbl = new Label
+            {
+                Text = labelText,
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 9, 12, 6)
+            };
+            table.Controls.Add(lbl, 0, rowIdx);
+            table.Controls.Add(input, 1, rowIdx);
+        }
+
+        private NumericUpDown AddNumericRow(TableLayoutPanel table, int rowIdx, string label, long min, long max)
+        {
             var nud = new NumericUpDown
             {
-                Location = new Point(210, y),
-                Width = 140,
                 Minimum = Math.Max(0, min),
                 Maximum = Math.Max(Math.Max(0, min), max),
-                ThousandsSeparator = true
+                ThousandsSeparator = true,
+                Width = 180,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(8, 6, 0, 6)
             };
-            Controls.Add(nud);
+            AddRow(table, rowIdx, label, nud);
             return nud;
         }
 
@@ -324,7 +349,7 @@ namespace WinParted.UI.Dialogs
             {
                 base.OnPaint(e);
                 Graphics g = e.Graphics;
-                g.Clear(Color.FromArgb(226, 232, 240));
+                g.Clear(ThemeManager.BackElevated);
 
                 float pad = 6f;
                 float trackW = Width - pad * 2f;
@@ -347,7 +372,7 @@ namespace WinParted.UI.Dialogs
                     g.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
 
                 // Drag handles on left and right edges
-                using (var handleBr = new SolidBrush(Color.FromArgb(30, 41, 59)))
+                using (var handleBr = new SolidBrush(ThemeManager.TextPrimary))
                 {
                     g.FillRectangle(handleBr, rect.X - 3, rect.Y + 12, 6, rect.Height - 24);
                     g.FillRectangle(handleBr, rect.Right - 3, rect.Y + 12, 6, rect.Height - 24);
@@ -442,23 +467,48 @@ namespace WinParted.UI.Dialogs
         {
             _disk = disk;
             Text = "Manage Partition Flags — " + part.ShortDeviceName;
-            Size = new Size(440, 360);
+            Size = new Size(500, 420);
+            MinimumSize = new Size(460, 390);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Segoe UI", 9f);
 
-            int y = 16;
-            Controls.Add(new Label
+            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+            Controls.Add(root);
+
+            var btnPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 44,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(94, 32), Margin = new Padding(8, 0, 0, 0) };
+            var btnOk = new Button { Text = "Apply Flags", DialogResult = DialogResult.OK, Size = new Size(106, 32), Tag = "PrimaryButton" };
+            btnPanel.Controls.Add(btnCancel);
+            btnPanel.Controls.Add(btnOk);
+            root.Controls.Add(btnPanel);
+
+            var flow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                AutoScroll = true
+            };
+            root.Controls.Add(flow);
+
+            flow.Controls.Add(new Label
             {
                 Text = disk.PartitionStyle == PartitionTableStyle.GPT ? "GPT Partition Type GUID:" : "MBR Partition Type ID:",
-                Location = new Point(16, y),
                 AutoSize = true,
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                Margin = new Padding(0, 0, 0, 6)
             });
-            y += 24;
 
-            _cmbType = new ComboBox { Location = new Point(16, y), Width = 390, DropDownStyle = ComboBoxStyle.DropDownList };
+            _cmbType = new ComboBox { Width = 440, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 0, 0, 12) };
             if (disk.PartitionStyle == PartitionTableStyle.GPT)
             {
                 _cmbType.Items.Add(new TypeOption("Basic Data (Windows NTFS / FAT / exFAT)", GptPartitionTypeGuids.BasicData, 0x07));
@@ -500,27 +550,18 @@ namespace WinParted.UI.Dialogs
                 }
                 _cmbType.SelectedIndex = sel;
             }
-            Controls.Add(_cmbType);
-            y += 40;
+            flow.Controls.Add(_cmbType);
 
             bool isGpt = disk.PartitionStyle == PartitionTableStyle.GPT;
-            _chkBootEsp = new CheckBox { Text = "boot / esp (Mark as EFI System Partition)", Location = new Point(16, y), AutoSize = true, Checked = part.GptTypeGuid == GptPartitionTypeGuids.EfiSystem, Enabled = isGpt };
-            y += 26;
-            _chkLegacyBoot = new CheckBox { Text = "legacy_boot (GPT BIOS bootable attribute)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & 0x4UL) != 0, Enabled = isGpt };
-            y += 26;
-            _chkReadOnly = new CheckBox { Text = "readonly (Bit 60)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & (1UL << 60)) != 0, Enabled = isGpt };
-            y += 26;
-            _chkHidden = new CheckBox { Text = "hidden (Bit 62)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & (1UL << 62)) != 0, Enabled = isGpt };
-            y += 26;
-            _chkNoAutomount = new CheckBox { Text = "no_automount (Bit 63)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & (1UL << 63)) != 0, Enabled = isGpt };
-            y += 26;
-            _chkMbrBoot = new CheckBox { Text = "Active / Bootable Flag (0x80 MBR)", Location = new Point(16, y), AutoSize = true, Checked = part.MbrBootable, Enabled = !isGpt };
-            y += 40;
+            _chkBootEsp = new CheckBox { Text = "boot / esp (Mark as EFI System Partition)", AutoSize = true, Margin = new Padding(2, 4, 2, 4), Checked = part.GptTypeGuid == GptPartitionTypeGuids.EfiSystem, Enabled = isGpt };
+            _chkLegacyBoot = new CheckBox { Text = "legacy_boot (GPT BIOS bootable attribute)", AutoSize = true, Margin = new Padding(2, 4, 2, 4), Checked = (part.GptAttributes & 0x4UL) != 0, Enabled = isGpt };
+            _chkReadOnly = new CheckBox { Text = "readonly (Bit 60)", AutoSize = true, Margin = new Padding(2, 4, 2, 4), Checked = (part.GptAttributes & (1UL << 60)) != 0, Enabled = isGpt };
+            _chkHidden = new CheckBox { Text = "hidden (Bit 62)", AutoSize = true, Margin = new Padding(2, 4, 2, 4), Checked = (part.GptAttributes & (1UL << 62)) != 0, Enabled = isGpt };
+            _chkNoAutomount = new CheckBox { Text = "no_automount (Bit 63)", AutoSize = true, Margin = new Padding(2, 4, 2, 4), Checked = (part.GptAttributes & (1UL << 63)) != 0, Enabled = isGpt };
+            _chkMbrBoot = new CheckBox { Text = "Active / Bootable Flag (0x80 MBR)", AutoSize = true, Margin = new Padding(2, 4, 2, 4), Checked = part.MbrBootable, Enabled = !isGpt };
 
-            Controls.AddRange(new Control[] { _chkBootEsp, _chkLegacyBoot, _chkReadOnly, _chkHidden, _chkNoAutomount, _chkMbrBoot });
+            flow.Controls.AddRange(new Control[] { _chkBootEsp, _chkLegacyBoot, _chkReadOnly, _chkHidden, _chkNoAutomount, _chkMbrBoot });
 
-            var btnOk = new Button { Text = "Apply Flags", DialogResult = DialogResult.OK, Location = new Point(220, y), Size = new Size(92, 30) };
-            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(318, y), Size = new Size(88, 30) };
             btnOk.Click += (s, e) =>
             {
                 var opt = (TypeOption)_cmbType.SelectedItem;
@@ -534,10 +575,9 @@ namespace WinParted.UI.Dialogs
                 ResultMbrType = opt.MbrId;
                 ResultMbrBoot = _chkMbrBoot.Checked;
             };
-            Controls.Add(btnOk);
-            Controls.Add(btnCancel);
             AcceptButton = btnOk;
             CancelButton = btnCancel;
+            ThemeManager.ApplyTheme(this);
         }
 
         private class TypeOption
@@ -569,29 +609,54 @@ namespace WinParted.UI.Dialogs
         public WipePartitionDialog(PartitionEntry part)
         {
             Text = "Secure Wipe Partition — " + part.ShortDeviceName;
-            Size = new Size(420, 240);
+            Size = new Size(480, 280);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Segoe UI", 9f);
 
-            Controls.Add(new Label
+            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+            Controls.Add(root);
+
+            var btnPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 44,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(92, 32), Margin = new Padding(8, 0, 0, 0) };
+            var btnOk = new Button { Text = "Queue Wipe", DialogResult = DialogResult.OK, Size = new Size(106, 32), Tag = "DangerButton" };
+            btnPanel.Controls.Add(btnCancel);
+            btnPanel.Controls.Add(btnOk);
+            root.Controls.Add(btnPanel);
+
+            var flow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false
+            };
+            root.Controls.Add(flow);
+
+            flow.Controls.Add(new Label
             {
                 Text = string.Format("Overwrite all {0} in {1} ({2}):",
                     ByteFormatter.FormatBytes(part.PartitionLength), part.ShortDeviceName,
                     string.IsNullOrEmpty(part.Label) ? "no label" : part.Label),
-                Location = new Point(16, 16),
-                Size = new Size(370, 32)
+                AutoSize = true,
+                MaximumSize = new Size(430, 0),
+                Margin = new Padding(0, 0, 0, 12)
             });
 
-            _rbZero = new RadioButton { Text = "Zero-Fill (0x00) — Fast clean wipe", Location = new Point(20, 56), AutoSize = true, Checked = true };
-            _rbOnes = new RadioButton { Text = "Ones-Fill (0xFF) — Flash/SSD pattern", Location = new Point(20, 84), AutoSize = true };
-            _rbRandom = new RadioButton { Text = "Cryptographic / PRNG Random Data — Secure erase", Location = new Point(20, 112), AutoSize = true };
-            Controls.AddRange(new Control[] { _rbZero, _rbOnes, _rbRandom });
-
-            var btnOk = new Button { Text = "Queue Wipe", DialogResult = DialogResult.OK, Location = new Point(204, 156), Size = new Size(92, 30), BackColor = Color.FromArgb(220, 38, 38), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(302, 156), Size = new Size(88, 30) };
-            Controls.AddRange(new Control[] { btnOk, btnCancel });
+            _rbZero = new RadioButton { Text = "Zero-Fill (0x00) — Fast clean wipe", AutoSize = true, Margin = new Padding(4, 4, 0, 4), Checked = true };
+            _rbOnes = new RadioButton { Text = "Ones-Fill (0xFF) — Flash/SSD pattern", AutoSize = true, Margin = new Padding(4, 4, 0, 4) };
+            _rbRandom = new RadioButton { Text = "Cryptographic / PRNG Random Data — Secure erase", AutoSize = true, Margin = new Padding(4, 4, 0, 4) };
+            flow.Controls.AddRange(new Control[] { _rbZero, _rbOnes, _rbRandom });
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+            ThemeManager.ApplyTheme(this);
         }
     }
 
@@ -606,37 +671,55 @@ namespace WinParted.UI.Dialogs
         {
             _disk = disk;
             Text = "Low-Level Sector & Hex Inspector — " + disk.DisplayName;
-            Size = new Size(920, 620);
+            Size = new Size(940, 640);
             StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Segoe UI", 9f);
 
-            var topBar = new Panel { Dock = DockStyle.Top, Height = 74, Padding = new Padding(10), BackColor = Color.FromArgb(241, 245, 249) };
+            var topBar = new Panel { Dock = DockStyle.Top, Height = 88, Padding = new Padding(10, 8, 10, 6), Tag = "ElevatedPanel" };
             Controls.Add(topBar);
 
-            topBar.Controls.Add(new Label { Text = "LBA Sector:", Location = new Point(12, 14), AutoSize = true });
+            var row2 = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 36,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                AutoScroll = false
+            };
+            topBar.Controls.Add(row2);
+
+            var row1 = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                Height = 34,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false
+            };
+            topBar.Controls.Add(row1);
+
+            row1.Controls.Add(new Label { Text = "LBA Sector:", AutoSize = true, Margin = new Padding(0, 6, 8, 0) });
             long maxLba = Math.Max(0, disk.TotalSizeBytes / Math.Max(512, disk.LogicalSectorSize) - 1);
             _numLba = new NumericUpDown
             {
-                Location = new Point(88, 11),
-                Width = 130,
+                Width = 150,
                 Minimum = 0,
                 Maximum = maxLba,
                 Value = Math.Min(maxLba, Math.Max(0, initialLba)),
-                ThousandsSeparator = true
+                ThousandsSeparator = true,
+                Margin = new Padding(0, 2, 8, 0)
             };
-            topBar.Controls.Add(_numLba);
+            row1.Controls.Add(_numLba);
 
-            var btnGo = new Button { Text = "Read Sector", Location = new Point(226, 10), Size = new Size(90, 25) };
+            var btnGo = new Button { Text = "Read Sector", AutoSize = true, MinimumSize = new Size(100, 26), Padding = new Padding(8, 2, 8, 2), Margin = new Padding(0, 1, 0, 0), Tag = "PrimaryButton" };
             btnGo.Click += (s, e) => LoadSector((long)_numLba.Value);
-            topBar.Controls.Add(btnGo);
+            row1.Controls.Add(btnGo);
 
-            // Quick jump buttons
-            int qx = 12;
-            AddQuickBtn(topBar, "LBA 0 (MBR)", 0, ref qx);
-            AddQuickBtn(topBar, "LBA 1 (GPT Hdr)", 1, ref qx);
-            AddQuickBtn(topBar, "LBA 2 (GPT Entries)", 2, ref qx);
+            AddQuickBtn(row2, "LBA 0 (MBR)", 0);
+            AddQuickBtn(row2, "LBA 1 (GPT Hdr)", 1);
+            AddQuickBtn(row2, "LBA 2 (GPT Entries)", 2);
             foreach (var p in disk.Partitions.Where(x => !x.IsUnallocated).Take(4))
             {
-                AddQuickBtn(topBar, string.Format("Part #{0} Boot", p.PartitionNumber), p.StartLba, ref qx);
+                AddQuickBtn(row2, string.Format("Part #{0} Boot", p.PartitionNumber), p.StartLba);
             }
 
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 350 };
@@ -651,7 +734,8 @@ namespace WinParted.UI.Dialogs
                 ScrollBars = ScrollBars.Vertical,
                 Font = new Font("Consolas", 9.5f),
                 BackColor = Color.FromArgb(15, 23, 42),
-                ForeColor = Color.FromArgb(226, 232, 240)
+                ForeColor = Color.FromArgb(226, 232, 240),
+                Tag = "ConsoleColors"
             };
             split.Panel1.Controls.Add(_txtHex);
 
@@ -661,24 +745,23 @@ namespace WinParted.UI.Dialogs
                 Multiline = true,
                 ReadOnly = true,
                 ScrollBars = ScrollBars.Vertical,
-                Font = new Font("Consolas", 9f),
-                BackColor = Color.White
+                Font = new Font("Consolas", 9f)
             };
             split.Panel2.Controls.Add(_txtDecode);
 
             LoadSector((long)_numLba.Value);
+            ThemeManager.ApplyTheme(this);
         }
 
-        private void AddQuickBtn(Control parent, string text, long lba, ref int x)
+        private void AddQuickBtn(Control parent, string text, long lba)
         {
-            var btn = new Button { Text = text, Location = new Point(x, 42), Size = new Size(118, 24) };
+            var btn = new Button { Text = text, AutoSize = true, MinimumSize = new Size(92, 26), Padding = new Padding(8, 2, 8, 2), Margin = new Padding(0, 4, 6, 0) };
             btn.Click += (s, e) =>
             {
                 _numLba.Value = Math.Min(_numLba.Maximum, Math.Max(0, lba));
                 LoadSector(lba);
             };
             parent.Controls.Add(btn);
-            x += 124;
         }
 
         private void LoadSector(long lba)
@@ -781,8 +864,9 @@ namespace WinParted.UI.Dialogs
         public AlignmentAndHealthDialog(DiskInfo disk)
         {
             Text = "Alignment & Disk Health Analyzer — " + disk.DisplayName;
-            Size = new Size(760, 460);
+            Size = new Size(820, 500);
             StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Segoe UI", 9f);
 
             var sb = new StringBuilder();
             sb.AppendLine("DEVICE PROPERTIES");
@@ -819,6 +903,7 @@ namespace WinParted.UI.Dialogs
                 Text = sb.ToString()
             };
             Controls.Add(txt);
+            ThemeManager.ApplyTheme(this);
         }
     }
 }
