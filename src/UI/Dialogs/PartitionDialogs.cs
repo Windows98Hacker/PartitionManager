@@ -1,0 +1,810 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Windows.Forms;
+using WinParted.Core;
+using WinParted.Interop;
+using WinParted.Models;
+
+namespace WinParted.UI.Dialogs
+{
+    public class CreateOrResizePartitionDialog : Form
+    {
+        private readonly bool _isCreateMode;
+        private readonly long _regionStartBytes;
+        private readonly long _regionTotalBytes;
+        private readonly long _minSizeBytes;
+        private readonly DiskInfo _disk;
+        private readonly PartitionEntry _existingPartition;
+
+        private readonly SliderPreviewPanel _sliderBar;
+        private readonly NumericUpDown _numBeforeMiB;
+        private readonly NumericUpDown _numSizeMiB;
+        private readonly NumericUpDown _numAfterMiB;
+        private readonly ComboBox _cmbAlign;
+        private readonly ComboBox _cmbFs;
+        private readonly TextBox _txtLabel;
+        private readonly TextBox _txtPartName;
+        private readonly Label _lblRangeInfo;
+
+        private bool _updating;
+
+        public long ResultStartOffset { get; private set; }
+        public long ResultLengthBytes { get; private set; }
+        public FileSystemType ResultFileSystem { get; private set; }
+        public string ResultLabel { get; private set; }
+        public string ResultPartitionName { get; private set; }
+
+        public CreateOrResizePartitionDialog(
+            DiskInfo disk,
+            PartitionEntry targetSlice,
+            long contiguousStartBytes,
+            long contiguousTotalBytes,
+            bool isCreateMode)
+        {
+            _disk = disk;
+            _existingPartition = targetSlice;
+            _isCreateMode = isCreateMode;
+            _regionStartBytes = contiguousStartBytes;
+            _regionTotalBytes = contiguousTotalBytes;
+
+            long usedBytes = (!isCreateMode && targetSlice.UsedBytes.HasValue) ? targetSlice.UsedBytes.Value : 0;
+            _minSizeBytes = Math.Max(1048576L, ByteFormatter.AlignUp(Math.Max(1048576L, usedBytes), 1048576L));
+            if (_minSizeBytes > _regionTotalBytes) _minSizeBytes = _regionTotalBytes;
+
+            Text = isCreateMode ? "Create New Partition" : "Resize / Move Partition — " + targetSlice.ShortDeviceName;
+            Size = new Size(560, 470);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            BackColor = Color.FromArgb(248, 250, 252);
+
+            long initialBefore = isCreateMode ? 0 : Math.Max(0, targetSlice.StartingOffset - _regionStartBytes);
+            long initialSize = isCreateMode ? _regionTotalBytes : targetSlice.PartitionLength;
+            if (initialBefore + initialSize > _regionTotalBytes)
+                initialSize = _regionTotalBytes - initialBefore;
+
+            _sliderBar = new SliderPreviewPanel(_regionTotalBytes, _minSizeBytes, initialBefore, initialSize,
+                isCreateMode ? FileSystemType.NTFS : targetSlice.FileSystem, usedBytes);
+            _sliderBar.Location = new Point(16, 14);
+            _sliderBar.Size = new Size(512, 64);
+            _sliderBar.RangeChanged += (s, e) => SyncFromBytes(_sliderBar.BeforeBytes, _sliderBar.SizeBytes);
+            Controls.Add(_sliderBar);
+
+            int y = 92;
+            _lblRangeInfo = new Label
+            {
+                Location = new Point(16, y),
+                Size = new Size(512, 20),
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = Color.FromArgb(51, 65, 85)
+            };
+            Controls.Add(_lblRangeInfo);
+            y += 28;
+
+            long maxMiB = Math.Max(1, _regionTotalBytes / 1048576L);
+            long minMiB = Math.Max(1, _minSizeBytes / 1048576L);
+
+            _numBeforeMiB = AddNumericRow("Free space preceding (MiB):", 16, y, 0, maxMiB - minMiB);
+            y += 32;
+            _numSizeMiB = AddNumericRow("New size (MiB):", 16, y, minMiB, maxMiB);
+            y += 32;
+            _numAfterMiB = AddNumericRow("Free space following (MiB):", 16, y, 0, maxMiB - minMiB);
+            y += 38;
+
+            _numBeforeMiB.ValueChanged += (s, e) => OnNumericBeforeChanged();
+            _numSizeMiB.ValueChanged += (s, e) => OnNumericSizeChanged();
+            _numAfterMiB.ValueChanged += (s, e) => OnNumericAfterChanged();
+
+            Controls.Add(new Label { Text = "Align to:", Location = new Point(16, y + 3), AutoSize = true });
+            _cmbAlign = new ComboBox
+            {
+                Location = new Point(210, y),
+                Width = 180,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            _cmbAlign.Items.AddRange(new object[] { "MiB (1024 KiB - Recommended)", "Cylinder (8 MiB)", "None (Sector 512 B)" });
+            _cmbAlign.SelectedIndex = 0;
+            Controls.Add(_cmbAlign);
+            y += 32;
+
+            Controls.Add(new Label { Text = "File system:", Location = new Point(16, y + 3), AutoSize = true });
+            _cmbFs = new ComboBox
+            {
+                Location = new Point(210, y),
+                Width = 180,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Enabled = isCreateMode
+            };
+            var fsOptions = new[]
+            {
+                FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.exFAT, FileSystemType.Ext4,
+                FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
+                FileSystemType.LinuxSwap, FileSystemType.EfiSystem, FileSystemType.MicrosoftReserved, FileSystemType.RAW
+            };
+            foreach (var fs in fsOptions) _cmbFs.Items.Add(fs);
+            _cmbFs.SelectedItem = isCreateMode ? FileSystemType.NTFS : (fsOptions.Contains(targetSlice.FileSystem) ? targetSlice.FileSystem : FileSystemType.NTFS);
+            _cmbFs.SelectedIndexChanged += (s, e) =>
+            {
+                if (_cmbFs.SelectedItem is FileSystemType)
+                    _sliderBar.SetFileSystem((FileSystemType)_cmbFs.SelectedItem);
+            };
+            Controls.Add(_cmbFs);
+            y += 32;
+
+            Controls.Add(new Label { Text = "Partition name (GPT):", Location = new Point(16, y + 3), AutoSize = true });
+            _txtPartName = new TextBox
+            {
+                Location = new Point(210, y),
+                Width = 318,
+                Text = isCreateMode ? "Basic data partition" : (targetSlice.PartitionName ?? string.Empty),
+                Enabled = isCreateMode && disk.PartitionStyle == PartitionTableStyle.GPT
+            };
+            Controls.Add(_txtPartName);
+            y += 32;
+
+            Controls.Add(new Label { Text = "Volume label:", Location = new Point(16, y + 3), AutoSize = true });
+            _txtLabel = new TextBox
+            {
+                Location = new Point(210, y),
+                Width = 318,
+                Text = isCreateMode ? "New Volume" : (targetSlice.Label ?? string.Empty),
+                Enabled = isCreateMode
+            };
+            Controls.Add(_txtLabel);
+            y += 44;
+
+            var btnOk = new Button
+            {
+                Text = isCreateMode ? "Add Partition" : "Resize / Move",
+                DialogResult = DialogResult.OK,
+                Location = new Point(340, y),
+                Size = new Size(92, 30),
+                BackColor = Color.FromArgb(37, 99, 235),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat
+            };
+            var btnCancel = new Button
+            {
+                Text = "Cancel",
+                DialogResult = DialogResult.Cancel,
+                Location = new Point(438, y),
+                Size = new Size(90, 30)
+            };
+            btnOk.Click += (s, e) => CommitValues();
+            Controls.Add(btnOk);
+            Controls.Add(btnCancel);
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+
+            SyncFromBytes(initialBefore, initialSize);
+        }
+
+        private NumericUpDown AddNumericRow(string label, int x, int y, long min, long max)
+        {
+            Controls.Add(new Label { Text = label, Location = new Point(x, y + 3), AutoSize = true });
+            var nud = new NumericUpDown
+            {
+                Location = new Point(210, y),
+                Width = 140,
+                Minimum = Math.Max(0, min),
+                Maximum = Math.Max(Math.Max(0, min), max),
+                ThousandsSeparator = true
+            };
+            Controls.Add(nud);
+            return nud;
+        }
+
+        private void SyncFromBytes(long beforeBytes, long sizeBytes)
+        {
+            _updating = true;
+            try
+            {
+                long beforeMiB = Math.Max(0, beforeBytes / 1048576L);
+                long sizeMiB = Math.Max((long)_numSizeMiB.Minimum, sizeBytes / 1048576L);
+                long totalMiB = Math.Max(1, _regionTotalBytes / 1048576L);
+                if (beforeMiB + sizeMiB > totalMiB)
+                    sizeMiB = Math.Max((long)_numSizeMiB.Minimum, totalMiB - beforeMiB);
+                long afterMiB = Math.Max(0, totalMiB - beforeMiB - sizeMiB);
+
+                _numBeforeMiB.Value = Math.Min(_numBeforeMiB.Maximum, Math.Max(_numBeforeMiB.Minimum, beforeMiB));
+                _numSizeMiB.Value = Math.Min(_numSizeMiB.Maximum, Math.Max(_numSizeMiB.Minimum, sizeMiB));
+                _numAfterMiB.Value = Math.Min(_numAfterMiB.Maximum, Math.Max(_numAfterMiB.Minimum, afterMiB));
+
+                _sliderBar.SetRange(beforeMiB * 1048576L, sizeMiB * 1048576L);
+                long startOff = _regionStartBytes + beforeMiB * 1048576L;
+                long endOff = startOff + sizeMiB * 1048576L;
+                _lblRangeInfo.Text = string.Format("Start: 0x{0:X} (LBA {1:N0})  ->  End: 0x{2:X}  |  Total span: {3}",
+                    startOff, startOff / Math.Max(512, _disk.LogicalSectorSize), endOff, ByteFormatter.FormatBytes(_regionTotalBytes));
+            }
+            finally
+            {
+                _updating = false;
+            }
+        }
+
+        private void OnNumericBeforeChanged()
+        {
+            if (_updating) return;
+            long before = (long)_numBeforeMiB.Value * 1048576L;
+            long size = (long)_numSizeMiB.Value * 1048576L;
+            if (before + size > _regionTotalBytes)
+                size = Math.Max(_minSizeBytes, _regionTotalBytes - before);
+            SyncFromBytes(before, size);
+        }
+
+        private void OnNumericSizeChanged()
+        {
+            if (_updating) return;
+            long before = (long)_numBeforeMiB.Value * 1048576L;
+            long size = (long)_numSizeMiB.Value * 1048576L;
+            if (before + size > _regionTotalBytes)
+                before = Math.Max(0, _regionTotalBytes - size);
+            SyncFromBytes(before, size);
+        }
+
+        private void OnNumericAfterChanged()
+        {
+            if (_updating) return;
+            long after = (long)_numAfterMiB.Value * 1048576L;
+            long size = (long)_numSizeMiB.Value * 1048576L;
+            long before = Math.Max(0, _regionTotalBytes - after - size);
+            SyncFromBytes(before, size);
+        }
+
+        private void CommitValues()
+        {
+            long alignUnit = 1048576L;
+            if (_cmbAlign.SelectedIndex == 1) alignUnit = 8L * 1048576L;
+            else if (_cmbAlign.SelectedIndex == 2) alignUnit = Math.Max(512, _disk.LogicalSectorSize);
+
+            long rawStart = _regionStartBytes + (long)_numBeforeMiB.Value * 1048576L;
+            long rawLen = (long)_numSizeMiB.Value * 1048576L;
+
+            long alignedStart = ByteFormatter.AlignUp(rawStart, alignUnit);
+            if (alignedStart < _regionStartBytes) alignedStart = _regionStartBytes;
+            if (alignedStart > _regionStartBytes + _regionTotalBytes - _minSizeBytes)
+                alignedStart = rawStart;
+
+            long maxLen = (_regionStartBytes + _regionTotalBytes) - alignedStart;
+            long alignedLen = Math.Min(maxLen, ByteFormatter.AlignDown(rawLen, Math.Min(alignUnit, maxLen)));
+            if (alignedLen < _minSizeBytes) alignedLen = Math.Min(maxLen, _minSizeBytes);
+
+            ResultStartOffset = alignedStart;
+            ResultLengthBytes = alignedLen;
+            ResultFileSystem = _cmbFs.SelectedItem is FileSystemType ? (FileSystemType)_cmbFs.SelectedItem : FileSystemType.NTFS;
+            ResultLabel = _txtLabel.Text.Trim();
+            ResultPartitionName = _txtPartName.Text.Trim();
+        }
+
+        private class SliderPreviewPanel : Panel
+        {
+            private readonly long _totalBytes;
+            private readonly long _minBytes;
+            private readonly long _usedBytes;
+            private FileSystemType _fs;
+            private long _beforeBytes;
+            private long _sizeBytes;
+            private int _dragMode; // 0=none, 1=left, 2=right, 3=move
+            private int _dragStartX;
+            private long _dragOrigBefore;
+            private long _dragOrigSize;
+
+            public long BeforeBytes { get { return _beforeBytes; } }
+            public long SizeBytes { get { return _sizeBytes; } }
+            public event EventHandler RangeChanged;
+
+            public SliderPreviewPanel(long totalBytes, long minBytes, long beforeBytes, long sizeBytes, FileSystemType fs, long usedBytes)
+            {
+                DoubleBuffered = true;
+                _totalBytes = Math.Max(1, totalBytes);
+                _minBytes = minBytes;
+                _beforeBytes = beforeBytes;
+                _sizeBytes = sizeBytes;
+                _fs = fs;
+                _usedBytes = usedBytes;
+                BackColor = Color.White;
+                BorderStyle = BorderStyle.FixedSingle;
+            }
+
+            public void SetFileSystem(FileSystemType fs) { _fs = fs; Invalidate(); }
+
+            public void SetRange(long before, long size)
+            {
+                _beforeBytes = before;
+                _sizeBytes = size;
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                Graphics g = e.Graphics;
+                g.Clear(Color.FromArgb(226, 232, 240));
+
+                float pad = 6f;
+                float trackW = Width - pad * 2f;
+                float x = pad + (float)(trackW * ((double)_beforeBytes / _totalBytes));
+                float w = Math.Max(16f, (float)(trackW * ((double)_sizeBytes / _totalBytes)));
+                if (x + w > Width - pad) w = Math.Max(10f, Width - pad - x);
+
+                var rect = new RectangleF(x, 8f, w, Height - 16f);
+                using (var fillBr = new SolidBrush(FileSystemColors.GetFillColor(_fs)))
+                    g.FillRectangle(fillBr, rect);
+
+                if (_usedBytes > 0 && _sizeBytes > 0)
+                {
+                    float uw = (float)(rect.Width * Math.Min(1.0, (double)_usedBytes / _sizeBytes));
+                    using (var usedBr = new SolidBrush(FileSystemColors.GetUsedColor(_fs)))
+                        g.FillRectangle(usedBr, rect.X, rect.Y, uw, rect.Height);
+                }
+
+                using (var pen = new Pen(FileSystemColors.GetBorderColor(_fs), 2.5f))
+                    g.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
+
+                // Drag handles on left and right edges
+                using (var handleBr = new SolidBrush(Color.FromArgb(30, 41, 59)))
+                {
+                    g.FillRectangle(handleBr, rect.X - 3, rect.Y + 12, 6, rect.Height - 24);
+                    g.FillRectangle(handleBr, rect.Right - 3, rect.Y + 12, 6, rect.Height - 24);
+                }
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                base.OnMouseDown(e);
+                float pad = 6f;
+                float trackW = Width - pad * 2f;
+                float x = pad + (float)(trackW * ((double)_beforeBytes / _totalBytes));
+                float w = Math.Max(16f, (float)(trackW * ((double)_sizeBytes / _totalBytes)));
+
+                _dragStartX = e.X;
+                _dragOrigBefore = _beforeBytes;
+                _dragOrigSize = _sizeBytes;
+
+                if (Math.Abs(e.X - x) <= 8) _dragMode = 1;
+                else if (Math.Abs(e.X - (x + w)) <= 8) _dragMode = 2;
+                else if (e.X > x && e.X < x + w) _dragMode = 3;
+                else _dragMode = 0;
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                base.OnMouseMove(e);
+                float pad = 6f;
+                float trackW = Math.Max(1f, Width - pad * 2f);
+
+                if (_dragMode == 0)
+                {
+                    float x = pad + (float)(trackW * ((double)_beforeBytes / _totalBytes));
+                    float w = Math.Max(16f, (float)(trackW * ((double)_sizeBytes / _totalBytes)));
+                    if (Math.Abs(e.X - x) <= 8 || Math.Abs(e.X - (x + w)) <= 8)
+                        Cursor = Cursors.SizeWE;
+                    else if (e.X > x && e.X < x + w)
+                        Cursor = Cursors.SizeAll;
+                    else
+                        Cursor = Cursors.Default;
+                    return;
+                }
+
+                long deltaBytes = (long)(((e.X - _dragStartX) / trackW) * _totalBytes);
+                if (_dragMode == 1)
+                {
+                    long maxShift = _dragOrigSize - _minBytes;
+                    long newBefore = Math.Max(0, Math.Min(_dragOrigBefore + maxShift, _dragOrigBefore + deltaBytes));
+                    newBefore = ByteFormatter.AlignDown(newBefore, 1048576L);
+                    _beforeBytes = newBefore;
+                    _sizeBytes = (_dragOrigBefore + _dragOrigSize) - newBefore;
+                }
+                else if (_dragMode == 2)
+                {
+                    long newSize = Math.Max(_minBytes, Math.Min(_totalBytes - _dragOrigBefore, _dragOrigSize + deltaBytes));
+                    _sizeBytes = Math.Max(_minBytes, ByteFormatter.AlignDown(newSize, 1048576L));
+                }
+                else if (_dragMode == 3)
+                {
+                    long newBefore = Math.Max(0, Math.Min(_totalBytes - _dragOrigSize, _dragOrigBefore + deltaBytes));
+                    _beforeBytes = ByteFormatter.AlignDown(newBefore, 1048576L);
+                }
+                Invalidate();
+                if (RangeChanged != null) RangeChanged(this, EventArgs.Empty);
+            }
+
+            protected override void OnMouseUp(MouseEventArgs e)
+            {
+                base.OnMouseUp(e);
+                _dragMode = 0;
+            }
+        }
+    }
+
+    public class ManageFlagsDialog : Form
+    {
+        private readonly DiskInfo _disk;
+        private readonly ComboBox _cmbType;
+        private readonly CheckBox _chkBootEsp;
+        private readonly CheckBox _chkLegacyBoot;
+        private readonly CheckBox _chkReadOnly;
+        private readonly CheckBox _chkHidden;
+        private readonly CheckBox _chkNoAutomount;
+        private readonly CheckBox _chkMbrBoot;
+
+        public Guid ResultGptTypeGuid { get; private set; }
+        public ulong ResultGptAttributes { get; private set; }
+        public byte ResultMbrType { get; private set; }
+        public bool ResultMbrBoot { get; private set; }
+
+        public ManageFlagsDialog(DiskInfo disk, PartitionEntry part)
+        {
+            _disk = disk;
+            Text = "Manage Partition Flags — " + part.ShortDeviceName;
+            Size = new Size(440, 360);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+
+            int y = 16;
+            Controls.Add(new Label
+            {
+                Text = disk.PartitionStyle == PartitionTableStyle.GPT ? "GPT Partition Type GUID:" : "MBR Partition Type ID:",
+                Location = new Point(16, y),
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            });
+            y += 24;
+
+            _cmbType = new ComboBox { Location = new Point(16, y), Width = 390, DropDownStyle = ComboBoxStyle.DropDownList };
+            if (disk.PartitionStyle == PartitionTableStyle.GPT)
+            {
+                _cmbType.Items.Add(new TypeOption("Basic Data (Windows NTFS / FAT / exFAT)", GptPartitionTypeGuids.BasicData, 0x07));
+                _cmbType.Items.Add(new TypeOption("EFI System Partition (boot, esp)", GptPartitionTypeGuids.EfiSystem, 0xEF));
+                _cmbType.Items.Add(new TypeOption("Microsoft Reserved (msftres)", GptPartitionTypeGuids.MicrosoftReserved, 0x0C));
+                _cmbType.Items.Add(new TypeOption("Windows Recovery Environment (diag)", GptPartitionTypeGuids.WindowsRecovery, 0x27));
+                _cmbType.Items.Add(new TypeOption("Linux Filesystem Data (ext2/3/4, btrfs, xfs)", GptPartitionTypeGuids.LinuxFilesystem, 0x83));
+                _cmbType.Items.Add(new TypeOption("Linux Swap", GptPartitionTypeGuids.LinuxSwap, 0x82));
+                _cmbType.Items.Add(new TypeOption("Linux LVM", GptPartitionTypeGuids.LinuxLvm, 0x8E));
+                _cmbType.Items.Add(new TypeOption("BIOS Boot Partition (bios_grub)", GptPartitionTypeGuids.BiosBoot, 0x00));
+
+                int sel = 0;
+                for (int i = 0; i < _cmbType.Items.Count; i++)
+                {
+                    if (((TypeOption)_cmbType.Items[i]).GptGuid == part.GptTypeGuid) { sel = i; break; }
+                }
+                _cmbType.SelectedIndex = sel;
+            }
+            else
+            {
+                _cmbType.Items.Add(new TypeOption("0x07 — NTFS / exFAT / HPFS", Guid.Empty, 0x07));
+                _cmbType.Items.Add(new TypeOption("0x0C — FAT32 (LBA)", Guid.Empty, 0x0C));
+                _cmbType.Items.Add(new TypeOption("0x0E — FAT16 (LBA)", Guid.Empty, 0x0E));
+                _cmbType.Items.Add(new TypeOption("0x83 — Linux Native (ext2/3/4, XFS, Btrfs)", Guid.Empty, 0x83));
+                _cmbType.Items.Add(new TypeOption("0x82 — Linux Swap", Guid.Empty, 0x82));
+                _cmbType.Items.Add(new TypeOption("0x8E — Linux LVM", Guid.Empty, 0x8E));
+                _cmbType.Items.Add(new TypeOption("0xEF — EFI System Partition", Guid.Empty, 0xEF));
+                _cmbType.Items.Add(new TypeOption("0x27 — Windows Recovery", Guid.Empty, 0x27));
+
+                int sel = 0;
+                for (int i = 0; i < _cmbType.Items.Count; i++)
+                {
+                    if (((TypeOption)_cmbType.Items[i]).MbrId == part.MbrPartitionType) { sel = i; break; }
+                }
+                _cmbType.SelectedIndex = sel;
+            }
+            Controls.Add(_cmbType);
+            y += 40;
+
+            bool isGpt = disk.PartitionStyle == PartitionTableStyle.GPT;
+            _chkBootEsp = new CheckBox { Text = "boot / esp (Mark as EFI System Partition)", Location = new Point(16, y), AutoSize = true, Checked = part.GptTypeGuid == GptPartitionTypeGuids.EfiSystem, Enabled = isGpt };
+            y += 26;
+            _chkLegacyBoot = new CheckBox { Text = "legacy_boot (GPT BIOS bootable attribute)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & 0x4UL) != 0, Enabled = isGpt };
+            y += 26;
+            _chkReadOnly = new CheckBox { Text = "readonly (Bit 60)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & (1UL << 60)) != 0, Enabled = isGpt };
+            y += 26;
+            _chkHidden = new CheckBox { Text = "hidden (Bit 62)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & (1UL << 62)) != 0, Enabled = isGpt };
+            y += 26;
+            _chkNoAutomount = new CheckBox { Text = "no_automount (Bit 63)", Location = new Point(16, y), AutoSize = true, Checked = (part.GptAttributes & (1UL << 63)) != 0, Enabled = isGpt };
+            y += 26;
+            _chkMbrBoot = new CheckBox { Text = "Active / Bootable Flag (0x80 MBR)", Location = new Point(16, y), AutoSize = true, Checked = part.MbrBootable, Enabled = !isGpt };
+            y += 40;
+
+            Controls.AddRange(new Control[] { _chkBootEsp, _chkLegacyBoot, _chkReadOnly, _chkHidden, _chkNoAutomount, _chkMbrBoot });
+
+            var btnOk = new Button { Text = "Apply Flags", DialogResult = DialogResult.OK, Location = new Point(220, y), Size = new Size(92, 30) };
+            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(318, y), Size = new Size(88, 30) };
+            btnOk.Click += (s, e) =>
+            {
+                var opt = (TypeOption)_cmbType.SelectedItem;
+                ResultGptTypeGuid = _chkBootEsp.Checked ? GptPartitionTypeGuids.EfiSystem : opt.GptGuid;
+                ulong attrs = 0;
+                if (_chkLegacyBoot.Checked) attrs |= 0x4UL;
+                if (_chkReadOnly.Checked) attrs |= (1UL << 60);
+                if (_chkHidden.Checked) attrs |= (1UL << 62);
+                if (_chkNoAutomount.Checked) attrs |= (1UL << 63);
+                ResultGptAttributes = attrs;
+                ResultMbrType = opt.MbrId;
+                ResultMbrBoot = _chkMbrBoot.Checked;
+            };
+            Controls.Add(btnOk);
+            Controls.Add(btnCancel);
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+        }
+
+        private class TypeOption
+        {
+            public string Text;
+            public Guid GptGuid;
+            public byte MbrId;
+            public TypeOption(string t, Guid g, byte m) { Text = t; GptGuid = g; MbrId = m; }
+            public override string ToString() { return Text; }
+        }
+    }
+
+    public class WipePartitionDialog : Form
+    {
+        private readonly RadioButton _rbZero;
+        private readonly RadioButton _rbOnes;
+        private readonly RadioButton _rbRandom;
+
+        public WipePattern SelectedPattern
+        {
+            get
+            {
+                if (_rbOnes.Checked) return WipePattern.OnesFill;
+                if (_rbRandom.Checked) return WipePattern.RandomDoD;
+                return WipePattern.ZeroFill;
+            }
+        }
+
+        public WipePartitionDialog(PartitionEntry part)
+        {
+            Text = "Secure Wipe Partition — " + part.ShortDeviceName;
+            Size = new Size(420, 240);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+
+            Controls.Add(new Label
+            {
+                Text = string.Format("Overwrite all {0} in {1} ({2}):",
+                    ByteFormatter.FormatBytes(part.PartitionLength), part.ShortDeviceName,
+                    string.IsNullOrEmpty(part.Label) ? "no label" : part.Label),
+                Location = new Point(16, 16),
+                Size = new Size(370, 32)
+            });
+
+            _rbZero = new RadioButton { Text = "Zero-Fill (0x00) — Fast clean wipe", Location = new Point(20, 56), AutoSize = true, Checked = true };
+            _rbOnes = new RadioButton { Text = "Ones-Fill (0xFF) — Flash/SSD pattern", Location = new Point(20, 84), AutoSize = true };
+            _rbRandom = new RadioButton { Text = "Cryptographic / PRNG Random Data — Secure erase", Location = new Point(20, 112), AutoSize = true };
+            Controls.AddRange(new Control[] { _rbZero, _rbOnes, _rbRandom });
+
+            var btnOk = new Button { Text = "Queue Wipe", DialogResult = DialogResult.OK, Location = new Point(204, 156), Size = new Size(92, 30), BackColor = Color.FromArgb(220, 38, 38), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(302, 156), Size = new Size(88, 30) };
+            Controls.AddRange(new Control[] { btnOk, btnCancel });
+        }
+    }
+
+    public class HexSectorInspectorDialog : Form
+    {
+        private readonly DiskInfo _disk;
+        private readonly NumericUpDown _numLba;
+        private readonly TextBox _txtHex;
+        private readonly TextBox _txtDecode;
+
+        public HexSectorInspectorDialog(DiskInfo disk, long initialLba = 0)
+        {
+            _disk = disk;
+            Text = "Low-Level Sector & Hex Inspector — " + disk.DisplayName;
+            Size = new Size(920, 620);
+            StartPosition = FormStartPosition.CenterParent;
+
+            var topBar = new Panel { Dock = DockStyle.Top, Height = 74, Padding = new Padding(10), BackColor = Color.FromArgb(241, 245, 249) };
+            Controls.Add(topBar);
+
+            topBar.Controls.Add(new Label { Text = "LBA Sector:", Location = new Point(12, 14), AutoSize = true });
+            long maxLba = Math.Max(0, disk.TotalSizeBytes / Math.Max(512, disk.LogicalSectorSize) - 1);
+            _numLba = new NumericUpDown
+            {
+                Location = new Point(88, 11),
+                Width = 130,
+                Minimum = 0,
+                Maximum = maxLba,
+                Value = Math.Min(maxLba, Math.Max(0, initialLba)),
+                ThousandsSeparator = true
+            };
+            topBar.Controls.Add(_numLba);
+
+            var btnGo = new Button { Text = "Read Sector", Location = new Point(226, 10), Size = new Size(90, 25) };
+            btnGo.Click += (s, e) => LoadSector((long)_numLba.Value);
+            topBar.Controls.Add(btnGo);
+
+            // Quick jump buttons
+            int qx = 12;
+            AddQuickBtn(topBar, "LBA 0 (MBR)", 0, ref qx);
+            AddQuickBtn(topBar, "LBA 1 (GPT Hdr)", 1, ref qx);
+            AddQuickBtn(topBar, "LBA 2 (GPT Entries)", 2, ref qx);
+            foreach (var p in disk.Partitions.Where(x => !x.IsUnallocated).Take(4))
+            {
+                AddQuickBtn(topBar, string.Format("Part #{0} Boot", p.PartitionNumber), p.StartLba, ref qx);
+            }
+
+            var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 350 };
+            Controls.Add(split);
+            split.BringToFront();
+
+            _txtHex = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                Font = new Font("Consolas", 9.5f),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.FromArgb(226, 232, 240)
+            };
+            split.Panel1.Controls.Add(_txtHex);
+
+            _txtDecode = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                Font = new Font("Consolas", 9f),
+                BackColor = Color.White
+            };
+            split.Panel2.Controls.Add(_txtDecode);
+
+            LoadSector((long)_numLba.Value);
+        }
+
+        private void AddQuickBtn(Control parent, string text, long lba, ref int x)
+        {
+            var btn = new Button { Text = text, Location = new Point(x, 42), Size = new Size(118, 24) };
+            btn.Click += (s, e) =>
+            {
+                _numLba.Value = Math.Min(_numLba.Maximum, Math.Max(0, lba));
+                LoadSector(lba);
+            };
+            parent.Controls.Add(btn);
+            x += 124;
+        }
+
+        private void LoadSector(long lba)
+        {
+            int secSize = Math.Max(512, _disk.LogicalSectorSize);
+            try
+            {
+                byte[] bytes = RawDiskEngine.ReadBytes(_disk, lba * secSize, secSize);
+                _txtHex.Text = FormatHexDump(bytes, lba * secSize);
+                _txtDecode.Text = DecodeSectorStructure(lba, bytes);
+            }
+            catch (Exception ex)
+            {
+                _txtHex.Text = "Unable to read raw sector LBA " + lba + ":\r\n" + ex.Message +
+                               "\r\n\r\nNote: Reading raw physical drive sectors on Windows requires Administrator elevation. Virtual Disk (.img) files can always be inspected without elevation.";
+                _txtDecode.Text = "Raw read unavailable.";
+            }
+        }
+
+        private string FormatHexDump(byte[] data, long baseOffset)
+        {
+            var sb = new StringBuilder();
+            for (int i = 0; i < data.Length; i += 16)
+            {
+                sb.AppendFormat("{0:X8}  ", baseOffset + i);
+                for (int j = 0; j < 16; j++)
+                {
+                    if (i + j < data.Length) sb.AppendFormat("{0:X2} ", data[i + j]);
+                    else sb.Append("   ");
+                    if (j == 7) sb.Append(" ");
+                }
+                sb.Append(" |");
+                for (int j = 0; j < 16 && i + j < data.Length; j++)
+                {
+                    byte b = data[i + j];
+                    sb.Append(b >= 32 && b < 127 ? (char)b : '.');
+                }
+                sb.AppendLine("|");
+            }
+            return sb.ToString();
+        }
+
+        private string DecodeSectorStructure(long lba, byte[] b)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine(string.Format("=== Structural Decoder for LBA {0:N0} (Offset 0x{1:X}) ===", lba, lba * b.Length));
+
+            if (lba == 0 && b.Length >= 512)
+            {
+                sb.AppendLine(string.Format("Boot Signature: 0x{0:X2}{1:X2} ({2})", b[510], b[511], (b[510] == 0x55 && b[511] == 0xAA) ? "VALID 0x55AA" : "MISSING"));
+                sb.AppendLine(string.Format("MBR Disk Signature: 0x{0:X8}", BitConverter.ToUInt32(b, 440)));
+                for (int i = 0; i < 4; i++)
+                {
+                    int off = 446 + i * 16;
+                    byte type = b[off + 4];
+                    uint start = BitConverter.ToUInt32(b, off + 8);
+                    uint count = BitConverter.ToUInt32(b, off + 12);
+                    sb.AppendLine(string.Format("  MBR Slot {0}: Boot=0x{1:X2}, Type=0x{2:X2} ({3}), StartLBA={4}, Sectors={5}",
+                        i + 1, b[off], type, type == 0xEE ? "GPT Protective" : Win32DiskInterop.GuessFsFromMbrType(type).ToString(), start, count));
+                }
+            }
+            else if (lba == 1 && b.Length >= 92 && BitConverter.ToUInt64(b, 0) == 0x5452415020494645UL)
+            {
+                uint hdrCrc = BitConverter.ToUInt32(b, 16);
+                byte[] copy = (byte[])b.Clone();
+                Array.Clear(copy, 16, 4);
+                uint calcCrc = Crc32.Compute(copy, 0, Math.Min(92, copy.Length));
+                byte[] g = new byte[16];
+                Array.Copy(b, 56, g, 0, 16);
+                sb.AppendLine("Signature: \"EFI PART\" (Valid GPT Header)");
+                sb.AppendLine(string.Format("Header CRC32: 0x{0:X8} (Computed: 0x{1:X8} -> {2})", hdrCrc, calcCrc, hdrCrc == calcCrc ? "VALID" : "MISMATCH"));
+                sb.AppendLine(string.Format("Disk GUID: {0}", new Guid(g)));
+                sb.AppendLine(string.Format("First Usable LBA: {0:N0} | Last Usable LBA: {1:N0}", BitConverter.ToInt64(b, 40), BitConverter.ToInt64(b, 48)));
+                sb.AppendLine(string.Format("Partition Entries: {0} entries x {1} bytes @ LBA {2} | Array CRC32: 0x{3:X8}",
+                    BitConverter.ToInt32(b, 80), BitConverter.ToInt32(b, 84), BitConverter.ToInt64(b, 72), BitConverter.ToUInt32(b, 88)));
+            }
+            else if (b.Length >= 512)
+            {
+                string oem = Encoding.ASCII.GetString(b, 3, 8);
+                sb.AppendLine("OEM / Boot ID (+3): \"" + oem.Replace("\0", ".") + "\"");
+                if (b.Length >= 0x60 && Encoding.ASCII.GetString(b, 0x52, 8) == "FAT32   ")
+                    sb.AppendLine("Detected FAT32 Boot Sector | Label: " + Encoding.ASCII.GetString(b, 0x47, 11).Trim());
+                if (Encoding.ASCII.GetString(b, 0, 4) == "XFSB")
+                    sb.AppendLine("Detected XFS Superblock");
+            }
+            return sb.ToString();
+        }
+    }
+
+    public class AlignmentAndHealthDialog : Form
+    {
+        public AlignmentAndHealthDialog(DiskInfo disk)
+        {
+            Text = "Alignment & Disk Health Analyzer — " + disk.DisplayName;
+            Size = new Size(760, 460);
+            StartPosition = FormStartPosition.CenterParent;
+
+            var sb = new StringBuilder();
+            sb.AppendLine("DEVICE PROPERTIES");
+            sb.AppendLine("  Model / Path      : " + disk.Model + " (" + disk.DevicePath + ")");
+            sb.AppendLine("  Bus / Interface   : " + disk.BusTypeName);
+            sb.AppendLine("  Partition Table   : " + disk.PartitionStyle + (disk.PartitionStyle == PartitionTableStyle.GPT ? (disk.GptCrcValid ? " (CRC32 VALID)" : " (CRC32 MISMATCH)") : ""));
+            sb.AppendLine("  Logical / Physical: " + disk.LogicalSectorSize + " B / " + disk.PhysicalSectorSize + " B");
+            sb.AppendLine("  Total Capacity    : " + ByteFormatter.FormatBytes(disk.TotalSizeBytes));
+            sb.AppendLine();
+            sb.AppendLine("PARTITION ALIGNMENT AUDIT (4K Physical Sector & 1 MiB SSD Boundary)");
+            sb.AppendLine(new string('-', 95));
+            sb.AppendLine(string.Format("{0,-6} {1,-16} {2,-14} {3,-14} {4,-10} {5,-12}",
+                "Part#", "Filesystem", "Start LBA", "Offset", "4K Align", "1 MiB Align"));
+            sb.AppendLine(new string('-', 95));
+
+            foreach (var p in disk.Partitions.Where(x => !x.IsUnallocated))
+            {
+                sb.AppendLine(string.Format("{0,-6} {1,-16} {2,-14:N0} {3,-14} {4,-10} {5,-12}",
+                    "#" + p.PartitionNumber,
+                    FileSystemColors.GetDisplayName(p.FileSystem),
+                    p.StartLba,
+                    ByteFormatter.FormatBytes(p.StartingOffset),
+                    p.IsAligned4K ? "PASS" : "MISALIGNED",
+                    p.IsAligned1MiB ? "OPTIMAL" : "Suboptimal"));
+            }
+
+            var txt = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                Font = new Font("Consolas", 9.5f),
+                Text = sb.ToString()
+            };
+            Controls.Add(txt);
+        }
+    }
+}
