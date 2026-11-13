@@ -173,54 +173,100 @@ namespace WinParted.Core
             return vol;
         }
 
-        public static byte[] ReadFileBytes(DiskInfo disk, PartitionEntry part, VirtualFsNode fileNode)
+        private const long CopyStreamChunkBytes = 4L * 1048576L; // 4 MiB chunked transfer for multi-GB exports
+
+        public static byte[] ReadFileBytes(DiskInfo disk, PartitionEntry part, VirtualFsNode fileNode, int maxBytes = 262144)
         {
-            if (fileNode == null || fileNode.IsDirectory)
+            if (fileNode == null || fileNode.IsDirectory || maxBytes <= 0)
                 return new byte[0];
+
+            using (var ms = new MemoryStream())
+            {
+                CopyFileNodeToStream(disk, part, fileNode, ms, maxBytes, null);
+                return ms.ToArray();
+            }
+        }
+
+        public static long CopyFileNodeToStream(
+            DiskInfo disk,
+            PartitionEntry part,
+            VirtualFsNode fileNode,
+            Stream destination,
+            long maxBytesToCopy = long.MaxValue,
+            Action<long, long> onProgress = null)
+        {
+            if (fileNode == null || fileNode.IsDirectory || destination == null || maxBytesToCopy <= 0)
+                return 0;
 
             if (fileNode.InlineContent != null)
             {
-                byte[] copy = new byte[fileNode.InlineContent.Length];
-                Array.Copy(fileNode.InlineContent, copy, copy.Length);
-                return copy;
+                int toWrite = (int)Math.Min((long)fileNode.InlineContent.Length, maxBytesToCopy);
+                if (toWrite > 0)
+                {
+                    destination.Write(fileNode.InlineContent, 0, toWrite);
+                    if (onProgress != null) onProgress(toWrite, toWrite);
+                }
+                return toWrite;
             }
 
             if (fileNode.ContentExtents != null && fileNode.ContentExtents.Count > 0 && fileNode.ContentLength > 0)
             {
-                int targetLen = (int)Math.Min(fileNode.ContentLength, 16L * 1048576L);
-                byte[] outBuf = new byte[targetLen];
-                int written = 0;
-                for (int i = 0; i < fileNode.ContentExtents.Count && written < targetLen; i++)
+                long targetTotal = Math.Min(fileNode.ContentLength, maxBytesToCopy);
+                long written = 0;
+
+                for (int i = 0; i < fileNode.ContentExtents.Count && written < targetTotal; i++)
                 {
                     long extOff = fileNode.ContentExtents[i].Key;
                     long extLen = fileNode.ContentExtents[i].Value;
                     if (extOff < part.StartingOffset || extOff >= part.EndOffset || extLen <= 0) continue;
-                    int chunkLen = (int)Math.Min(targetLen - written, Math.Min(extLen, part.EndOffset - extOff));
-                    if (chunkLen <= 0) continue;
-                    byte[] chunk = RawDiskEngine.ReadBytes(disk, extOff, chunkLen);
-                    int copyLen = Math.Min(chunkLen, chunk.Length);
-                    if (copyLen > 0)
+
+                    long extAvail = Math.Min(extLen, part.EndOffset - extOff);
+                    long remInExt = Math.Min(targetTotal - written, extAvail);
+                    long cursor = extOff;
+
+                    while (remInExt > 0)
                     {
-                        Array.Copy(chunk, 0, outBuf, written, copyLen);
-                        written += copyLen;
+                        int chunkLen = (int)Math.Min(CopyStreamChunkBytes, remInExt);
+                        byte[] chunk = RawDiskEngine.ReadBytes(disk, cursor, chunkLen);
+                        int actual = Math.Min(chunkLen, chunk.Length);
+                        if (actual <= 0) return written;
+
+                        destination.Write(chunk, 0, actual);
+                        written += actual;
+                        cursor += actual;
+                        remInExt -= actual;
+
+                        if (onProgress != null) onProgress(written, targetTotal);
+                        if (actual < chunkLen) return written;
                     }
-                    if (copyLen < chunkLen) break;
                 }
-                if (written == targetLen) return outBuf;
-                byte[] trimmed = new byte[written];
-                Array.Copy(outBuf, trimmed, written);
-                return trimmed;
+                return written;
             }
 
-            if (fileNode.ContentLength <= 0 || fileNode.ContentOffset < part.StartingOffset)
-                return new byte[0];
+            if (fileNode.ContentLength <= 0 || fileNode.ContentOffset < part.StartingOffset || fileNode.ContentOffset >= part.EndOffset)
+                return 0;
 
-            int toRead = (int)Math.Min(fileNode.ContentLength, 16L * 1048576L);
-            if (fileNode.ContentOffset + toRead > part.EndOffset)
-                toRead = (int)Math.Max(0, part.EndOffset - fileNode.ContentOffset);
-            if (toRead <= 0) return new byte[0];
+            long partAvail = part.EndOffset - fileNode.ContentOffset;
+            long contiguousTotal = Math.Min(Math.Min(fileNode.ContentLength, maxBytesToCopy), partAvail);
+            long totalWritten = 0;
+            long physCursor = fileNode.ContentOffset;
 
-            return RawDiskEngine.ReadBytes(disk, fileNode.ContentOffset, toRead);
+            while (totalWritten < contiguousTotal)
+            {
+                int chunkLen = (int)Math.Min(CopyStreamChunkBytes, contiguousTotal - totalWritten);
+                byte[] chunk = RawDiskEngine.ReadBytes(disk, physCursor, chunkLen);
+                int actual = Math.Min(chunkLen, chunk.Length);
+                if (actual <= 0) break;
+
+                destination.Write(chunk, 0, actual);
+                totalWritten += actual;
+                physCursor += actual;
+
+                if (onProgress != null) onProgress(totalWritten, contiguousTotal);
+                if (actual < chunkLen) break;
+            }
+
+            return totalWritten;
         }
 
         public static List<VirtualFsNode> SearchVolume(MountedReadOnlyVolume vol, string query)
@@ -260,6 +306,20 @@ namespace WinParted.Core
             DiskInfo disk, PartitionEntry part, VirtualFsNode node, string hostDestinationPath,
             out int filesCopied, out int foldersCreated, out long bytesCopied)
         {
+            ExportNodeToHost(disk, part, node, hostDestinationPath, null, null, out filesCopied, out foldersCreated, out bytesCopied);
+        }
+
+        public static void ExportNodeToHost(
+            DiskInfo disk,
+            PartitionEntry part,
+            VirtualFsNode node,
+            string hostDestinationPath,
+            Action<long, long, string> onProgress,
+            Func<bool> isCancelled,
+            out int filesCopied,
+            out int foldersCreated,
+            out long bytesCopied)
+        {
             filesCopied = 0;
             foldersCreated = 0;
             bytesCopied = 0;
@@ -268,6 +328,8 @@ namespace WinParted.Core
             if (part == null) throw new ArgumentNullException("part");
             if (node == null) throw new ArgumentNullException("node");
             if (string.IsNullOrEmpty(hostDestinationPath)) throw new ArgumentNullException("hostDestinationPath");
+
+            long totalEstimatedBytes = ComputeEstimatedBytes(node, 0);
 
             if (!node.IsDirectory)
             {
@@ -279,10 +341,9 @@ namespace WinParted.Core
                 if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent))
                     Directory.CreateDirectory(parent);
 
-                byte[] data = ReadFileBytes(disk, part, node);
-                File.WriteAllBytes(targetFile, data);
+                long written = StreamNodeToHostFile(disk, part, node, targetFile, 0, totalEstimatedBytes, onProgress);
                 filesCopied = 1;
-                bytesCopied = data.Length;
+                bytesCopied = written;
                 return;
             }
 
@@ -290,33 +351,83 @@ namespace WinParted.Core
                 ? SanitizeHostName(string.IsNullOrEmpty(part.Label) ? "VolumeRoot" : part.Label)
                 : SanitizeHostName(node.Name);
             string destRoot = Path.Combine(hostDestinationPath, rootFolderName);
-            ExportDirectoryRecursive(disk, part, node, destRoot, ref filesCopied, ref foldersCreated, ref bytesCopied, 0);
+            ExportDirectoryRecursive(disk, part, node, destRoot, totalEstimatedBytes, onProgress, isCancelled, ref filesCopied, ref foldersCreated, ref bytesCopied, 0);
+        }
+
+        private static long ComputeEstimatedBytes(VirtualFsNode node, int depth)
+        {
+            if (node == null || depth > 48) return 0;
+            if (!node.IsDirectory)
+                return node.SizeBytes > 0 ? node.SizeBytes : Math.Max(0, node.ContentLength);
+
+            long sum = 0;
+            foreach (var child in node.Children)
+                sum += ComputeEstimatedBytes(child, depth + 1);
+            return sum;
+        }
+
+        private static long StreamNodeToHostFile(
+            DiskInfo disk,
+            PartitionEntry part,
+            VirtualFsNode fileNode,
+            string targetFile,
+            long completedBeforeFile,
+            long totalEstimatedBytes,
+            Action<long, long, string> onProgress)
+        {
+            if (onProgress != null)
+                onProgress(completedBeforeFile, totalEstimatedBytes, fileNode.Name);
+
+            using (var fs = new FileStream(targetFile, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
+            {
+                long copied = CopyFileNodeToStream(disk, part, fileNode, fs, long.MaxValue, (doneInFile, fileTotal) =>
+                {
+                    if (onProgress != null)
+                        onProgress(completedBeforeFile + doneInFile, Math.Max(totalEstimatedBytes, completedBeforeFile + fileTotal), fileNode.Name);
+                });
+                fs.Flush();
+                return copied;
+            }
         }
 
         private static void ExportDirectoryRecursive(
-            DiskInfo disk, PartitionEntry part, VirtualFsNode dirNode, string targetDir,
-            ref int filesCopied, ref int foldersCreated, ref long bytesCopied, int depth)
+            DiskInfo disk,
+            PartitionEntry part,
+            VirtualFsNode dirNode,
+            string targetDir,
+            long totalEstimatedBytes,
+            Action<long, long, string> onProgress,
+            Func<bool> isCancelled,
+            ref int filesCopied,
+            ref int foldersCreated,
+            ref long bytesCopied,
+            int depth)
         {
             if (dirNode == null || depth > 48) return;
+            if (isCancelled != null && isCancelled())
+                throw new OperationCanceledException("Export to host was cancelled.");
+
             Directory.CreateDirectory(targetDir);
             foldersCreated++;
 
             foreach (var child in dirNode.Children)
             {
+                if (isCancelled != null && isCancelled())
+                    throw new OperationCanceledException("Export to host was cancelled.");
+
                 string safeChild = SanitizeHostName(child.Name);
                 if (string.IsNullOrEmpty(safeChild) || safeChild == "." || safeChild == "..")
                     continue;
 
                 if (child.IsDirectory)
                 {
-                    ExportDirectoryRecursive(disk, part, child, Path.Combine(targetDir, safeChild), ref filesCopied, ref foldersCreated, ref bytesCopied, depth + 1);
+                    ExportDirectoryRecursive(disk, part, child, Path.Combine(targetDir, safeChild), totalEstimatedBytes, onProgress, isCancelled, ref filesCopied, ref foldersCreated, ref bytesCopied, depth + 1);
                 }
                 else
                 {
-                    byte[] data = ReadFileBytes(disk, part, child);
-                    File.WriteAllBytes(Path.Combine(targetDir, safeChild), data);
+                    long written = StreamNodeToHostFile(disk, part, child, Path.Combine(targetDir, safeChild), bytesCopied, totalEstimatedBytes, onProgress);
                     filesCopied++;
-                    bytesCopied += data.Length;
+                    bytesCopied += written;
                 }
             }
         }
@@ -841,93 +952,114 @@ namespace WinParted.Core
             long blockSize, uint inodeTableBlock, int inodeSize,
             uint inodeNum, string name, string fullPath, HashSet<uint> visited, int depth)
         {
-            if (depth > 8 || !visited.Add(inodeNum))
+            if (depth > 16 || !visited.Add(inodeNum))
                 return null;
 
             byte[] inode = ReadExtInodeBytes(disk, part, blockSize, inodeTableBlock, inodeSize, inodeNum);
             if (inode.Length < 128) return null;
 
             ushort mode = BitConverter.ToUInt16(inode, 0x00);
-            uint sizeLo = BitConverter.ToUInt32(inode, 0x04);
             uint mtime = BitConverter.ToUInt32(inode, 0x10);
             bool isDir = (mode & 0xF000) == 0x4000;
+            if (!isDir)
+                return BuildExtFileNode(disk, part, blockSize, inode, inodeNum, name, fullPath);
 
             var node = new VirtualFsNode
             {
                 Name = name,
                 FullPath = fullPath,
-                IsDirectory = isDir,
-                SizeBytes = sizeLo,
+                IsDirectory = true,
+                SizeBytes = BitConverter.ToUInt32(inode, 0x04),
                 InodeOrObjectId = inodeNum,
                 PermissionsString = FormatUnixMode(mode),
                 ModifiedUtc = FromUnixSeconds(mtime)
             };
 
-            uint firstBlock = ResolveExtFirstBlock(inode);
-            if (!isDir)
+            var dirExtents = ResolveExtExtents(disk, part, blockSize, inode);
+            long dirBytesRead = 0;
+            const long MaxDirScanBytes = 2L * 1048576L;
+
+            for (int ex = 0; ex < dirExtents.Count && dirBytesRead < MaxDirScanBytes; ex++)
             {
-                if (firstBlock > 0)
+                long extOff = dirExtents[ex].Key;
+                long extLen = dirExtents[ex].Value;
+                long cursor = extOff;
+                long endOff = Math.Min(part.EndOffset, extOff + extLen);
+
+                while (cursor < endOff && dirBytesRead < MaxDirScanBytes)
                 {
-                    node.ContentOffset = part.StartingOffset + (long)firstBlock * blockSize;
-                    node.ContentLength = sizeLo;
-                }
-                return node;
-            }
+                    int blkLen = (int)Math.Min(blockSize, endOff - cursor);
+                    if (blkLen < 12) break;
+                    byte[] dirBlock = RawDiskEngine.ReadBytes(disk, cursor, blkLen);
+                    dirBytesRead += blkLen;
+                    cursor += blkLen;
 
-            if (firstBlock == 0) return node;
-            long dirOffset = part.StartingOffset + (long)firstBlock * blockSize;
-            byte[] dirBlock = RawDiskEngine.ReadBytes(disk, dirOffset, (int)Math.Min(blockSize, part.EndOffset - dirOffset));
-
-            int pos = 0;
-            while (pos + 8 <= dirBlock.Length)
-            {
-                uint childInode = BitConverter.ToUInt32(dirBlock, pos + 0);
-                ushort recLen = BitConverter.ToUInt16(dirBlock, pos + 4);
-                byte nameLen = dirBlock[pos + 6];
-                byte fileType = dirBlock[pos + 7];
-                if (recLen < 8 || pos + recLen > dirBlock.Length) break;
-
-                if (childInode != 0 && nameLen > 0 && pos + 8 + nameLen <= dirBlock.Length)
-                {
-                    string childName = Encoding.UTF8.GetString(dirBlock, pos + 8, nameLen);
-                    if (childName != "." && childName != "..")
+                    int pos = 0;
+                    while (pos + 8 <= dirBlock.Length)
                     {
-                        string childPath = fullPath == "/" ? "/" + childName : fullPath + "/" + childName;
-                        byte[] childInodeBytes = ReadExtInodeBytes(disk, part, blockSize, inodeTableBlock, inodeSize, childInode);
-                        bool childIsDir = childInodeBytes.Length >= 2
-                            ? ((BitConverter.ToUInt16(childInodeBytes, 0) & 0xF000) == 0x4000)
-                            : (fileType == 2);
+                        uint childInode = BitConverter.ToUInt32(dirBlock, pos + 0);
+                        ushort recLen = BitConverter.ToUInt16(dirBlock, pos + 4);
+                        byte nameLen = dirBlock[pos + 6];
+                        byte fileType = dirBlock[pos + 7];
+                        if (recLen < 8 || pos + recLen > dirBlock.Length) break;
 
-                        if (childIsDir)
+                        if (childInode != 0 && nameLen > 0 && pos + 8 + nameLen <= dirBlock.Length)
                         {
-                            var sub = ReadExtDirectoryNode(disk, part, vol, blockSize, inodeTableBlock, inodeSize, childInode, childName, childPath, visited, depth + 1);
-                            if (sub != null) node.Children.Add(sub);
-                        }
-                        else if (childInodeBytes.Length >= 128)
-                        {
-                            ushort cMode = BitConverter.ToUInt16(childInodeBytes, 0x00);
-                            uint cSize = BitConverter.ToUInt32(childInodeBytes, 0x04);
-                            uint cMtime = BitConverter.ToUInt32(childInodeBytes, 0x10);
-                            uint cBlock = ResolveExtFirstBlock(childInodeBytes);
-                            node.Children.Add(new VirtualFsNode
+                            string childName = Encoding.UTF8.GetString(dirBlock, pos + 8, nameLen);
+                            if (childName != "." && childName != "..")
                             {
-                                Name = childName,
-                                FullPath = childPath,
-                                IsDirectory = false,
-                                SizeBytes = cSize,
-                                InodeOrObjectId = childInode,
-                                PermissionsString = FormatUnixMode(cMode),
-                                ModifiedUtc = FromUnixSeconds(cMtime),
-                                ContentOffset = cBlock > 0 ? part.StartingOffset + (long)cBlock * blockSize : 0,
-                                ContentLength = cBlock > 0 ? cSize : 0
-                            });
+                                string childPath = fullPath == "/" ? "/" + childName : fullPath + "/" + childName;
+                                byte[] childInodeBytes = ReadExtInodeBytes(disk, part, blockSize, inodeTableBlock, inodeSize, childInode);
+                                bool childIsDir = childInodeBytes.Length >= 2
+                                    ? ((BitConverter.ToUInt16(childInodeBytes, 0) & 0xF000) == 0x4000)
+                                    : (fileType == 2);
+
+                                if (childIsDir)
+                                {
+                                    var sub = ReadExtDirectoryNode(disk, part, vol, blockSize, inodeTableBlock, inodeSize, childInode, childName, childPath, visited, depth + 1);
+                                    if (sub != null) node.Children.Add(sub);
+                                }
+                                else if (childInodeBytes.Length >= 128)
+                                {
+                                    var fileNode = BuildExtFileNode(disk, part, blockSize, childInodeBytes, childInode, childName, childPath);
+                                    if (fileNode != null) node.Children.Add(fileNode);
+                                }
+                            }
                         }
+                        pos += recLen;
                     }
                 }
-                pos += recLen;
             }
 
             return node;
+        }
+
+        private static VirtualFsNode BuildExtFileNode(
+            DiskInfo disk, PartitionEntry part, long blockSize,
+            byte[] inode, uint inodeNum, string name, string fullPath)
+        {
+            ushort mode = BitConverter.ToUInt16(inode, 0x00);
+            uint sizeLo = BitConverter.ToUInt32(inode, 0x04);
+            uint sizeHi = (inode.Length >= 0x70 && (mode & 0xF000) == 0x8000)
+                ? BitConverter.ToUInt32(inode, 0x6C)
+                : 0u;
+            long fullSize = ((long)sizeHi << 32) | sizeLo;
+            uint mtime = BitConverter.ToUInt32(inode, 0x10);
+            var extents = ResolveExtExtents(disk, part, blockSize, inode);
+
+            return new VirtualFsNode
+            {
+                Name = name,
+                FullPath = fullPath,
+                IsDirectory = false,
+                SizeBytes = fullSize,
+                InodeOrObjectId = inodeNum,
+                PermissionsString = FormatUnixMode(mode),
+                ModifiedUtc = FromUnixSeconds(mtime),
+                ContentOffset = extents.Count > 0 ? extents[0].Key : 0,
+                ContentLength = extents.Count > 0 ? fullSize : 0,
+                ContentExtents = extents.Count > 0 ? extents : null
+            };
         }
 
         private static byte[] ReadExtInodeBytes(DiskInfo disk, PartitionEntry part, long blockSize, uint inodeTableBlock, int inodeSize, uint inodeNum)
@@ -939,19 +1071,118 @@ namespace WinParted.Core
             return RawDiskEngine.ReadBytes(disk, offset, inodeSize);
         }
 
-        private static uint ResolveExtFirstBlock(byte[] inode)
+        private static List<KeyValuePair<long, long>> ResolveExtExtents(DiskInfo disk, PartitionEntry part, long blockSize, byte[] inode)
         {
-            if (inode.Length < 100) return 0;
+            var result = new List<KeyValuePair<long, long>>();
+            if (inode == null || inode.Length < 100 || blockSize <= 0) return result;
+
             uint flags = BitConverter.ToUInt32(inode, 0x20);
-            bool usesExtents = (flags & 0x80000u) != 0 || BitConverter.ToUInt16(inode, 0x28) == 0xF30A;
-            if (usesExtents && BitConverter.ToUInt16(inode, 0x28) == 0xF30A)
+            ushort magic = BitConverter.ToUInt16(inode, 0x28);
+            bool usesExtents = (flags & 0x80000u) != 0 || magic == 0xF30A;
+
+            if (usesExtents && magic == 0xF30A)
             {
-                ushort entries = BitConverter.ToUInt16(inode, 0x2A);
-                ushort depth = BitConverter.ToUInt16(inode, 0x2E);
-                if (entries >= 1 && depth == 0)
-                    return BitConverter.ToUInt32(inode, 0x3C);
+                ParseExt4ExtentNode(disk, part, blockSize, inode, 0x28, Math.Min(inode.Length, 0x64), result, 0);
+                return CoalesceExtents(result);
             }
-            return BitConverter.ToUInt32(inode, 0x28);
+
+            // Legacy direct blocks i_block[0..11]
+            for (int i = 0; i < 12 && 0x28 + (i + 1) * 4 <= inode.Length; i++)
+            {
+                uint blk = BitConverter.ToUInt32(inode, 0x28 + i * 4);
+                if (blk == 0) continue;
+                long extOff = part.StartingOffset + (long)blk * blockSize;
+                if (extOff >= part.StartingOffset && extOff < part.EndOffset)
+                    result.Add(new KeyValuePair<long, long>(extOff, Math.Min(blockSize, part.EndOffset - extOff)));
+            }
+
+            // Single indirect block i_block[12]
+            if (0x28 + 13 * 4 <= inode.Length)
+            {
+                uint indBlk = BitConverter.ToUInt32(inode, 0x28 + 12 * 4);
+                if (indBlk > 0)
+                {
+                    long indOff = part.StartingOffset + (long)indBlk * blockSize;
+                    if (indOff >= part.StartingOffset && indOff + 4 <= part.EndOffset)
+                    {
+                        byte[] indBuf = RawDiskEngine.ReadBytes(disk, indOff, (int)Math.Min(blockSize, part.EndOffset - indOff));
+                        for (int p = 0; p + 4 <= indBuf.Length; p += 4)
+                        {
+                            uint blk = BitConverter.ToUInt32(indBuf, p);
+                            if (blk == 0) continue;
+                            long extOff = part.StartingOffset + (long)blk * blockSize;
+                            if (extOff >= part.StartingOffset && extOff < part.EndOffset)
+                                result.Add(new KeyValuePair<long, long>(extOff, Math.Min(blockSize, part.EndOffset - extOff)));
+                        }
+                    }
+                }
+            }
+
+            return CoalesceExtents(result);
+        }
+
+        private static void ParseExt4ExtentNode(
+            DiskInfo disk, PartitionEntry part, long blockSize,
+            byte[] buf, int offset, int maxLen,
+            List<KeyValuePair<long, long>> result, int depth)
+        {
+            if (depth > 5 || offset + 12 > maxLen) return;
+            if (BitConverter.ToUInt16(buf, offset) != 0xF30A) return;
+
+            ushort entries = BitConverter.ToUInt16(buf, offset + 2);
+            ushort ehDepth = BitConverter.ToUInt16(buf, offset + 6);
+            int maxEntries = Math.Min((int)entries, (maxLen - offset - 12) / 12);
+
+            for (int i = 0; i < maxEntries; i++)
+            {
+                int rec = offset + 12 + i * 12;
+                if (ehDepth == 0)
+                {
+                    ushort rawLen = BitConverter.ToUInt16(buf, rec + 4);
+                    uint extBlocks = rawLen > 32768 ? (uint)(rawLen - 32768) : rawLen;
+                    ushort startHi = BitConverter.ToUInt16(buf, rec + 6);
+                    uint startLo = BitConverter.ToUInt32(buf, rec + 8);
+                    long physBlock = ((long)startHi << 32) | startLo;
+                    if (physBlock <= 0 || extBlocks == 0) continue;
+
+                    long extOff = part.StartingOffset + physBlock * blockSize;
+                    long extLen = (long)extBlocks * blockSize;
+                    if (extOff >= part.StartingOffset && extOff < part.EndOffset)
+                        result.Add(new KeyValuePair<long, long>(extOff, Math.Min(extLen, part.EndOffset - extOff)));
+                }
+                else
+                {
+                    uint leafLo = BitConverter.ToUInt32(buf, rec + 4);
+                    ushort leafHi = BitConverter.ToUInt16(buf, rec + 8);
+                    long childBlock = ((long)leafHi << 32) | leafLo;
+                    if (childBlock <= 0) continue;
+
+                    long childOff = part.StartingOffset + childBlock * blockSize;
+                    if (childOff < part.StartingOffset || childOff + 12 > part.EndOffset) continue;
+
+                    byte[] childBuf = RawDiskEngine.ReadBytes(disk, childOff, (int)Math.Min(blockSize, part.EndOffset - childOff));
+                    ParseExt4ExtentNode(disk, part, blockSize, childBuf, 0, childBuf.Length, result, depth + 1);
+                }
+            }
+        }
+
+        private static List<KeyValuePair<long, long>> CoalesceExtents(List<KeyValuePair<long, long>> raw)
+        {
+            if (raw == null || raw.Count <= 1) return raw;
+            var merged = new List<KeyValuePair<long, long>>(raw.Count);
+            KeyValuePair<long, long> cur = raw[0];
+            for (int i = 1; i < raw.Count; i++)
+            {
+                if (cur.Key + cur.Value == raw[i].Key)
+                    cur = new KeyValuePair<long, long>(cur.Key, cur.Value + raw[i].Value);
+                else
+                {
+                    merged.Add(cur);
+                    cur = raw[i];
+                }
+            }
+            merged.Add(cur);
+            return merged;
         }
 
         private struct HfsExtent
@@ -970,6 +1201,12 @@ namespace WinParted.Core
             public ushort Mode;
             public DateTime ModifiedUtc;
             public List<KeyValuePair<long, long>> Extents = new List<KeyValuePair<long, long>>();
+        }
+
+        private struct HfsOverflowRecord
+        {
+            public uint StartBlock;
+            public HfsExtent[] Extents;
         }
 
         private static void ParseHfsPlusVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
@@ -1012,6 +1249,9 @@ namespace WinParted.Core
                 vol.TotalBlocks = totalBlocks;
                 vol.FreeBlocks = freeBlocks;
 
+                ulong extLogicalSize = ReadBE64(vh, 192);
+                var extExtents = ParseHfsExtents(vh, 208);
+
                 ulong catLogicalSize = ReadBE64(vh, 272);
                 var catExtents = ParseHfsExtents(vh, 288);
 
@@ -1021,7 +1261,7 @@ namespace WinParted.Core
 
                 if (blockSize >= 512 && catLogicalSize >= 512 && catExtents[0].BlockCount > 0 && catExtents[0].StartBlock > 0)
                 {
-                    if (TryParseHfsPlusCatalogBTree(disk, part, vol, embedBase, blockSize, catLogicalSize, catExtents, isHfsx))
+                    if (TryParseHfsPlusCatalogBTree(disk, part, vol, embedBase, blockSize, catLogicalSize, catExtents, extLogicalSize, extExtents, isHfsx))
                         return;
                 }
             }
@@ -1062,16 +1302,16 @@ namespace WinParted.Core
 
         private static byte[] ReadHfsForkBytes(
             DiskInfo disk, long partStart, long partEnd, long embedBase, uint blockSize,
-            HfsExtent[] extents, long forkOffset, int length)
+            IList<HfsExtent> extents, long forkOffset, int length)
         {
-            if (length <= 0 || forkOffset < 0) return new byte[0];
+            if (length <= 0 || forkOffset < 0 || extents == null) return new byte[0];
 
             byte[] output = new byte[length];
             int copied = 0;
             long logicalCursor = forkOffset;
 
             long extLogicalStart = 0;
-            for (int i = 0; i < extents.Length && copied < length; i++)
+            for (int i = 0; i < extents.Count && copied < length; i++)
             {
                 if (extents[i].BlockCount == 0) break;
                 long extByteLen = (long)extents[i].BlockCount * blockSize;
@@ -1105,10 +1345,135 @@ namespace WinParted.Core
             return trimmed;
         }
 
+        private static Dictionary<uint, List<HfsOverflowRecord>> ParseHfsExtentsOverflowBTree(
+            DiskInfo disk, PartitionEntry part, long embedBase,
+            uint blockSize, ulong extLogicalSize, HfsExtent[] extExtents)
+        {
+            var map = new Dictionary<uint, List<HfsOverflowRecord>>();
+            if (extLogicalSize < 512 || extExtents == null || extExtents.Length == 0 || extExtents[0].BlockCount == 0)
+                return map;
+
+            byte[] node0 = ReadHfsForkBytes(disk, part.StartingOffset, part.EndOffset, embedBase, blockSize, extExtents, 0, 512);
+            if (node0.Length < 44 || (sbyte)node0[8] != 1)
+                return map;
+
+            uint leafRecords = ReadBE32(node0, 20);
+            uint firstLeafNode = ReadBE32(node0, 24);
+            ushort nodeSize = ReadBE16(node0, 32);
+
+            if (leafRecords == 0 || firstLeafNode == 0 || nodeSize < 512 || (nodeSize & (nodeSize - 1)) != 0)
+                return map;
+
+            var visited = new HashSet<uint>();
+            uint curNode = firstLeafNode;
+            int nodesWalked = 0;
+            const int MaxExtLeafNodes = 4096;
+
+            while (curNode != 0 && nodesWalked < MaxExtLeafNodes)
+            {
+                if (!visited.Add(curNode)) break;
+                long nodeOffset = (long)curNode * nodeSize;
+                if ((ulong)nodeOffset + nodeSize > extLogicalSize) break;
+
+                byte[] nodeBuf = ReadHfsForkBytes(disk, part.StartingOffset, part.EndOffset, embedBase, blockSize, extExtents, nodeOffset, nodeSize);
+                if (nodeBuf.Length < 14) break;
+
+                uint fLink = ReadBE32(nodeBuf, 0);
+                sbyte kind = (sbyte)nodeBuf[8];
+                ushort numRecords = ReadBE16(nodeBuf, 10);
+                nodesWalked++;
+
+                if (kind == -1) // kBTLeafNode
+                {
+                    int offTableStart = nodeSize - 2 * (numRecords + 1);
+                    for (int r = 0; r < numRecords; r++)
+                    {
+                        int offPos = nodeSize - 2 * (r + 1);
+                        if (offPos < 14 || offPos + 2 > nodeBuf.Length) break;
+
+                        int recOff = ReadBE16(nodeBuf, offPos);
+                        if (recOff < 14 || recOff + 12 > nodeBuf.Length || (offTableStart > 14 && recOff >= offTableStart + 2))
+                            continue;
+
+                        ushort keyLen = ReadBE16(nodeBuf, recOff);
+                        if (keyLen < 10 || recOff + 2 + keyLen > nodeBuf.Length) continue;
+
+                        byte forkType = nodeBuf[recOff + 2];
+                        if (forkType != 0) continue; // data fork only
+
+                        uint fileId = ReadBE32(nodeBuf, recOff + 4);
+                        uint startBlock = ReadBE32(nodeBuf, recOff + 8);
+
+                        int dataOff = recOff + 2 + keyLen;
+                        if ((dataOff & 1) != 0) dataOff++;
+                        if (dataOff + 64 > nodeBuf.Length) continue;
+
+                        List<HfsOverflowRecord> recList;
+                        if (!map.TryGetValue(fileId, out recList))
+                        {
+                            recList = new List<HfsOverflowRecord>();
+                            map[fileId] = recList;
+                        }
+                        recList.Add(new HfsOverflowRecord
+                        {
+                            StartBlock = startBlock,
+                            Extents = ParseHfsExtents(nodeBuf, dataOff)
+                        });
+                    }
+                }
+
+                curNode = fLink;
+            }
+
+            return map;
+        }
+
+        private static List<HfsExtent> CombineHfsDataExtents(
+            HfsExtent[] inlineExtents, uint fileId, Dictionary<uint, List<HfsOverflowRecord>> overflowMap)
+        {
+            var combined = new List<HfsExtent>();
+            ulong coveredBlocks = 0;
+
+            if (inlineExtents != null)
+            {
+                for (int i = 0; i < inlineExtents.Length; i++)
+                {
+                    if (inlineExtents[i].BlockCount == 0) break;
+                    combined.Add(inlineExtents[i]);
+                    coveredBlocks += inlineExtents[i].BlockCount;
+                }
+            }
+
+            List<HfsOverflowRecord> overflowRecs;
+            if (overflowMap != null && overflowMap.TryGetValue(fileId, out overflowRecs) && overflowRecs.Count > 0)
+            {
+                overflowRecs.Sort((a, b) => a.StartBlock.CompareTo(b.StartBlock));
+                for (int r = 0; r < overflowRecs.Count; r++)
+                {
+                    var rec = overflowRecs[r];
+                    if ((ulong)rec.StartBlock < coveredBlocks) continue;
+                    ulong cursor = rec.StartBlock;
+                    for (int e = 0; e < rec.Extents.Length; e++)
+                    {
+                        if (rec.Extents[e].BlockCount == 0) break;
+                        combined.Add(rec.Extents[e]);
+                        cursor += rec.Extents[e].BlockCount;
+                    }
+                    coveredBlocks = cursor;
+                }
+            }
+
+            return combined;
+        }
+
         private static bool TryParseHfsPlusCatalogBTree(
             DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, long embedBase,
-            uint blockSize, ulong catLogicalSize, HfsExtent[] catExtents, bool isHfsx)
+            uint blockSize, ulong catLogicalSize, HfsExtent[] catInlineExtents,
+            ulong extLogicalSize, HfsExtent[] extExtents, bool isHfsx)
         {
+            var overflowMap = ParseHfsExtentsOverflowBTree(disk, part, embedBase, blockSize, extLogicalSize, extExtents);
+            var catExtents = CombineHfsDataExtents(catInlineExtents, 4u, overflowMap); // kHFSCatalogFileID = 4
+
             byte[] node0 = ReadHfsForkBytes(disk, part.StartingOffset, part.EndOffset, embedBase, blockSize, catExtents, 0, 512);
             if (node0.Length < 44) return false;
 
@@ -1131,8 +1496,8 @@ namespace WinParted.Core
             bool truncated = false;
             string rootVolumeName = null;
 
-            const int MaxLeafNodes = 512;
-            const int MaxCatalogEntries = 4000;
+            const int MaxLeafNodes = 4096;
+            const int MaxCatalogEntries = 32768;
 
             while (curNode != 0 && nodesWalked < MaxLeafNodes && items.Count < MaxCatalogEntries)
             {
@@ -1217,7 +1582,8 @@ namespace WinParted.Core
                             if (mode == 0) mode = 0x81A4;
 
                             ulong logicalSize = ReadBE64(nodeBuf, dataOff + 88);
-                            var fileExtents = ParseHfsExtents(nodeBuf, dataOff + 104);
+                            var inlineExtents = ParseHfsExtents(nodeBuf, dataOff + 104);
+                            var allExtents = CombineHfsDataExtents(inlineExtents, fileId, overflowMap);
 
                             var item = new HfsCatalogItem
                             {
@@ -1230,14 +1596,14 @@ namespace WinParted.Core
                                 ModifiedUtc = FromHfsPlusSeconds(modDate)
                             };
 
-                            for (int e = 0; e < fileExtents.Length; e++)
+                            for (int e = 0; e < allExtents.Count; e++)
                             {
-                                if (fileExtents[e].BlockCount == 0) break;
-                                long extAbsOff = part.StartingOffset + embedBase + (long)fileExtents[e].StartBlock * blockSize;
-                                long extByteLen = (long)fileExtents[e].BlockCount * blockSize;
-                                if (extAbsOff >= part.StartingOffset && extAbsOff < part.EndOffset)
-                                    item.Extents.Add(new KeyValuePair<long, long>(extAbsOff, extByteLen));
+                                long extAbsOff = part.StartingOffset + embedBase + (long)allExtents[e].StartBlock * blockSize;
+                                long extByteLen = (long)allExtents[e].BlockCount * blockSize;
+                                if (extAbsOff >= part.StartingOffset && extAbsOff < part.EndOffset && extByteLen > 0)
+                                    item.Extents.Add(new KeyValuePair<long, long>(extAbsOff, Math.Min(extByteLen, part.EndOffset - extAbsOff)));
                             }
+                            item.Extents = CoalesceExtents(item.Extents);
 
                             items.Add(item);
                         }
