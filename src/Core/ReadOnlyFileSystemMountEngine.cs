@@ -75,6 +75,12 @@ namespace WinParted.Core
                 case FileSystemType.Ext4:
                 case FileSystemType.Btrfs:
                 case FileSystemType.XFS:
+                case FileSystemType.F2FS:
+                case FileSystemType.ZFS:
+                case FileSystemType.SquashFS:
+                case FileSystemType.ISO9660:
+                case FileSystemType.UDF:
+                case FileSystemType.ReFS:
                 case FileSystemType.APFS:
                 case FileSystemType.HFSPlus:
                 case FileSystemType.HFS:
@@ -127,7 +133,7 @@ namespace WinParted.Core
             if (requireVirtualDisk && !disk.IsVirtualImage)
                 throw new InvalidOperationException("Test safety restriction: Read-only mount tests are restricted to virtual disk images.");
             if (!IsSupportedNonMicrosoftFs(part.FileSystem))
-                throw new NotSupportedException("Read-only explorer mount is intended for non-Microsoft filesystems (ext2/3/4, Btrfs, XFS, APFS, HFS+, HFS, Linux Swap/LVM2). Selected: " + FileSystemColors.GetDisplayName(part.FileSystem));
+                throw new NotSupportedException("Read-only explorer mount is intended for supported volumes (ext2/3/4, Btrfs, XFS, F2FS, ZFS, SquashFS, ISO9660, UDF, APFS, HFS+, HFS, ReFS, Swap/LVM2). Selected: " + FileSystemColors.GetDisplayName(part.FileSystem));
 
             string mountId = string.Format("ro_disk{0}_p{1}", disk.DiskNumber, part.PartitionNumber);
             string mountPath = string.Format("/mnt/ro/disk{0}p{1}", disk.DiskNumber, part.PartitionNumber);
@@ -157,6 +163,18 @@ namespace WinParted.Core
             else if (part.FileSystem == FileSystemType.HFSPlus)
             {
                 ParseHfsPlusVolume(disk, part, vol);
+            }
+            else if (part.FileSystem == FileSystemType.Btrfs)
+            {
+                ParseBtrfsVolume(disk, part, vol);
+            }
+            else if (part.FileSystem == FileSystemType.XFS)
+            {
+                ParseXfsVolume(disk, part, vol);
+            }
+            else if (part.FileSystem == FileSystemType.ISO9660)
+            {
+                ParseIso9660Volume(disk, part, vol);
             }
             else
             {
@@ -1755,6 +1773,766 @@ namespace WinParted.Core
             }
         }
 
+        private sealed class BtrfsChunkMap
+        {
+            public ulong LogicalStart;
+            public ulong Length;
+            public ulong PhysicalStart;
+        }
+
+        private sealed class BtrfsInodeMeta
+        {
+            public long Size;
+            public uint Mode;
+            public uint MtimeSec;
+        }
+
+        private static void ParseBtrfsVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
+        {
+            if (part.PartitionLength < 0x15000L)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            byte[] sb = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x10000L, 4096);
+            if (sb.Length < 0x350 || !MatchesAscii(sb, 0x40, "_BHRfS_M"))
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            ulong rootLogical = BitConverter.ToUInt64(sb, 0x50);
+            uint sectorSize = BitConverter.ToUInt32(sb, 0x90);
+            uint nodeSize = BitConverter.ToUInt32(sb, 0x94);
+            uint sysChunkSize = BitConverter.ToUInt32(sb, 0xA0);
+            if (sectorSize < 512 || sectorSize > 65536) sectorSize = 4096;
+            if (nodeSize < 4096 || nodeSize > 65536) nodeSize = 16384;
+
+            vol.BlockSize = sectorSize;
+            long totalBytes = BitConverter.ToInt64(sb, 0x70);
+            long bytesUsed = BitConverter.ToInt64(sb, 0x78);
+            if (totalBytes > 0)
+            {
+                vol.TotalBlocks = totalBytes / sectorSize;
+                vol.FreeBlocks = Math.Max(0, (totalBytes - bytesUsed) / sectorSize);
+            }
+
+            // Parse sys_chunk_array at +0x32B
+            var chunks = new List<BtrfsChunkMap>();
+            int scEnd = Math.Min(sb.Length, 0x32B + (int)Math.Min(2048U, sysChunkSize));
+            int p = 0x32B;
+            while (p + 17 + 48 <= scEnd)
+            {
+                byte keyType = sb[p + 8];
+                ulong chunkLog = BitConverter.ToUInt64(sb, p + 9);
+                p += 17;
+                if (keyType != 228 || p + 48 > scEnd) break;
+                ulong chunkLen = BitConverter.ToUInt64(sb, p + 0);
+                ushort numStripes = BitConverter.ToUInt16(sb, p + 44);
+                int recBytes = 48 + numStripes * 32;
+                if (numStripes >= 1 && p + 48 + 32 <= scEnd)
+                {
+                    ulong physOff = BitConverter.ToUInt64(sb, p + 48 + 8);
+                    chunks.Add(new BtrfsChunkMap { LogicalStart = chunkLog, Length = chunkLen, PhysicalStart = physOff });
+                }
+                p += recBytes;
+            }
+
+            // Locate FS tree root (owner 5) directly or via ROOT_TREE (owner 1) -> ROOT_ITEM (objectid 5, type 132)
+            long startNodePhys = ResolveBtrfsLogical(chunks, rootLogical, part.PartitionLength);
+            if (startNodePhys < 0 || startNodePhys + nodeSize > part.PartitionLength)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            byte[] firstNode = RawDiskEngine.ReadBytes(disk, part.StartingOffset + startNodePhys, (int)nodeSize);
+            if (firstNode.Length < 101)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            ulong treeOwner = BitConverter.ToUInt64(firstNode, 0x58);
+            ulong fsRootLogical = rootLogical;
+            if (treeOwner == 1UL)
+            {
+                ulong foundFs = FindBtrfsRootItemLogical(disk, part, chunks, firstNode, (int)nodeSize, 5UL, 0);
+                if (foundFs == 0)
+                {
+                    ParseCatalogOrMetadataVolume(disk, part, vol);
+                    return;
+                }
+                fsRootLogical = foundFs;
+            }
+
+            var inodes = new Dictionary<ulong, BtrfsInodeMeta>();
+            var dirLinks = new List<KeyValuePair<ulong, KeyValuePair<string, ulong>>>();
+            var dirTypes = new Dictionary<string, byte>(StringComparer.Ordinal);
+            var inlineData = new Dictionary<ulong, byte[]>();
+            var regExtents = new Dictionary<ulong, List<KeyValuePair<long, long>>>();
+            int leavesRead = 0;
+
+            CollectBtrfsTreeLeaves(disk, part, chunks, fsRootLogical, (int)nodeSize, inodes, dirLinks, dirTypes, inlineData, regExtents, ref leavesRead, 0);
+
+            if (inodes.Count == 0 && dirLinks.Count == 0)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            var nodesByObjId = new Dictionary<ulong, VirtualFsNode>();
+            foreach (var kv in inodes)
+            {
+                uint mode = kv.Value.Mode;
+                bool isDir = (mode & 0xF000U) == 0x4000U;
+                var n = new VirtualFsNode
+                {
+                    InodeOrObjectId = kv.Key,
+                    IsDirectory = isDir,
+                    SizeBytes = isDir ? 0 : kv.Value.Size,
+                    ContentLength = isDir ? 0 : kv.Value.Size,
+                    PermissionsString = FormatUnixMode((ushort)(mode & 0xFFFFU)),
+                    ModifiedUtc = FromUnixSeconds(kv.Value.MtimeSec)
+                };
+
+                byte[] inl;
+                List<KeyValuePair<long, long>> exts;
+                if (!isDir && inlineData.TryGetValue(kv.Key, out inl))
+                {
+                    n.InlineContent = inl;
+                    n.ContentLength = 0;
+                }
+                else if (!isDir && regExtents.TryGetValue(kv.Key, out exts) && exts.Count > 0)
+                {
+                    n.ContentExtents = exts;
+                    n.ContentOffset = exts[0].Key;
+                }
+
+                nodesByObjId[kv.Key] = n;
+            }
+
+            VirtualFsNode root;
+            if (!nodesByObjId.TryGetValue(256UL, out root))
+            {
+                root = new VirtualFsNode
+                {
+                    Name = "/",
+                    FullPath = "/",
+                    IsDirectory = true,
+                    InodeOrObjectId = 256UL,
+                    PermissionsString = "drwxr-xr-x"
+                };
+                nodesByObjId[256UL] = root;
+            }
+            else
+            {
+                root.Name = "/";
+                root.FullPath = "/";
+                root.IsDirectory = true;
+            }
+
+            var attached = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var link in dirLinks)
+            {
+                ulong parentId = link.Key;
+                string name = link.Value.Key;
+                ulong childId = link.Value.Value;
+                if (string.IsNullOrEmpty(name) || name == "." || name == "..") continue;
+                string dedupKey = parentId + ":" + name;
+                if (!attached.Add(dedupKey)) continue;
+
+                VirtualFsNode parentNode;
+                VirtualFsNode childNode;
+                if (!nodesByObjId.TryGetValue(parentId, out parentNode) || !parentNode.IsDirectory) continue;
+                if (!nodesByObjId.TryGetValue(childId, out childNode))
+                {
+                    byte ftype;
+                    dirTypes.TryGetValue(dedupKey, out ftype);
+                    childNode = new VirtualFsNode
+                    {
+                        InodeOrObjectId = childId,
+                        IsDirectory = (ftype == 2),
+                        PermissionsString = (ftype == 2) ? "drwxr-xr-x" : "-rw-r--r--"
+                    };
+                    nodesByObjId[childId] = childNode;
+                }
+
+                childNode.Name = name;
+                parentNode.Children.Add(childNode);
+            }
+
+            SortAndAssignPaths(root, "/");
+            vol.SuperblockSummary = string.Format(
+                "Btrfs CoW ('{0}') | Sector={1} B | Node={2} B | Items={3} | Read-Only",
+                string.IsNullOrEmpty(vol.Label) ? "btrfs" : vol.Label,
+                sectorSize, nodeSize, inodes.Count);
+            vol.RootNode = root;
+        }
+
+        private static long ResolveBtrfsLogical(List<BtrfsChunkMap> chunks, ulong logical, long partLength)
+        {
+            for (int i = 0; i < chunks.Count; i++)
+            {
+                var c = chunks[i];
+                if (logical >= c.LogicalStart && logical < c.LogicalStart + c.Length)
+                {
+                    ulong phys = c.PhysicalStart + (logical - c.LogicalStart);
+                    if (phys < (ulong)partLength) return (long)phys;
+                }
+            }
+            if (logical < (ulong)partLength) return (long)logical;
+            return -1;
+        }
+
+        private static ulong FindBtrfsRootItemLogical(DiskInfo disk, PartitionEntry part, List<BtrfsChunkMap> chunks, byte[] node, int nodeSize, ulong targetRootObj, int depth)
+        {
+            if (depth > 6 || node.Length < 101) return 0;
+            uint nritems = BitConverter.ToUInt32(node, 0x60);
+            byte level = node[0x64];
+            if (level == 0)
+            {
+                for (uint i = 0; i < nritems; i++)
+                {
+                    int hOff = 101 + (int)i * 25;
+                    if (hOff + 25 > node.Length) break;
+                    ulong obj = BitConverter.ToUInt64(node, hOff);
+                    byte kType = node[hOff + 8];
+                    uint dataRel = BitConverter.ToUInt32(node, hOff + 17);
+                    uint dataSize = BitConverter.ToUInt32(node, hOff + 21);
+                    int pOff = 101 + (int)dataRel;
+                    if (obj == targetRootObj && kType == 132 && dataSize >= 184 && pOff + 184 <= node.Length)
+                        return BitConverter.ToUInt64(node, pOff + 176);
+                }
+                return 0;
+            }
+
+            // Internal node: btrfs_key_ptr entries are 33 bytes each (17B key + 8B blockptr + 8B gen)
+            int childIdx = -1;
+            for (uint i = 0; i < nritems; i++)
+            {
+                int kOff = 101 + (int)i * 33;
+                if (kOff + 33 > node.Length) break;
+                ulong obj = BitConverter.ToUInt64(node, kOff);
+                if (obj <= targetRootObj) childIdx = (int)i;
+                else break;
+            }
+            if (childIdx < 0 && nritems > 0) childIdx = 0;
+            if (childIdx >= 0)
+            {
+                ulong ptrLogical = BitConverter.ToUInt64(node, 101 + childIdx * 33 + 17);
+                long ptrPhys = ResolveBtrfsLogical(chunks, ptrLogical, part.PartitionLength);
+                if (ptrPhys >= 0 && ptrPhys + nodeSize <= part.PartitionLength)
+                {
+                    byte[] child = RawDiskEngine.ReadBytes(disk, part.StartingOffset + ptrPhys, nodeSize);
+                    return FindBtrfsRootItemLogical(disk, part, chunks, child, nodeSize, targetRootObj, depth + 1);
+                }
+            }
+            return 0;
+        }
+
+        private static void CollectBtrfsTreeLeaves(
+            DiskInfo disk, PartitionEntry part, List<BtrfsChunkMap> chunks,
+            ulong nodeLogical, int nodeSize,
+            Dictionary<ulong, BtrfsInodeMeta> inodes,
+            List<KeyValuePair<ulong, KeyValuePair<string, ulong>>> dirLinks,
+            Dictionary<string, byte> dirTypes,
+            Dictionary<ulong, byte[]> inlineData,
+            Dictionary<ulong, List<KeyValuePair<long, long>>> regExtents,
+            ref int leavesRead, int depth)
+        {
+            if (depth > 6 || leavesRead >= 64) return;
+            long phys = ResolveBtrfsLogical(chunks, nodeLogical, part.PartitionLength);
+            if (phys < 0 || phys + nodeSize > part.PartitionLength) return;
+
+            byte[] node = RawDiskEngine.ReadBytes(disk, part.StartingOffset + phys, nodeSize);
+            if (node.Length < 101) return;
+            uint nritems = BitConverter.ToUInt32(node, 0x60);
+            byte level = node[0x64];
+
+            if (level > 0)
+            {
+                for (uint i = 0; i < nritems && leavesRead < 64; i++)
+                {
+                    int kOff = 101 + (int)i * 33;
+                    if (kOff + 33 > node.Length) break;
+                    ulong childLogical = BitConverter.ToUInt64(node, kOff + 17);
+                    CollectBtrfsTreeLeaves(disk, part, chunks, childLogical, nodeSize, inodes, dirLinks, dirTypes, inlineData, regExtents, ref leavesRead, depth + 1);
+                }
+                return;
+            }
+
+            leavesRead++;
+            for (uint i = 0; i < nritems; i++)
+            {
+                int hOff = 101 + (int)i * 25;
+                if (hOff + 25 > node.Length) break;
+                ulong objId = BitConverter.ToUInt64(node, hOff);
+                byte kType = node[hOff + 8];
+                uint dataRel = BitConverter.ToUInt32(node, hOff + 17);
+                uint dataSize = BitConverter.ToUInt32(node, hOff + 21);
+                int pOff = 101 + (int)dataRel;
+                if (pOff < 101 || pOff + dataSize > node.Length) continue;
+
+                if (kType == 1 && dataSize >= 148)
+                {
+                    inodes[objId] = new BtrfsInodeMeta
+                    {
+                        Size = (long)BitConverter.ToUInt64(node, pOff + 16),
+                        Mode = BitConverter.ToUInt32(node, pOff + 52),
+                        MtimeSec = (uint)BitConverter.ToUInt64(node, pOff + 136)
+                    };
+                }
+                else if ((kType == 84 || kType == 96) && dataSize >= 30)
+                {
+                    int cur = pOff;
+                    int end = pOff + (int)dataSize;
+                    while (cur + 30 <= end)
+                    {
+                        ulong childObj = BitConverter.ToUInt64(node, cur);
+                        ushort dLen = BitConverter.ToUInt16(node, cur + 25);
+                        ushort nLen = BitConverter.ToUInt16(node, cur + 27);
+                        byte ft = node[cur + 29];
+                        cur += 30;
+                        if (cur + nLen + dLen > end) break;
+                        string name = Encoding.UTF8.GetString(node, cur, nLen);
+                        cur += nLen + dLen;
+                        if (childObj != 0 && !string.IsNullOrEmpty(name))
+                        {
+                            dirLinks.Add(new KeyValuePair<ulong, KeyValuePair<string, ulong>>(objId, new KeyValuePair<string, ulong>(name, childObj)));
+                            dirTypes[objId + ":" + name] = ft;
+                        }
+                    }
+                }
+                else if (kType == 108 && dataSize >= 21)
+                {
+                    byte compression = node[pOff + 16];
+                    byte extType = node[pOff + 20];
+                    if (extType == 0 && compression == 0)
+                    {
+                        int inlLen = (int)dataSize - 21;
+                        if (inlLen >= 0)
+                        {
+                            byte[] raw = new byte[inlLen];
+                            Array.Copy(node, pOff + 21, raw, 0, inlLen);
+                            inlineData[objId] = raw;
+                        }
+                    }
+                    else if (extType == 1 && compression == 0 && dataSize >= 53)
+                    {
+                        ulong diskBytenr = BitConverter.ToUInt64(node, pOff + 21);
+                        ulong extOffInDisk = BitConverter.ToUInt64(node, pOff + 37);
+                        ulong numBytes = BitConverter.ToUInt64(node, pOff + 45);
+                        if (diskBytenr > 0 && numBytes > 0)
+                        {
+                            long extPhys = ResolveBtrfsLogical(chunks, diskBytenr + extOffInDisk, part.PartitionLength);
+                            if (extPhys >= 0)
+                            {
+                                List<KeyValuePair<long, long>> list;
+                                if (!regExtents.TryGetValue(objId, out list))
+                                {
+                                    list = new List<KeyValuePair<long, long>>();
+                                    regExtents[objId] = list;
+                                }
+                                list.Add(new KeyValuePair<long, long>(part.StartingOffset + extPhys, (long)numBytes));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private sealed class XfsGeom
+        {
+            public uint BlockSize;
+            public ushort InodeSize;
+            public uint AgBlocks;
+            public byte InopbLog;
+            public byte AgBlkLog;
+            public bool HasFtype;
+        }
+
+        private static void ParseXfsVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
+        {
+            if (part.PartitionLength < 4096)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            byte[] sb = RawDiskEngine.ReadBytes(disk, part.StartingOffset, 4096);
+            if (sb.Length < 152 || !MatchesAscii(sb, 0, "XFSB"))
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            uint blockSize = ReadBE32(sb, 4);
+            bool isValidBE = blockSize >= 512 && blockSize <= 65536 && (blockSize & (blockSize - 1)) == 0;
+            if (!isValidBE)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            ulong dblocks = ReadBE64(sb, 8);
+            ulong fdblocks = ReadBE64(sb, 144);
+            ulong rootIno = ReadBE64(sb, 56);
+            uint agBlocks = ReadBE32(sb, 84);
+            ushort versionNum = ReadBE16(sb, 100);
+            ushort inodeSize = ReadBE16(sb, 104);
+            if (inodeSize < 256 || inodeSize > 2048) inodeSize = 512;
+            byte inopbLog = sb[123];
+            byte agBlkLog = sb[124];
+            uint featIncompat = sb.Length >= 220 ? ReadBE32(sb, 216) : 0U;
+            bool hasFtype = ((versionNum & 0x000F) == 5 && (featIncompat & 0x04U) != 0) || ((versionNum & 0x000F) != 5 && (versionNum & 0x0200) != 0 && sb.Length >= 220 && (featIncompat & 0x04U) != 0);
+
+            vol.BlockSize = blockSize;
+            vol.TotalBlocks = (long)dblocks;
+            vol.FreeBlocks = (long)Math.Min(dblocks, fdblocks);
+
+            var geom = new XfsGeom
+            {
+                BlockSize = blockSize,
+                InodeSize = inodeSize,
+                AgBlocks = agBlocks,
+                InopbLog = inopbLog,
+                AgBlkLog = agBlkLog,
+                HasFtype = hasFtype
+            };
+
+            var visited = new HashSet<ulong>();
+            var root = BuildXfsNodeRecursive(disk, part, geom, rootIno, "/", visited, 0);
+            if (root == null)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            root.Name = "/";
+            root.FullPath = "/";
+            root.IsDirectory = true;
+            SortAndAssignPaths(root, "/");
+            vol.SuperblockSummary = string.Format(
+                "XFS v{0} ('{1}') | BlockSize={2} B | InodeSize={3} B | RootIno={4} | Read-Only",
+                (versionNum & 0x000F) == 5 ? 5 : 4,
+                string.IsNullOrEmpty(vol.Label) ? "xfs" : vol.Label,
+                blockSize, inodeSize, rootIno);
+            vol.RootNode = root;
+        }
+
+        private static long ConvertXfsInoToRelOffset(XfsGeom g, ulong ino)
+        {
+            if (g.AgBlkLog == 0 || g.InopbLog == 0 || g.AgBlocks == 0)
+                return (long)ino * g.InodeSize;
+            int totalLog = g.AgBlkLog + g.InopbLog;
+            ulong ag = (totalLog < 63) ? (ino >> totalLog) : 0UL;
+            ulong agbno = (ino >> g.InopbLog) & ((1UL << g.AgBlkLog) - 1UL);
+            ulong idx = ino & ((1UL << g.InopbLog) - 1UL);
+            ulong block = ag * g.AgBlocks + agbno;
+            return (long)(block * g.BlockSize + idx * g.InodeSize);
+        }
+
+        private static List<KeyValuePair<long, long>> ParseXfsBmbtExtents(PartitionEntry part, XfsGeom g, byte[] inodeBuf, int dataForkOff, uint nextents, long maxFileSize)
+        {
+            var runs = new List<KeyValuePair<long, long>>();
+            long remaining = maxFileSize;
+            for (uint i = 0; i < nextents && remaining > 0; i++)
+            {
+                int rOff = dataForkOff + (int)i * 16;
+                if (rOff + 16 > inodeBuf.Length) break;
+                ulong hi = ReadBE64(inodeBuf, rOff);
+                ulong lo = ReadBE64(inodeBuf, rOff + 8);
+                ulong startBlock = ((hi & 0x1FFUL) << 43) | (lo >> 21);
+                ulong blockCount = lo & 0x1FFFFFUL;
+                ulong fsbMask = (1UL << g.AgBlkLog) - 1UL;
+                ulong physBlock = (g.AgBlkLog > 0 && g.AgBlocks > 0)
+                    ? ((startBlock >> g.AgBlkLog) * g.AgBlocks + (startBlock & fsbMask))
+                    : startBlock;
+                long physOff = part.StartingOffset + (long)(physBlock * g.BlockSize);
+                long extBytes = (long)(blockCount * g.BlockSize);
+                long used = Math.Min(remaining, extBytes);
+                if (physOff >= part.StartingOffset && physOff < part.EndOffset && used > 0)
+                {
+                    runs.Add(new KeyValuePair<long, long>(physOff, used));
+                    remaining -= used;
+                }
+            }
+            return runs;
+        }
+
+        private static VirtualFsNode BuildXfsNodeRecursive(DiskInfo disk, PartitionEntry part, XfsGeom g, ulong ino, string name, HashSet<ulong> visited, int depth)
+        {
+            if (depth > 24 || !visited.Add(ino)) return null;
+            long relOff = ConvertXfsInoToRelOffset(g, ino);
+            if (relOff < 0 || relOff + g.InodeSize > part.PartitionLength) return null;
+
+            byte[] buf = RawDiskEngine.ReadBytes(disk, part.StartingOffset + relOff, g.InodeSize);
+            if (buf.Length < 100 || ReadBE16(buf, 0) != 0x494E) return null;
+
+            ushort mode = ReadBE16(buf, 2);
+            byte version = buf[4];
+            byte format = buf[5];
+            uint mtimeSec = ReadBE32(buf, 40);
+            long size = (long)ReadBE64(buf, 56);
+            uint nextents = ReadBE32(buf, 76);
+            int dataForkOff = (version >= 3) ? 176 : 100;
+            if (dataForkOff > buf.Length) return null;
+
+            bool isDir = (mode & 0xF000U) == 0x4000U;
+            var node = new VirtualFsNode
+            {
+                Name = name,
+                IsDirectory = isDir,
+                SizeBytes = isDir ? 0 : size,
+                ContentLength = isDir ? 0 : size,
+                InodeOrObjectId = ino,
+                PermissionsString = FormatUnixMode(mode),
+                ModifiedUtc = FromUnixSeconds(mtimeSec)
+            };
+
+            if (!isDir)
+            {
+                if (format == 1 && size >= 0)
+                {
+                    int len = (int)Math.Min(size, buf.Length - dataForkOff);
+                    if (len > 0)
+                    {
+                        byte[] inlineBytes = new byte[len];
+                        Array.Copy(buf, dataForkOff, inlineBytes, 0, len);
+                        node.InlineContent = inlineBytes;
+                        node.ContentLength = 0;
+                    }
+                }
+                else if (format == 2 && nextents > 0 && size > 0)
+                {
+                    var exts = ParseXfsBmbtExtents(part, g, buf, dataForkOff, nextents, size);
+                    if (exts.Count > 0)
+                    {
+                        node.ContentExtents = exts;
+                        node.ContentOffset = exts[0].Key;
+                    }
+                }
+                return node;
+            }
+
+            if (format == 1 && dataForkOff + 6 <= buf.Length)
+            {
+                byte count = buf[dataForkOff];
+                byte i8Count = buf[dataForkOff + 1];
+                bool use64 = i8Count > 0;
+                int cur = dataForkOff + (use64 ? 10 : 6);
+                for (int i = 0; i < count && cur < buf.Length; i++)
+                {
+                    int namelen = buf[cur++];
+                    if (cur + 2 + namelen > buf.Length) break;
+                    cur += 2; // 2-byte shortform offset
+                    string childName = Encoding.UTF8.GetString(buf, cur, namelen);
+                    cur += namelen;
+                    if (g.HasFtype)
+                    {
+                        if (cur >= buf.Length) break;
+                        cur++;
+                    }
+                    int inoBytes = use64 ? 8 : 4;
+                    if (cur + inoBytes > buf.Length) break;
+                    ulong childIno = use64 ? ReadBE64(buf, cur) : (ulong)ReadBE32(buf, cur);
+                    cur += inoBytes;
+                    if (!string.IsNullOrEmpty(childName) && childName != "." && childName != "..")
+                    {
+                        var childNode = BuildXfsNodeRecursive(disk, part, g, childIno, childName, visited, depth + 1);
+                        if (childNode != null) node.Children.Add(childNode);
+                    }
+                }
+            }
+            else if (format == 2 && nextents > 0)
+            {
+                var dirRuns = ParseXfsBmbtExtents(part, g, buf, dataForkOff, nextents, Math.Max(g.BlockSize, size));
+                foreach (var run in dirRuns)
+                {
+                    byte[] blk = RawDiskEngine.ReadBytes(disk, run.Key, (int)Math.Min(65536L, run.Value));
+                    if (blk.Length < 16) continue;
+                    uint magic = ReadBE32(blk, 0);
+                    int hdrSize = (magic == 0x58444233U || magic == 0x58444433U) ? 64 : 16; // XDB3/XDD3 vs XD2B/XD2D
+                    int pos = hdrSize;
+                    while (pos + 12 <= blk.Length)
+                    {
+                        ushort tag = ReadBE16(blk, pos);
+                        if (tag == 0xFFFF)
+                        {
+                            ushort freeLen = ReadBE16(blk, pos + 2);
+                            if (freeLen < 4) break;
+                            pos += ((freeLen + 7) / 8) * 8;
+                            continue;
+                        }
+                        if (pos + 9 > blk.Length) break;
+                        ulong childIno = ReadBE64(blk, pos);
+                        byte nLen = blk[pos + 8];
+                        if (nLen == 0 || pos + 9 + nLen > blk.Length) break;
+                        string childName = Encoding.UTF8.GetString(blk, pos + 9, nLen);
+                        int step = 9 + nLen + (g.HasFtype ? 1 : 0) + 2; // + tag(2)
+                        step = ((step + 7) / 8) * 8;
+                        pos += Math.Max(8, step);
+                        if (!string.IsNullOrEmpty(childName) && childName != "." && childName != "..")
+                        {
+                            var childNode = BuildXfsNodeRecursive(disk, part, g, childIno, childName, visited, depth + 1);
+                            if (childNode != null) node.Children.Add(childNode);
+                        }
+                    }
+                }
+            }
+
+            return node;
+        }
+
+        private static void ParseIso9660Volume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
+        {
+            if (part.PartitionLength < 0x9800L)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            byte[] pvd = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x8000L, 4096);
+            if (pvd.Length < 2048 || pvd[0] != 1 || !MatchesAscii(pvd, 1, "CD001"))
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            ushort logicalBlockSize = BitConverter.ToUInt16(pvd, 0x80);
+            if (logicalBlockSize < 512 || logicalBlockSize > 4096) logicalBlockSize = 2048;
+            uint volSpaceBlocks = BitConverter.ToUInt32(pvd, 0x50);
+            uint rootLba = BitConverter.ToUInt32(pvd, 0x9C + 2);
+            uint rootLen = BitConverter.ToUInt32(pvd, 0x9C + 10);
+
+            // Prefer Joliet SVD at +0x8800 if present and non-empty
+            bool isJoliet = false;
+            if (pvd.Length >= 2048 + 190 && pvd[2048] == 2 && MatchesAscii(pvd, 2049, "CD001") && pvd[2048 + 88] == (byte)'%')
+            {
+                uint jLba = BitConverter.ToUInt32(pvd, 2048 + 0x9C + 2);
+                uint jLen = BitConverter.ToUInt32(pvd, 2048 + 0x9C + 10);
+                if (jLba >= 16 && jLen >= 34 && (long)jLba * logicalBlockSize < part.PartitionLength)
+                {
+                    rootLba = jLba;
+                    rootLen = jLen;
+                    isJoliet = true;
+                }
+            }
+
+            vol.BlockSize = logicalBlockSize;
+            vol.TotalBlocks = volSpaceBlocks;
+            vol.FreeBlocks = 0;
+
+            var root = new VirtualFsNode
+            {
+                Name = "/",
+                FullPath = "/",
+                IsDirectory = true,
+                InodeOrObjectId = rootLba,
+                PermissionsString = "dr-xr-xr-x"
+            };
+
+            var visited = new HashSet<uint>();
+            ParseIsoDirectoryExtent(disk, part, root, rootLba, rootLen, logicalBlockSize, isJoliet, visited, 0);
+            if (root.Children.Count == 0)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            SortAndAssignPaths(root, "/");
+            vol.SuperblockSummary = string.Format(
+                "ISO9660 {0} ('{1}') | LogicalBlock={2} B | Sectors={3:N0} | Read-Only",
+                isJoliet ? "Joliet" : "ECMA-119",
+                string.IsNullOrEmpty(vol.Label) ? "CDROM" : vol.Label,
+                logicalBlockSize, volSpaceBlocks);
+            vol.RootNode = root;
+        }
+
+        private static void ParseIsoDirectoryExtent(
+            DiskInfo disk, PartitionEntry part, VirtualFsNode parent,
+            uint dirLba, uint dirLen, ushort blockSize, bool isJoliet,
+            HashSet<uint> visited, int depth)
+        {
+            if (depth > 24 || dirLen == 0 || !visited.Add(dirLba)) return;
+            long relOff = (long)dirLba * blockSize;
+            int readLen = (int)Math.Min(1048576L, Math.Min((long)dirLen, part.PartitionLength - relOff));
+            if (relOff < 0 || readLen < 34) return;
+
+            byte[] dir = RawDiskEngine.ReadBytes(disk, part.StartingOffset + relOff, readLen);
+            int pos = 0;
+            while (pos < dir.Length)
+            {
+                byte recLen = dir[pos];
+                if (recLen == 0)
+                {
+                    int nextSec = ((pos / blockSize) + 1) * blockSize;
+                    if (nextSec <= pos || nextSec >= dir.Length) break;
+                    pos = nextSec;
+                    continue;
+                }
+                if (pos + recLen > dir.Length || recLen < 34) break;
+
+                uint extLba = BitConverter.ToUInt32(dir, pos + 2);
+                uint dataLen = BitConverter.ToUInt32(dir, pos + 10);
+                byte flags = dir[pos + 25];
+                int nameLen = dir[pos + 32];
+                if (33 + nameLen > recLen) { pos += recLen; continue; }
+
+                if (nameLen == 1 && (dir[pos + 33] == 0 || dir[pos + 33] == 1))
+                {
+                    pos += recLen;
+                    continue;
+                }
+
+                string name = isJoliet && nameLen >= 2
+                    ? Encoding.BigEndianUnicode.GetString(dir, pos + 33, nameLen & ~1).TrimEnd('\0')
+                    : Encoding.ASCII.GetString(dir, pos + 33, nameLen).TrimEnd('\0');
+
+                // Check optional Rock Ridge NM entry in System Use area
+                int suStart = 33 + nameLen + ((nameLen & 1) == 0 ? 1 : 0);
+                if (!isJoliet && suStart + 5 <= recLen)
+                {
+                    int su = pos + suStart;
+                    int recEnd = pos + recLen;
+                    var rrName = new StringBuilder();
+                    while (su + 4 <= recEnd)
+                    {
+                        byte suLen = dir[su + 2];
+                        if (suLen < 4 || su + suLen > recEnd) break;
+                        if (dir[su] == (byte)'N' && dir[su + 1] == (byte)'M' && suLen > 5)
+                            rrName.Append(Encoding.UTF8.GetString(dir, su + 5, suLen - 5));
+                        su += suLen;
+                    }
+                    if (rrName.Length > 0)
+                        name = rrName.ToString();
+                }
+
+                int semiIdx = name.IndexOf(';');
+                if (semiIdx > 0) name = name.Substring(0, semiIdx);
+
+                bool isDir = (flags & 0x02) != 0;
+                var child = new VirtualFsNode
+                {
+                    Name = name,
+                    IsDirectory = isDir,
+                    SizeBytes = isDir ? 0 : (long)dataLen,
+                    InodeOrObjectId = extLba,
+                    PermissionsString = isDir ? "dr-xr-xr-x" : "-r--r--r--",
+                    ContentOffset = isDir ? 0 : (part.StartingOffset + (long)extLba * blockSize),
+                    ContentLength = isDir ? 0 : (long)dataLen
+                };
+                parent.Children.Add(child);
+
+                if (isDir)
+                    ParseIsoDirectoryExtent(disk, part, child, extLba, dataLen, blockSize, isJoliet, visited, depth + 1);
+
+                pos += recLen;
+            }
+        }
+
         private static void ParseCatalogOrMetadataVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             int headerReadLen = (int)Math.Min(131072L, part.PartitionLength);
@@ -1764,6 +2542,18 @@ namespace WinParted.Core
                 vol.SuperblockSummary = "Btrfs Superblock (_BHRfS_M @ +64 KiB) | Read-Only";
             else if (part.FileSystem == FileSystemType.XFS)
                 vol.SuperblockSummary = "XFS Superblock (XFSB @ +0 B) | AG BlockSize=" + (header.Length >= 8 ? BitConverter.ToUInt32(header, 4) : 4096) + " B";
+            else if (part.FileSystem == FileSystemType.F2FS)
+                vol.SuperblockSummary = "F2FS Flash-Friendly Superblock (0xF2F52010 @ +1024 B) | BlockSize=4096 B | Read-Only";
+            else if (part.FileSystem == FileSystemType.ZFS)
+                vol.SuperblockSummary = "OpenZFS Storage Pool Vdev (Uberblock 0x00BAB10C) | Read-Only";
+            else if (part.FileSystem == FileSystemType.SquashFS)
+                vol.SuperblockSummary = "SquashFS 4.0 Read-Only Compressed RootFS (hsqs) | BlockSize=128 KiB | Read-Only";
+            else if (part.FileSystem == FileSystemType.ISO9660)
+                vol.SuperblockSummary = "ISO9660 (ECMA-119 CD001) Optical/Live Volume | LogicalBlock=2048 B | Read-Only";
+            else if (part.FileSystem == FileSystemType.UDF)
+                vol.SuperblockSummary = "UDF (ECMA-167 BEA01/NSR03) Universal Volume | Read-Only";
+            else if (part.FileSystem == FileSystemType.ReFS)
+                vol.SuperblockSummary = "Resilient File System (ReFS) Volume Header | Read-Only";
             else if (part.FileSystem == FileSystemType.APFS)
                 vol.SuperblockSummary = "Apple APFS Container Superblock (NXSB/APSB) | Read-Only";
             else if (part.FileSystem == FileSystemType.HFSPlus)

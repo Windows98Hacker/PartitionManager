@@ -139,8 +139,9 @@ namespace WinParted.UI.Dialogs
             };
             var fsOptions = new[]
             {
-                FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.exFAT, FileSystemType.Ext4,
-                FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
+                FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
+                FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
+                FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
                 FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
                 FileSystemType.EfiSystem, FileSystemType.MicrosoftReserved, FileSystemType.RAW
             };
@@ -515,9 +516,10 @@ namespace WinParted.UI.Dialogs
                 _cmbType.Items.Add(new TypeOption("EFI System Partition (boot, esp)", GptPartitionTypeGuids.EfiSystem, 0xEF));
                 _cmbType.Items.Add(new TypeOption("Microsoft Reserved (msftres)", GptPartitionTypeGuids.MicrosoftReserved, 0x0C));
                 _cmbType.Items.Add(new TypeOption("Windows Recovery Environment (diag)", GptPartitionTypeGuids.WindowsRecovery, 0x27));
-                _cmbType.Items.Add(new TypeOption("Linux Filesystem Data (ext2/3/4, btrfs, xfs)", GptPartitionTypeGuids.LinuxFilesystem, 0x83));
+                _cmbType.Items.Add(new TypeOption("Linux Filesystem Data (ext2/3/4, btrfs, xfs, f2fs, squashfs)", GptPartitionTypeGuids.LinuxFilesystem, 0x83));
                 _cmbType.Items.Add(new TypeOption("Linux Swap", GptPartitionTypeGuids.LinuxSwap, 0x82));
                 _cmbType.Items.Add(new TypeOption("Linux LVM", GptPartitionTypeGuids.LinuxLvm, 0x8E));
+                _cmbType.Items.Add(new TypeOption("OpenZFS / Solaris Pool Member", GptPartitionTypeGuids.ZfsMember, 0xBF));
                 _cmbType.Items.Add(new TypeOption("BIOS Boot Partition (bios_grub)", GptPartitionTypeGuids.BiosBoot, 0x00));
                 _cmbType.Items.Add(new TypeOption("Apple APFS Container", GptPartitionTypeGuids.AppleApfs, 0xAF));
                 _cmbType.Items.Add(new TypeOption("Apple HFS+ / HFSX", GptPartitionTypeGuids.AppleHfs, 0xAF));
@@ -535,9 +537,11 @@ namespace WinParted.UI.Dialogs
                 _cmbType.Items.Add(new TypeOption("0x07 — NTFS / exFAT / HPFS", Guid.Empty, 0x07));
                 _cmbType.Items.Add(new TypeOption("0x0C — FAT32 (LBA)", Guid.Empty, 0x0C));
                 _cmbType.Items.Add(new TypeOption("0x0E — FAT16 (LBA)", Guid.Empty, 0x0E));
-                _cmbType.Items.Add(new TypeOption("0x83 — Linux Native (ext2/3/4, XFS, Btrfs)", Guid.Empty, 0x83));
+                _cmbType.Items.Add(new TypeOption("0x83 — Linux Native (ext2/3/4, XFS, Btrfs, F2FS, SquashFS)", Guid.Empty, 0x83));
                 _cmbType.Items.Add(new TypeOption("0x82 — Linux Swap", Guid.Empty, 0x82));
                 _cmbType.Items.Add(new TypeOption("0x8E — Linux LVM", Guid.Empty, 0x8E));
+                _cmbType.Items.Add(new TypeOption("0xBF — OpenZFS / Solaris", Guid.Empty, 0xBF));
+                _cmbType.Items.Add(new TypeOption("0xCD — ISO9660 / UDF Optical Image", Guid.Empty, 0xCD));
                 _cmbType.Items.Add(new TypeOption("0xAF — Apple HFS / HFS+ / APFS", Guid.Empty, 0xAF));
                 _cmbType.Items.Add(new TypeOption("0xAB — Apple Boot", Guid.Empty, 0xAB));
                 _cmbType.Items.Add(new TypeOption("0xEF — EFI System Partition", Guid.Empty, 0xEF));
@@ -853,8 +857,33 @@ namespace WinParted.UI.Dialogs
                 sb.AppendLine("OEM / Boot ID (+3): \"" + oem.Replace("\0", ".") + "\"");
                 if (b.Length >= 0x60 && Encoding.ASCII.GetString(b, 0x52, 8) == "FAT32   ")
                     sb.AppendLine("Detected FAT32 Boot Sector | Label: " + Encoding.ASCII.GetString(b, 0x47, 11).Trim());
+                if (b.Length >= 0x40 && Encoding.ASCII.GetString(b, 0x36, 8) == "FAT16   ")
+                    sb.AppendLine("Detected FAT16 Boot Sector | Label: " + Encoding.ASCII.GetString(b, 0x2B, 11).Trim());
+                if (b.Length >= 11 && Encoding.ASCII.GetString(b, 3, 4) == "ReFS")
+                    sb.AppendLine("Detected Windows ReFS Volume Header");
+                if (BitConverter.ToUInt32(b, 0) == 0x73717368u)
+                    sb.AppendLine(string.Format("Detected SquashFS 4.0 Superblock (hsqs) | Inodes={0} | BlockSize={1} B",
+                        BitConverter.ToUInt32(b, 4), BitConverter.ToUInt32(b, 12)));
                 if (Encoding.ASCII.GetString(b, 0, 4) == "XFSB")
-                    sb.AppendLine("Detected XFS Superblock");
+                {
+                    uint beBlk = ((uint)b[4] << 24) | ((uint)b[5] << 16) | ((uint)b[6] << 8) | b[7];
+                    uint leBlk = BitConverter.ToUInt32(b, 4);
+                    sb.AppendLine(string.Format("Detected XFS Superblock (XFSB) | BlockSize={0} B | Label={1}",
+                        (beBlk >= 512 && beBlk <= 65536) ? beBlk : leBlk,
+                        Encoding.UTF8.GetString(b, 108, 12).TrimEnd('\0', ' ')));
+                }
+                if (b.Length >= 0x48 && Encoding.ASCII.GetString(b, 0x40, 8) == "_BHRfS_M")
+                    sb.AppendLine("Detected Btrfs Superblock (_BHRfS_M)");
+                if (BitConverter.ToUInt32(b, 0) == 0xF2F52010u)
+                    sb.AppendLine("Detected F2FS Superblock (0xF2F52010 @ +1024 B)");
+                if (b.Length >= 10 && Encoding.ASCII.GetString(b, 1, 5) == "CD001")
+                    sb.AppendLine("Detected ISO9660 Descriptor (CD001) | Type=" + b[0]);
+                if (b.Length >= 10 && (Encoding.ASCII.GetString(b, 1, 5) == "BEA01" || Encoding.ASCII.GetString(b, 1, 5) == "NSR02" || Encoding.ASCII.GetString(b, 1, 5) == "NSR03"))
+                    sb.AppendLine("Detected UDF Descriptor (" + Encoding.ASCII.GetString(b, 1, 5) + ")");
+                if (BitConverter.ToUInt64(b, 0) == 0x00BAB10CUL)
+                    sb.AppendLine("Detected OpenZFS Uberblock (0x00BAB10C)");
+                if (b.Length >= 0x440 && BitConverter.ToUInt16(b, 0x438) == 0xEF53)
+                    sb.AppendLine("Detected Ext2/Ext3/Ext4 Superblock (0xEF53)");
                 if (b.Length >= 36 && (Encoding.ASCII.GetString(b, 32, 4) == "NXSB" || Encoding.ASCII.GetString(b, 32, 4) == "APSB"))
                     sb.AppendLine("Detected Apple APFS Container/Volume Superblock (" + Encoding.ASCII.GetString(b, 32, 4) + ")");
                 if (b.Length >= 4 && Encoding.ASCII.GetString(b, 0, 2) == "H+")

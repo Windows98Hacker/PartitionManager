@@ -781,6 +781,9 @@ namespace WinParted.Core
             // 4b. Verify >16 MiB Multi-Extent + HFS+ Extents Overflow B-Tree Streaming Copy (20 MiB BaseSystem.dmg)
             VerifyLargeHfsPlusOverflowExport(tempDir, log);
 
+            // 4c. Verify Btrfs, XFS, Ext2 & Dev Filesystems (F2FS, ZFS, SquashFS, ISO9660, UDF)
+            VerifyDevFileSystemsMountAndFormat(tempDir, log);
+
             byte[] afterBytes = File.ReadAllBytes(imgPath);
             uint crcAfterUnmount = Crc32.Compute(afterBytes, 0, afterBytes.Length);
             if (crcAfterUnmount != crcBeforeMount)
@@ -863,7 +866,119 @@ namespace WinParted.Core
                 ReadOnlyFileSystemMountEngine.UnmountAll();
             }
 
-            log("  -> Stress 8 PASSED (6 foreign FSs mounted RO, searched, recursive host copied, experimental RW & GUI layout verified).");
+            log("  -> Stress 8 PASSED (6 foreign FSs, >16 MiB HFS+ overflow, native Btrfs/XFS/Ext2/ISO9660 & dev FSs verified).");
+        }
+
+        private static void VerifyDevFileSystemsMountAndFormat(string tempDir, Action<string> log)
+        {
+            string devImg = Path.Combine(tempDir, "stress8_devfs.img");
+            var disk = RawDiskEngine.CreateBlankVirtualDisk(devImg, 128 * MiB, PartitionTableStyle.GPT);
+            disk.DiskNumber = 95;
+            if (!disk.IsVirtualImage)
+                throw new Exception("Safety check failed: VerifyDevFileSystemsMountAndFormat must use a virtual disk image.");
+
+            var qm = new OperationQueueManager();
+            qm.SetBaselineDisks(null, new[] { disk });
+            qm.Enqueue(MakeCreateOp(95, devImg, 1 * MiB, 14 * MiB, FileSystemType.Btrfs, "dev-btrfs"));
+            qm.Enqueue(MakeCreateOp(95, devImg, 15 * MiB, 14 * MiB, FileSystemType.XFS, "dev-xfs"));
+            qm.Enqueue(MakeCreateOp(95, devImg, 29 * MiB, 14 * MiB, FileSystemType.Ext2, "dev-ext2"));
+            qm.Enqueue(MakeCreateOp(95, devImg, 43 * MiB, 14 * MiB, FileSystemType.ISO9660, "DEV_ISO"));
+            qm.Enqueue(MakeCreateOp(95, devImg, 57 * MiB, 14 * MiB, FileSystemType.F2FS, "dev-f2fs"));
+            qm.Enqueue(MakeCreateOp(95, devImg, 71 * MiB, 14 * MiB, FileSystemType.ZFS, "dev-zfs"));
+            qm.Enqueue(MakeCreateOp(95, devImg, 85 * MiB, 14 * MiB, FileSystemType.SquashFS, "dev-squash"));
+            qm.Enqueue(MakeCreateOp(95, devImg, 99 * MiB, 14 * MiB, FileSystemType.UDF, "dev-udf"));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(devImg, 95);
+            AssertIntegrity(disk);
+            if (disk.Partitions.Count != 8)
+                throw new Exception("Expected 8 dev filesystem partitions, got " + disk.Partitions.Count);
+
+            // Clear WPROFS01 synthetic catalog on Btrfs, XFS, and ISO9660 to prove native on-disk B-tree / XFSB+IN / ECMA-119 parsing
+            byte[] clearCat = new byte[4096];
+            RawDiskEngine.WriteBytes(disk, disk.Partitions[0].StartingOffset + 0x3000, clearCat);
+            RawDiskEngine.WriteBytes(disk, disk.Partitions[1].StartingOffset + 0x3000, clearCat);
+            RawDiskEngine.WriteBytes(disk, disk.Partitions[3].StartingOffset + 0x3000, clearCat);
+
+            disk = RawDiskEngine.LoadVirtualDisk(devImg, 95);
+            if (disk.Partitions[0].FileSystem != FileSystemType.Btrfs ||
+                disk.Partitions[1].FileSystem != FileSystemType.XFS ||
+                disk.Partitions[2].FileSystem != FileSystemType.Ext2 ||
+                disk.Partitions[3].FileSystem != FileSystemType.ISO9660 ||
+                disk.Partitions[4].FileSystem != FileSystemType.F2FS ||
+                disk.Partitions[5].FileSystem != FileSystemType.ZFS ||
+                disk.Partitions[6].FileSystem != FileSystemType.SquashFS ||
+                disk.Partitions[7].FileSystem != FileSystemType.UDF)
+            {
+                throw new Exception("Superblock detection mismatch across Btrfs/XFS/Ext2/ISO9660/F2FS/ZFS/SquashFS/UDF.");
+            }
+            if (disk.Partitions[5].GptTypeGuid != GptPartitionTypeGuids.ZfsMember)
+                throw new Exception("ZFS partition missing OpenZFS GPT Type GUID.");
+
+            try
+            {
+                // Native Btrfs B-tree leaf node (regular + inline extents)
+                VerifyRoMountAndFile(disk, disk.Partitions[0], "/etc/filesystems", "btrfs");
+                VerifyRoMountAndFile(disk, disk.Partitions[0], "/home/ReadMe.txt", "Btrfs Copy-on-Write");
+                VerifyRoMountAndFile(disk, disk.Partitions[0], "/@dev/btrfs-subvol.conf", "compress=zstd:3");
+
+                // Native XFS Big-Endian superblock + 'IN' shortform dirs + BMBT extents
+                VerifyRoMountAndFile(disk, disk.Partitions[1], "/home/ReadMe.txt", "XFS Big-Endian");
+                VerifyRoMountAndFile(disk, disk.Partitions[1], "/projects/xfs_project.json", "\"filesystem\": \"XFS\"");
+
+                // Native Ext2 direct i_block[0] inodes + subdirectories
+                VerifyRoMountAndFile(disk, disk.Partitions[2], "/etc/hostname", "dev-ext2");
+                VerifyRoMountAndFile(disk, disk.Partitions[2], "/home/dev_notes.md", "direct i_block");
+
+                // Native ISO9660 ECMA-119 CD001 directory records
+                VerifyRoMountAndFile(disk, disk.Partitions[3], "/README.TXT", "ECMA-119");
+                VerifyRoMountAndFile(disk, disk.Partitions[3], "/DEV/TOOLCHAIN.ENV", "FS=iso9660");
+
+                // F2FS, ZFS, SquashFS, UDF
+                VerifyRoMountAndFile(disk, disk.Partitions[4], "/etc/filesystems", "f2fs");
+                VerifyRoMountAndFile(disk, disk.Partitions[5], "/etc/filesystems", "zfs");
+                VerifyRoMountAndFile(disk, disk.Partitions[6], "/etc/filesystems", "squashfs");
+                VerifyRoMountAndFile(disk, disk.Partitions[7], "/etc/filesystems", "udf");
+
+                // Test recursive folder host copy on Btrfs & ISO9660
+                int fc, dc;
+                long bc;
+                string btrfsExport = Path.Combine(tempDir, "host_export_btrfs");
+                var bVol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, disk.Partitions[0].StartingOffset);
+                ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[0], FindFsNodeByPath(bVol.RootNode, "/@dev"), btrfsExport, out fc, out dc, out bc);
+                if (!File.Exists(Path.Combine(btrfsExport, "@dev", "btrfs-subvol.conf")))
+                    throw new Exception("Btrfs host export missing /@dev/btrfs-subvol.conf");
+            }
+            finally
+            {
+                ReadOnlyFileSystemMountEngine.UnmountAll();
+            }
+
+            // Test Resize & Relabel across dev filesystems on virtual disk
+            qm.SetBaselineDisks(null, new[] { disk });
+            qm.Enqueue(MakeResizeOp(95, devImg, disk.Partitions[4], 57 * MiB, 12 * MiB));
+            qm.Enqueue(new PendingOperation
+            {
+                Type = OperationType.ChangeLabel,
+                TargetDiskNumber = 95,
+                TargetDiskPath = devImg,
+                TargetPartitionNumber = disk.Partitions[5].PartitionNumber,
+                OriginalStartOffset = disk.Partitions[5].StartingOffset,
+                OriginalLength = disk.Partitions[5].PartitionLength,
+                NewLabel = "tank-pool",
+                NewPartitionName = "tank-pool",
+                Summary = "Relabel ZFS"
+            });
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(devImg, 95);
+            AssertIntegrity(disk);
+            if (disk.Partitions[4].FileSystem != FileSystemType.F2FS || disk.Partitions[4].PartitionLength != 12 * MiB)
+                throw new Exception("F2FS resize failed.");
+            if (disk.Partitions[5].FileSystem != FileSystemType.ZFS || disk.Partitions[5].Label != "tank-pool")
+                throw new Exception("ZFS relabel failed.");
+
+            log("  -> Dev Filesystems Verified (native Btrfs B-tree, BE XFS IN-inodes, Ext2 direct blocks, ECMA-119 ISO9660, F2FS, ZFS, SquashFS, UDF).");
         }
 
         private static void VerifyRoMountAndFile(DiskInfo disk, PartitionEntry part, string fullPath, string expectedSubstring)

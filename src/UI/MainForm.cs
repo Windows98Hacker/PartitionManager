@@ -128,7 +128,7 @@ namespace WinParted.UI
                     "WinParted — GParted-Style Partition Manager for 32-bit & 64-bit Windows\n\n" +
                     "Runtime: " + Win32DiskInterop.GetArchitectureBadge() + "\n" +
                     "Pointer Width: " + (IntPtr.Size * 8) + "-bit\n\n" +
-                    "Supports MBR & GPT partition tables, multi-OS filesystem inspection (NTFS, FAT32, exFAT, ReFS, ext2/3/4, Btrfs, XFS, Linux Swap, LVM2, BitLocker), 4K/1MiB alignment auditing, sector hex inspection, and a non-destructive Pending Operations Queue.",
+                    "Supports MBR & GPT partition tables, multi-OS filesystem inspection (NTFS, FAT16/FAT32, exFAT, ReFS, ext2/3/4, Btrfs, XFS, F2FS, ZFS, SquashFS, ISO9660, UDF, Linux Swap, LVM2, BitLocker, APFS, HFS+/HFS), 4K/1MiB alignment auditing, sector hex inspection, and a non-destructive Pending Operations Queue.",
                     "About WinParted", MessageBoxButtons.OK, MessageBoxIcon.Information));
 
             menu.Items.AddRange(new ToolStripItem[] { mApp, mEdit, mView, mDevice, mPart, mTools, mHelp });
@@ -1095,7 +1095,13 @@ namespace WinParted.UI
 
                 tbl.Controls.Add(new Label { Text = "File system:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 0);
                 var cmbFs = new ComboBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 6, 0, 8) };
-                cmbFs.Items.AddRange(new object[] { FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.exFAT, FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Btrfs, FileSystemType.XFS, FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS });
+                cmbFs.Items.AddRange(new object[]
+                {
+                    FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
+                    FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
+                    FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
+                    FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS
+                });
                 cmbFs.SelectedIndex = 0;
                 tbl.Controls.Add(cmbFs, 1, 0);
 
