@@ -37,7 +37,7 @@ namespace WinParted.UI
         private Label _lblStatus;
         private ContextMenuStrip _partContextMenu;
 
-        private ToolStripButton _tbNew, _tbDelete, _tbResize, _tbCopy, _tbPaste, _tbFormat, _tbFlags, _tbWipe, _tbUndo, _tbApply;
+        private ToolStripButton _tbNew, _tbDelete, _tbResize, _tbCopy, _tbPaste, _tbFormat, _tbFlags, _tbWipe, _tbMountRo, _tbBrowseFs, _tbUndo, _tbApply;
 
         public MainForm()
         {
@@ -106,6 +106,9 @@ namespace WinParted.UI
             mPart.DropDownItems.Add("Label / Name...", null, (s, e) => QueueLabelPartition());
             mPart.DropDownItems.Add("Manage Flags...", null, (s, e) => QueueManageFlags());
             mPart.DropDownItems.Add("Secure Wipe...", null, (s, e) => QueueWipePartition());
+            mPart.DropDownItems.Add(new ToolStripSeparator());
+            mPart.DropDownItems.Add("Mount / Unmount Read-Only", null, (s, e) => ToggleReadOnlyMount());
+            mPart.DropDownItems.Add("Browse Filesystem (Read-Only)...", null, (s, e) => BrowseNonMicrosoftFileSystem());
 
             var mTools = new ToolStripMenuItem("Tools");
             mTools.DropDownItems.Add("Hex & Sector Inspector...", null, (s, e) => OpenHexInspector());
@@ -204,6 +207,8 @@ namespace WinParted.UI
             _tbFormat = new ToolStripButton("Format", null, (s, e) => QueueFormatPartition());
             _tbFlags = new ToolStripButton("Flags", null, (s, e) => QueueManageFlags());
             _tbWipe = new ToolStripButton("Wipe", null, (s, e) => QueueWipePartition());
+            _tbMountRo = new ToolStripButton("Mount (RO)", null, (s, e) => ToggleReadOnlyMount()) { ToolTipText = "Mount/unmount non-Microsoft partition in read-only mode" };
+            _tbBrowseFs = new ToolStripButton("Browse FS", null, (s, e) => BrowseNonMicrosoftFileSystem()) { ToolTipText = "Browse files inside non-Microsoft partition (read-only)" };
             _tbUndo = new ToolStripButton("Undo", null, (s, e) => UndoOperation());
             _tbApply = new ToolStripButton("Apply All", null, (s, e) => ApplyOperations()) { Font = new Font("Segoe UI", 9f, FontStyle.Bold), ForeColor = ThemeManager.AccentGreen, Tag = "ApplyHighlight" };
             var tbHex = new ToolStripButton("Hex/LBA", null, (s, e) => OpenHexInspector());
@@ -215,6 +220,7 @@ namespace WinParted.UI
                 _tbNew, _tbDelete, new ToolStripSeparator(),
                 _tbResize, _tbCopy, _tbPaste, new ToolStripSeparator(),
                 _tbFormat, _tbFlags, _tbWipe, new ToolStripSeparator(),
+                _tbMountRo, _tbBrowseFs, new ToolStripSeparator(),
                 tbHex, tbAlign, new ToolStripSeparator(),
                 _tbUndo, _tbApply, new ToolStripSeparator(), tbRefresh
             });
@@ -338,6 +344,9 @@ namespace WinParted.UI
             _partContextMenu.Items.Add("Label / Name...", null, (s, e) => QueueLabelPartition());
             _partContextMenu.Items.Add("Manage Flags...", null, (s, e) => QueueManageFlags());
             _partContextMenu.Items.Add("Secure Wipe...", null, (s, e) => QueueWipePartition());
+            _partContextMenu.Items.Add(new ToolStripSeparator());
+            _partContextMenu.Items.Add("Mount / Unmount Read-Only", null, (s, e) => ToggleReadOnlyMount());
+            _partContextMenu.Items.Add("Browse Filesystem (Read-Only)...", null, (s, e) => BrowseNonMicrosoftFileSystem());
             _partContextMenu.Items.Add(new ToolStripSeparator());
             _partContextMenu.Items.Add("Inspect Boot Sector / LBA in Hex...", null, (s, e) => OpenHexInspectorAtSelected());
 
@@ -569,9 +578,18 @@ namespace WinParted.UI
                 DataGridViewRow rowToSelect = null;
                 foreach (var p in layout)
                 {
+                    var roMount = (!p.IsUnallocated && _currentPreviewDisk != null)
+                        ? ReadOnlyFileSystemMountEngine.GetMount(_currentPreviewDisk.DiskNumber, p.StartingOffset)
+                        : null;
+                    string nameOrLetter = p.IsUnallocated
+                        ? "-"
+                        : (roMount != null
+                            ? "[RO: " + roMount.MountPath + "]"
+                            : (string.IsNullOrEmpty(p.DriveLetter) ? p.PartitionName : p.DriveLetter));
+
                     int rowIdx = _gridPartitions.Rows.Add(
                         p.IsUnallocated ? "unallocated" : p.ShortDeviceName,
-                        p.IsUnallocated ? "-" : (string.IsNullOrEmpty(p.DriveLetter) ? p.PartitionName : p.DriveLetter),
+                        nameOrLetter,
                         FileSystemColors.GetDisplayName(p.FileSystem),
                         p.IsUnallocated ? "" : p.Label,
                         ByteFormatter.FormatBytes(p.PartitionLength),
@@ -727,8 +745,67 @@ namespace WinParted.UI
             _tbFormat.Enabled = isPart;
             _tbFlags.Enabled = isPart;
             _tbWipe.Enabled = isPart;
+
+            bool canRoMount = isPart && ReadOnlyFileSystemMountEngine.IsSupportedNonMicrosoftFs(sel.FileSystem);
+            bool isRoMounted = canRoMount && _currentPreviewDisk != null &&
+                ReadOnlyFileSystemMountEngine.GetMount(_currentPreviewDisk.DiskNumber, sel.StartingOffset) != null;
+            if (_tbMountRo != null)
+            {
+                _tbMountRo.Enabled = canRoMount;
+                _tbMountRo.Text = isRoMounted ? "Unmount (RO)" : "Mount (RO)";
+            }
+            if (_tbBrowseFs != null)
+                _tbBrowseFs.Enabled = canRoMount;
+
             _tbUndo.Enabled = _queueManager.PendingCount > 0;
             _tbApply.Enabled = _queueManager.PendingCount > 0;
+        }
+
+        private void ToggleReadOnlyMount()
+        {
+            var sel = GetSelectedPartition();
+            if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
+
+            var existing = ReadOnlyFileSystemMountEngine.GetMount(_currentPreviewDisk.DiskNumber, sel.StartingOffset);
+            if (existing != null)
+            {
+                ReadOnlyFileSystemMountEngine.Unmount(_currentPreviewDisk.DiskNumber, sel.StartingOffset);
+                sel.IsMounted = false;
+                RenderCurrentDisk();
+                _lblStatus.Text = "Unmounted read-only volume: " + existing.MountPath;
+                return;
+            }
+
+            try
+            {
+                var vol = ReadOnlyFileSystemMountEngine.MountReadOnly(_currentPreviewDisk, sel, false);
+                RenderCurrentDisk();
+                _lblStatus.Text = string.Format("Mounted {0} read-only at {1} ({2})",
+                    sel.ShortDeviceName, vol.MountPath, FileSystemColors.GetDisplayName(vol.FileSystem));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Read-Only Mount", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void BrowseNonMicrosoftFileSystem()
+        {
+            var sel = GetSelectedPartition();
+            if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
+
+            try
+            {
+                var vol = ReadOnlyFileSystemMountEngine.GetMount(_currentPreviewDisk.DiskNumber, sel.StartingOffset)
+                          ?? ReadOnlyFileSystemMountEngine.MountReadOnly(_currentPreviewDisk, sel, false);
+                RenderCurrentDisk();
+                using (var dlg = new FileSystemBrowserDialog(_currentPreviewDisk, sel, vol))
+                    dlg.ShowDialog(this);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Read-Only Filesystem Viewer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         private void RefreshOperationsList()

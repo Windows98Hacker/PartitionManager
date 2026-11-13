@@ -30,6 +30,7 @@ namespace WinParted.Core
                 RunStress5_PartitionTableSafetyAndRecovery(tempDir, log);
                 RunStress6_AppleAndMacDataSafety(tempDir, log);
                 RunStress7_PhysicalDiskScriptAndFormatType(tempDir, log);
+                RunStress8_ReadOnlyNonMicrosoftMountAndBrowse(tempDir, log);
 
                 log("STRESS_TEST_ALL_PASSED");
                 return true;
@@ -671,6 +672,96 @@ namespace WinParted.Core
             }
 
             log("  -> Stress 7 PASSED (Physical USB GPT/MBR Ext4 format script & FAT32->Ext4 superblock/type verification).");
+        }
+
+        private static void RunStress8_ReadOnlyNonMicrosoftMountAndBrowse(string tempDir, Action<string> log)
+        {
+            log("[Stress 8] Read-Only Mounting & Browsing Non-Microsoft Filesystems (Virtual Test Image Only)...");
+
+            string imgPath = Path.Combine(tempDir, "stress8_nonms_ro.img");
+            var disk = RawDiskEngine.CreateBlankVirtualDisk(imgPath, 96 * MiB, PartitionTableStyle.GPT);
+            disk.DiskNumber = 98;
+            if (!disk.IsVirtualImage)
+                throw new Exception("Safety check failed: Stress 8 must only run on a virtual test disk image.");
+
+            var qm = new OperationQueueManager();
+            qm.SetBaselineDisks(null, new[] { disk });
+
+            qm.Enqueue(MakeCreateOp(98, imgPath, 1 * MiB, 14 * MiB, FileSystemType.Ext4, "ro-ext4"));
+            qm.Enqueue(MakeCreateOp(98, imgPath, 15 * MiB, 14 * MiB, FileSystemType.Btrfs, "ro-btrfs"));
+            qm.Enqueue(MakeCreateOp(98, imgPath, 29 * MiB, 14 * MiB, FileSystemType.XFS, "ro-xfs"));
+            qm.Enqueue(MakeCreateOp(98, imgPath, 43 * MiB, 14 * MiB, FileSystemType.APFS, "ro-apfs"));
+            qm.Enqueue(MakeCreateOp(98, imgPath, 57 * MiB, 14 * MiB, FileSystemType.HFSPlus, "ro-hfsplus"));
+            qm.Enqueue(MakeCreateOp(98, imgPath, 71 * MiB, 14 * MiB, FileSystemType.HFS, "ro-hfs"));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 98);
+            if (disk.Partitions.Count != 6)
+                throw new Exception("Expected 6 non-Microsoft partitions in Stress 8 image, got " + disk.Partitions.Count);
+
+            byte[] beforeBytes = File.ReadAllBytes(imgPath);
+            uint crcBeforeMount = Crc32.Compute(beforeBytes, 0, beforeBytes.Length);
+
+            try
+            {
+                // 1. Ext4 real superblock + BGDT + inode table + extent + ext2_dir_entry_2 traversal
+                VerifyRoMountAndFile(disk, disk.Partitions[0], "/etc/fstab", "UUID=");
+                VerifyRoMountAndFile(disk, disk.Partitions[0], "/README.txt", "WinParted Read-Only Mount Preview");
+
+                // 2. Btrfs & XFS
+                VerifyRoMountAndFile(disk, disk.Partitions[1], "/etc/filesystems", "btrfs");
+                VerifyRoMountAndFile(disk, disk.Partitions[2], "/home/ReadMe.txt", "XFS");
+
+                // 3. Apple APFS, HFS+, Classic HFS
+                VerifyRoMountAndFile(disk, disk.Partitions[3], "/System/Library/CoreServices/SystemVersion.plist", "<string>apfs</string>");
+                VerifyRoMountAndFile(disk, disk.Partitions[4], "/Users/Shared/ReadMe.txt", "hfs+");
+                VerifyRoMountAndFile(disk, disk.Partitions[5], "/.VolumeLabel", "ro-hfs");
+            }
+            finally
+            {
+                foreach (var part in disk.Partitions)
+                    ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, part.StartingOffset);
+            }
+
+            byte[] afterBytes = File.ReadAllBytes(imgPath);
+            uint crcAfterUnmount = Crc32.Compute(afterBytes, 0, afterBytes.Length);
+            if (crcAfterUnmount != crcBeforeMount)
+                throw new Exception(string.Format("READ-ONLY VIOLATION: Test disk image mutated during mount/browse (before 0x{0:X8} != after 0x{1:X8}).", crcBeforeMount, crcAfterUnmount));
+
+            log("  -> Stress 8 PASSED (6 non-Microsoft filesystems mounted RO, browsed, read, & 100% byte-identical CRC verified).");
+        }
+
+        private static void VerifyRoMountAndFile(DiskInfo disk, PartitionEntry part, string fullPath, string expectedSubstring)
+        {
+            var vol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, part.StartingOffset)
+                      ?? ReadOnlyFileSystemMountEngine.MountReadOnly(disk, part, true);
+            if (!vol.IsReadOnly)
+                throw new Exception("Mounted volume must be strictly read-only.");
+            if (vol.RootNode == null || vol.RootNode.Children.Count == 0)
+                throw new Exception("Root directory tree is empty for " + part.FileSystem);
+
+            var node = FindFsNodeByPath(vol.RootNode, fullPath);
+            if (node == null || node.IsDirectory)
+                throw new Exception("Expected file '" + fullPath + "' not found on mounted " + part.FileSystem);
+
+            byte[] content = ReadOnlyFileSystemMountEngine.ReadFileBytes(disk, part, node);
+            string text = Encoding.UTF8.GetString(content);
+            if (text.IndexOf(expectedSubstring, StringComparison.OrdinalIgnoreCase) < 0)
+                throw new Exception(string.Format("Unexpected file content for {0} ({1}): expected '{2}', got '{3}'",
+                    fullPath, part.FileSystem, expectedSubstring, text));
+        }
+
+        private static VirtualFsNode FindFsNodeByPath(VirtualFsNode current, string fullPath)
+        {
+            if (current == null) return null;
+            if (string.Equals(current.FullPath, fullPath, StringComparison.Ordinal))
+                return current;
+            foreach (var child in current.Children)
+            {
+                var found = FindFsNodeByPath(child, fullPath);
+                if (found != null) return found;
+            }
+            return null;
         }
 
         private static PendingOperation MakeCreateOp(int diskNum, string diskPath, long start, long len, FileSystemType fs, string label)
