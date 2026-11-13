@@ -769,7 +769,7 @@ namespace WinParted.UI
             {
                 dlg.Controls.Add(new Label { Text = "File system:", Location = new Point(16, 20), AutoSize = true });
                 var cmbFs = new ComboBox { Location = new Point(120, 17), Width = 220, DropDownStyle = ComboBoxStyle.DropDownList };
-                cmbFs.Items.AddRange(new object[] { FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.exFAT, FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Btrfs, FileSystemType.XFS, FileSystemType.LinuxSwap });
+                cmbFs.Items.AddRange(new object[] { FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.exFAT, FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Btrfs, FileSystemType.XFS, FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS });
                 cmbFs.SelectedIndex = 0;
                 dlg.Controls.Add(cmbFs);
 

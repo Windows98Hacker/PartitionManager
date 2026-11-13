@@ -123,7 +123,8 @@ namespace WinParted.UI.Dialogs
             {
                 FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.exFAT, FileSystemType.Ext4,
                 FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
-                FileSystemType.LinuxSwap, FileSystemType.EfiSystem, FileSystemType.MicrosoftReserved, FileSystemType.RAW
+                FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
+                FileSystemType.EfiSystem, FileSystemType.MicrosoftReserved, FileSystemType.RAW
             };
             foreach (var fs in fsOptions) _cmbFs.Items.Add(fs);
             _cmbFs.SelectedItem = isCreateMode ? FileSystemType.NTFS : (fsOptions.Contains(targetSlice.FileSystem) ? targetSlice.FileSystem : FileSystemType.NTFS);
@@ -468,6 +469,9 @@ namespace WinParted.UI.Dialogs
                 _cmbType.Items.Add(new TypeOption("Linux Swap", GptPartitionTypeGuids.LinuxSwap, 0x82));
                 _cmbType.Items.Add(new TypeOption("Linux LVM", GptPartitionTypeGuids.LinuxLvm, 0x8E));
                 _cmbType.Items.Add(new TypeOption("BIOS Boot Partition (bios_grub)", GptPartitionTypeGuids.BiosBoot, 0x00));
+                _cmbType.Items.Add(new TypeOption("Apple APFS Container", GptPartitionTypeGuids.AppleApfs, 0xAF));
+                _cmbType.Items.Add(new TypeOption("Apple HFS+ / HFSX", GptPartitionTypeGuids.AppleHfs, 0xAF));
+                _cmbType.Items.Add(new TypeOption("Apple Boot / Recovery HD", GptPartitionTypeGuids.AppleBoot, 0xAB));
 
                 int sel = 0;
                 for (int i = 0; i < _cmbType.Items.Count; i++)
@@ -484,6 +488,8 @@ namespace WinParted.UI.Dialogs
                 _cmbType.Items.Add(new TypeOption("0x83 — Linux Native (ext2/3/4, XFS, Btrfs)", Guid.Empty, 0x83));
                 _cmbType.Items.Add(new TypeOption("0x82 — Linux Swap", Guid.Empty, 0x82));
                 _cmbType.Items.Add(new TypeOption("0x8E — Linux LVM", Guid.Empty, 0x8E));
+                _cmbType.Items.Add(new TypeOption("0xAF — Apple HFS / HFS+ / APFS", Guid.Empty, 0xAF));
+                _cmbType.Items.Add(new TypeOption("0xAB — Apple Boot", Guid.Empty, 0xAB));
                 _cmbType.Items.Add(new TypeOption("0xEF — EFI System Partition", Guid.Empty, 0xEF));
                 _cmbType.Items.Add(new TypeOption("0x27 — Windows Recovery", Guid.Empty, 0x27));
 
@@ -757,6 +763,14 @@ namespace WinParted.UI.Dialogs
                     sb.AppendLine("Detected FAT32 Boot Sector | Label: " + Encoding.ASCII.GetString(b, 0x47, 11).Trim());
                 if (Encoding.ASCII.GetString(b, 0, 4) == "XFSB")
                     sb.AppendLine("Detected XFS Superblock");
+                if (b.Length >= 36 && (Encoding.ASCII.GetString(b, 32, 4) == "NXSB" || Encoding.ASCII.GetString(b, 32, 4) == "APSB"))
+                    sb.AppendLine("Detected Apple APFS Container/Volume Superblock (" + Encoding.ASCII.GetString(b, 32, 4) + ")");
+                if (b.Length >= 4 && Encoding.ASCII.GetString(b, 0, 2) == "H+")
+                    sb.AppendLine("Detected Apple HFS+ Volume Header");
+                else if (b.Length >= 4 && Encoding.ASCII.GetString(b, 0, 2) == "HX")
+                    sb.AppendLine("Detected Apple HFSX Volume Header");
+                else if (b.Length >= 4 && Encoding.ASCII.GetString(b, 0, 2) == "BD")
+                    sb.AppendLine("Detected Macintosh Classic HFS Master Directory Block");
             }
             return sb.ToString();
         }
