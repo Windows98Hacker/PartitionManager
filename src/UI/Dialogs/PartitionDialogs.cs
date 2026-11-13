@@ -722,9 +722,18 @@ namespace WinParted.UI.Dialogs
                 AddQuickBtn(row2, string.Format("Part #{0} Boot", p.PartitionNumber), p.StartLba);
             }
 
-            var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 350 };
+            var split = new SplitContainer
+            {
+                Size = new Size(760, 500),
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Horizontal,
+                Panel1MinSize = 25,
+                Panel2MinSize = 25
+            };
+            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(split, 300);
             Controls.Add(split);
             split.BringToFront();
+            Load += (s, e) => IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(split, 300);
 
             _txtHex = new TextBox
             {
