@@ -729,6 +729,48 @@ namespace WinParted.Core
                 VerifyRoMountAndFile(disk, disk.Partitions[4], "/System/Library/CoreServices/SystemVersion.plist", "<string>hfs+</string>");
                 VerifyRoMountAndFile(disk, disk.Partitions[4], "/Users/Shared/ReadMe.txt", "hfs+");
                 VerifyRoMountAndFile(disk, disk.Partitions[5], "/.VolumeLabel", "ro-hfs");
+
+                // 4. Verify Search & Host Copy (File + Recursive Folder) in strictly Read-Only mode
+                var extVol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, disk.Partitions[0].StartingOffset);
+                var hfsVol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, disk.Partitions[4].StartingOffset);
+
+                var hfsHits = ReadOnlyFileSystemMountEngine.SearchVolume(hfsVol, "SystemVersion.plist");
+                if (hfsHits.Count != 1 || hfsHits[0].FullPath != "/System/Library/CoreServices/SystemVersion.plist")
+                    throw new Exception("SearchVolume failed on HFS+: expected /System/Library/CoreServices/SystemVersion.plist.");
+
+                var extHits = ReadOnlyFileSystemMountEngine.SearchVolume(extVol, "fstab");
+                if (extHits.Count != 1 || extHits[0].FullPath != "/etc/fstab")
+                    throw new Exception("SearchVolume failed on Ext4: expected /etc/fstab.");
+
+                // Guardrail: writing while Read-Only must throw InvalidOperationException
+                bool blockedRo = false;
+                try
+                {
+                    ReadOnlyFileSystemMountEngine.WriteFileToVolume(disk, disk.Partitions[4], hfsVol, hfsVol.RootNode, "blocked.txt", Encoding.UTF8.GetBytes("nope"));
+                }
+                catch (InvalidOperationException)
+                {
+                    blockedRo = true;
+                }
+                if (!blockedRo)
+                    throw new Exception("Read-Only safety failure: WriteFileToVolume succeeded without Experimental Write Mode enabled.");
+
+                int fCount;
+                int dCount;
+                long bCount;
+                string hfsExportRoot = Path.Combine(tempDir, "host_export_hfs");
+                var usersDir = FindFsNodeByPath(hfsVol.RootNode, "/Users");
+                ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[4], usersDir, hfsExportRoot, out fCount, out dCount, out bCount);
+                string exportedHfsFile = Path.Combine(hfsExportRoot, "Users", "Shared", "ReadMe.txt");
+                if (!File.Exists(exportedHfsFile) || File.ReadAllText(exportedHfsFile).IndexOf("hfs+", StringComparison.OrdinalIgnoreCase) < 0 || fCount < 1 || dCount < 2)
+                    throw new Exception("Recursive HFS+ folder copy to host failed.");
+
+                string extExportRoot = Path.Combine(tempDir, "host_export_ext4");
+                var etcDir = FindFsNodeByPath(extVol.RootNode, "/etc");
+                ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[0], etcDir, extExportRoot, out fCount, out dCount, out bCount);
+                string exportedExtFile = Path.Combine(extExportRoot, "etc", "fstab");
+                if (!File.Exists(exportedExtFile) || File.ReadAllText(exportedExtFile).IndexOf("UUID=", StringComparison.OrdinalIgnoreCase) < 0)
+                    throw new Exception("Recursive Ext4 folder copy to host failed.");
             }
             finally
             {
@@ -739,9 +781,59 @@ namespace WinParted.Core
             byte[] afterBytes = File.ReadAllBytes(imgPath);
             uint crcAfterUnmount = Crc32.Compute(afterBytes, 0, afterBytes.Length);
             if (crcAfterUnmount != crcBeforeMount)
-                throw new Exception(string.Format("READ-ONLY VIOLATION: Test disk image mutated during mount/browse (before 0x{0:X8} != after 0x{1:X8}).", crcBeforeMount, crcAfterUnmount));
+                throw new Exception(string.Format("READ-ONLY VIOLATION: Test disk image mutated during mount/browse/search/export (before 0x{0:X8} != after 0x{1:X8}).", crcBeforeMount, crcAfterUnmount));
 
-            log("  -> Stress 8 PASSED (6 non-Microsoft filesystems mounted RO, browsed, read, & 100% byte-identical CRC verified).");
+            // 5. Verify Experimental Write Mode (Virtual Test Disk Only) on Ext4 & HFS+
+            string hostUploadSrc = Path.Combine(tempDir, "HostUploadBundle");
+            Directory.CreateDirectory(Path.Combine(hostUploadSrc, "Nested"));
+            File.WriteAllText(Path.Combine(hostUploadSrc, "notes.txt"), "Experimental host upload top-level file.");
+            File.WriteAllText(Path.Combine(hostUploadSrc, "Nested", "deep.txt"), "Experimental nested file payload 12345!");
+
+            foreach (int pIdx in new int[] { 0, 4 })
+            {
+                var p = disk.Partitions[pIdx];
+                var vol = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, p, true);
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(vol, true);
+                if (vol.IsReadOnly)
+                    throw new Exception("Experimental Write toggle failed to unlock writes on " + p.FileSystem);
+
+                var expDir = ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(disk, p, vol, vol.RootNode, "ExpCustom");
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(disk, p, vol, expDir, "direct.txt", Encoding.UTF8.GetBytes("DirectWritePayload-" + p.FileSystem));
+                var tempDel = ReadOnlyFileSystemMountEngine.WriteFileToVolume(disk, p, vol, expDir, "temp_del.txt", Encoding.UTF8.GetBytes("delete-me"));
+                ReadOnlyFileSystemMountEngine.DeleteNodeFromVolume(disk, p, vol, tempDel);
+
+                int fw;
+                int dw;
+                ReadOnlyFileSystemMountEngine.WriteHostDirectoryToVolume(disk, p, vol, vol.RootNode, hostUploadSrc, out fw, out dw);
+                if (fw != 2 || dw != 2)
+                    throw new Exception("WriteHostDirectoryToVolume count mismatch: files=" + fw + ", dirs=" + dw);
+
+                ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, p.StartingOffset);
+            }
+
+            // Reload image from scratch and verify written overlay persists & defaults back to Read-Only
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 98);
+            foreach (int pIdx in new int[] { 0, 4 })
+            {
+                var p = disk.Partitions[pIdx];
+                var reloadedVol = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, p, true);
+                if (!reloadedVol.IsReadOnly)
+                    throw new Exception("Remounted volume must default back to Read-Only.");
+
+                VerifyRoMountAndFile(disk, p, "/ExpCustom/direct.txt", "DirectWritePayload-" + p.FileSystem);
+                VerifyRoMountAndFile(disk, p, "/HostUploadBundle/notes.txt", "Experimental host upload top-level file.");
+                VerifyRoMountAndFile(disk, p, "/HostUploadBundle/Nested/deep.txt", "Experimental nested file payload 12345!");
+                if (FindFsNodeByPath(reloadedVol.RootNode, "/ExpCustom/temp_del.txt") != null)
+                    throw new Exception("Deleted file reappeared after reload on " + p.FileSystem);
+
+                var searchNew = ReadOnlyFileSystemMountEngine.SearchVolume(reloadedVol, "deep.txt");
+                if (searchNew.Count != 1 || searchNew[0].FullPath != "/HostUploadBundle/Nested/deep.txt")
+                    throw new Exception("SearchVolume failed to find experimentally written nested file on " + p.FileSystem);
+
+                ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, p.StartingOffset);
+            }
+
+            log("  -> Stress 8 PASSED (6 foreign FSs mounted RO, searched, recursive host copied, & experimental RW verified on virtual test disk).");
         }
 
         private static void VerifyRoMountAndFile(DiskInfo disk, PartitionEntry part, string fullPath, string expectedSubstring)

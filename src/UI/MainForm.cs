@@ -35,6 +35,10 @@ namespace WinParted.UI
         private Label _lblDeviceInfo;
         private DataGridView _gridPartitions;
         private ListView _lvOperations;
+        private IntegratedFileSystemExplorerControl _integratedExplorer;
+        private int _boundExplorerDisk = -1;
+        private long _boundExplorerOffset = -1;
+        private MountedReadOnlyVolume _boundExplorerVolume;
         private Label _lblStatus;
         private ContextMenuStrip _partContextMenu;
 
@@ -244,7 +248,14 @@ namespace WinParted.UI
             _lblDeviceInfo = new Label { Location = new Point(10, 10), AutoSize = true, MaximumSize = new Size(245, 0), Font = new Font("Segoe UI", 8.8f) };
             _deviceInfoPanel.Controls.Add(_lblDeviceInfo);
 
-            var mainSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 330 };
+            var mainSplit = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Horizontal,
+                Panel1MinSize = 110,
+                Panel2MinSize = 180,
+                SplitterDistance = 250
+            };
 
             _gridPartitions = new DataGridView
             {
@@ -293,9 +304,18 @@ namespace WinParted.UI
 
             mainSplit.Panel1.Controls.Add(_gridPartitions);
 
-            // Pending Operations Bottom Panel
+            // Bottom Split: Left = Pending Operations Queue | Right = Integrated Foreign Filesystem Explorer
+            var bottomSplit = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical,
+                Panel1MinSize = 200,
+                Panel2MinSize = 360,
+                SplitterDistance = 300
+            };
+
             var opsHeader = new Panel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(8, 6, 8, 4), Tag = "ElevatedPanel" };
-            opsHeader.Controls.Add(new Label { Text = "Pending Operations Queue (Changes are staged safely until you click 'Apply All')", Dock = DockStyle.Left, AutoSize = true, Font = new Font("Segoe UI", 8.8f, FontStyle.Bold) });
+            opsHeader.Controls.Add(new Label { Text = "Pending Operations Queue (Safe Until 'Apply All')", Dock = DockStyle.Left, AutoSize = true, Font = new Font("Segoe UI", 8.8f, FontStyle.Bold) });
 
             _lvOperations = new ListView
             {
@@ -304,11 +324,11 @@ namespace WinParted.UI
                 FullRowSelect = true,
                 GridLines = true
             };
-            _lvOperations.Columns.Add("#", 44);
-            _lvOperations.Columns.Add("Target Disk", 115);
-            _lvOperations.Columns.Add("Operation Summary", 340);
-            _lvOperations.Columns.Add("Details", 400);
-            _lvOperations.Columns.Add("Risk", 90);
+            _lvOperations.Columns.Add("#", 38);
+            _lvOperations.Columns.Add("Disk", 90);
+            _lvOperations.Columns.Add("Operation Summary", 240);
+            _lvOperations.Columns.Add("Details", 260);
+            _lvOperations.Columns.Add("Risk", 75);
             _lvOperations.DoubleClick += (s, e) =>
             {
                 if (_lvOperations.SelectedItems.Count > 0 && _lvOperations.SelectedItems[0].Tag is PendingOperation)
@@ -318,8 +338,14 @@ namespace WinParted.UI
                 }
             };
 
-            mainSplit.Panel2.Controls.Add(_lvOperations);
-            mainSplit.Panel2.Controls.Add(opsHeader);
+            bottomSplit.Panel1.Controls.Add(_lvOperations);
+            bottomSplit.Panel1.Controls.Add(opsHeader);
+
+            _integratedExplorer = new IntegratedFileSystemExplorerControl { Dock = DockStyle.Fill };
+            _integratedExplorer.VolumeStateChanged += (s, e) => RefreshMountBadgesAndActions();
+            bottomSplit.Panel2.Controls.Add(_integratedExplorer);
+
+            mainSplit.Panel2.Controls.Add(bottomSplit);
 
             centerContainer.Controls.Add(mainSplit);
             centerContainer.Controls.Add(_deviceInfoPanel);
@@ -582,7 +608,7 @@ namespace WinParted.UI
                     string nameOrLetter = p.IsUnallocated
                         ? "-"
                         : (roMount != null
-                            ? "[RO: " + roMount.MountPath + "]"
+                            ? (roMount.ExperimentalWriteEnabled ? "[EXP-RW: " : "[RO: ") + roMount.MountPath + "]"
                             : (string.IsNullOrEmpty(p.DriveLetter) ? p.PartitionName : p.DriveLetter));
 
                     int rowIdx = _gridPartitions.Rows.Add(
@@ -619,6 +645,7 @@ namespace WinParted.UI
                 _selectedOffsetByDisk[_currentPreviewDisk.DiskNumber] = remembered.StartingOffset;
 
             UpdateActionStates();
+            UpdateIntegratedExplorerSelection();
             int diskPending = _queueManager.Queue.Count(o => o.TargetDiskNumber == _currentPreviewDisk.DiskNumber);
             _lblStatus.Text = string.Format("{0} | {1} pending on this disk ({2} total)", _currentPreviewDisk.DisplayName, diskPending, _queueManager.PendingCount);
         }
@@ -685,6 +712,7 @@ namespace WinParted.UI
             if (_currentPreviewDisk != null && part != null)
                 _selectedOffsetByDisk[_currentPreviewDisk.DiskNumber] = part.StartingOffset;
             UpdateActionStates();
+            UpdateIntegratedExplorerSelection();
         }
 
         private void SyncGridSelectionToPartition(PartitionEntry part)
@@ -724,8 +752,48 @@ namespace WinParted.UI
                         }
                     }
                     UpdateActionStates();
+                    UpdateIntegratedExplorerSelection();
                 }
             }
+        }
+
+        private void RefreshMountBadgesAndActions()
+        {
+            if (_currentPreviewDisk != null && _gridPartitions != null)
+            {
+                foreach (DataGridViewRow row in _gridPartitions.Rows)
+                {
+                    var p = row.Tag as PartitionEntry;
+                    if (p == null || p.IsUnallocated) continue;
+                    var roMount = ReadOnlyFileSystemMountEngine.GetMount(_currentPreviewDisk.DiskNumber, p.StartingOffset);
+                    row.Cells["Name"].Value = roMount != null
+                        ? (roMount.ExperimentalWriteEnabled ? "[EXP-RW: " : "[RO: ") + roMount.MountPath + "]"
+                        : (string.IsNullOrEmpty(p.DriveLetter) ? p.PartitionName : p.DriveLetter);
+                }
+            }
+            UpdateActionStates();
+        }
+
+        private void UpdateIntegratedExplorerSelection()
+        {
+            if (_integratedExplorer == null) return;
+            var sel = GetSelectedPartition();
+            int dNum = _currentPreviewDisk != null ? _currentPreviewDisk.DiskNumber : -1;
+            long off = sel != null ? sel.StartingOffset : -1;
+            var existingVol = (_currentPreviewDisk != null && sel != null && !sel.IsUnallocated)
+                ? ReadOnlyFileSystemMountEngine.GetMount(dNum, off)
+                : null;
+
+            if (_boundExplorerDisk == dNum && _boundExplorerOffset == off && ReferenceEquals(_boundExplorerVolume, existingVol))
+                return;
+
+            _boundExplorerDisk = dNum;
+            _boundExplorerOffset = off;
+            bool autoMount = _currentPreviewDisk != null && _currentPreviewDisk.IsVirtualImage;
+            _integratedExplorer.BindPartition(_currentPreviewDisk, sel, existingVol, autoMount);
+            _boundExplorerVolume = (_currentPreviewDisk != null && sel != null && !sel.IsUnallocated)
+                ? ReadOnlyFileSystemMountEngine.GetMount(dNum, off)
+                : null;
         }
 
         private void UpdateActionStates()
@@ -803,6 +871,8 @@ namespace WinParted.UI
                     sel.ShortDeviceName, vol.MountPath, FileSystemColors.GetDisplayName(vol.FileSystem));
                 using (var dlg = new FileSystemBrowserDialog(_currentPreviewDisk, sel, vol))
                     dlg.ShowDialog(this);
+                _boundExplorerDisk = -1;
+                RenderCurrentDisk();
             }
             catch (Exception ex)
             {
@@ -822,6 +892,8 @@ namespace WinParted.UI
                 RenderCurrentDisk();
                 using (var dlg = new FileSystemBrowserDialog(_currentPreviewDisk, sel, vol))
                     dlg.ShowDialog(this);
+                _boundExplorerDisk = -1;
+                RenderCurrentDisk();
             }
             catch (Exception ex)
             {

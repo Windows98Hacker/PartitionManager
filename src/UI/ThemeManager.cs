@@ -69,6 +69,26 @@ namespace WinParted.UI
             get { return IsDarkMode ? Color.FromArgb(251, 191, 36) : Color.FromArgb(180, 83, 9); }
         }
 
+        public static Color AccentRed
+        {
+            get { return IsDarkMode ? Color.FromArgb(239, 68, 68) : Color.FromArgb(220, 38, 38); }
+        }
+
+        public static Color ExperimentalSurface
+        {
+            get { return IsDarkMode ? Color.FromArgb(56, 14, 18) : Color.FromArgb(254, 226, 226); }
+        }
+
+        public static Color ExperimentalHeader
+        {
+            get { return IsDarkMode ? Color.FromArgb(127, 29, 29) : Color.FromArgb(185, 28, 28); }
+        }
+
+        public static Color ExperimentalText
+        {
+            get { return IsDarkMode ? Color.FromArgb(254, 202, 202) : Color.FromArgb(153, 27, 27); }
+        }
+
         public static void ToggleTheme()
         {
             IsDarkMode = !IsDarkMode;
@@ -179,8 +199,9 @@ namespace WinParted.UI
                 }
                 else if (string.Equals(tag, "DangerButton", StringComparison.OrdinalIgnoreCase))
                 {
-                    btn.BackColor = Color.FromArgb(185, 28, 28);
+                    btn.BackColor = btn.Enabled ? Color.FromArgb(185, 28, 28) : Color.FromArgb(95, 25, 28);
                     btn.ForeColor = Color.White;
+                    btn.FlatAppearance.BorderColor = Color.FromArgb(248, 113, 113);
                 }
                 else if (string.Equals(tag, "ElevateButton", StringComparison.OrdinalIgnoreCase))
                 {
@@ -193,13 +214,25 @@ namespace WinParted.UI
                     btn.ForeColor = TextPrimary;
                 }
             }
+            else if (c is CheckBox && string.Equals(tag, "ExperimentalToggle", StringComparison.OrdinalIgnoreCase))
+            {
+                var cb = (CheckBox)c;
+                cb.FlatStyle = FlatStyle.Flat;
+                cb.BackColor = cb.Checked ? Color.FromArgb(220, 38, 38) : Color.FromArgb(127, 29, 29);
+                cb.ForeColor = Color.White;
+                cb.FlatAppearance.BorderColor = Color.FromArgb(252, 165, 165);
+                cb.FlatAppearance.BorderSize = 2;
+                cb.FlatAppearance.CheckedBackColor = Color.FromArgb(220, 38, 38);
+            }
             else if (c is CheckBox || c is RadioButton)
             {
                 c.ForeColor = TextPrimary;
             }
             else if (c is Label)
             {
-                if (!string.Equals(tag, "KeepForeColor", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(tag, "ExperimentalLabel", StringComparison.OrdinalIgnoreCase))
+                    c.ForeColor = ExperimentalText;
+                else if (!string.Equals(tag, "KeepForeColor", StringComparison.OrdinalIgnoreCase))
                     c.ForeColor = TextPrimary;
             }
             else if (c is SplitContainer)
@@ -220,15 +253,28 @@ namespace WinParted.UI
             }
             else if (c is Panel)
             {
-                if (string.Equals(tag, "SurfacePanel", StringComparison.OrdinalIgnoreCase))
-                    c.BackColor = BackSurface;
-                else if (string.Equals(tag, "ElevatedPanel", StringComparison.OrdinalIgnoreCase))
-                    c.BackColor = BackElevated;
-                else if (string.Equals(tag, "StatusBar", StringComparison.OrdinalIgnoreCase))
-                    c.BackColor = BackElevated;
-                else if (!string.Equals(tag, "SliderPanel", StringComparison.OrdinalIgnoreCase))
-                    c.BackColor = BackPrimary;
-                c.ForeColor = TextPrimary;
+                if (string.Equals(tag, "ExperimentalPanel", StringComparison.OrdinalIgnoreCase))
+                {
+                    c.BackColor = ExperimentalSurface;
+                    c.ForeColor = ExperimentalText;
+                }
+                else if (string.Equals(tag, "ExperimentalHeaderPanel", StringComparison.OrdinalIgnoreCase))
+                {
+                    c.BackColor = ExperimentalHeader;
+                    c.ForeColor = Color.White;
+                }
+                else
+                {
+                    if (string.Equals(tag, "SurfacePanel", StringComparison.OrdinalIgnoreCase))
+                        c.BackColor = BackSurface;
+                    else if (string.Equals(tag, "ElevatedPanel", StringComparison.OrdinalIgnoreCase))
+                        c.BackColor = BackElevated;
+                    else if (string.Equals(tag, "StatusBar", StringComparison.OrdinalIgnoreCase))
+                        c.BackColor = BackElevated;
+                    else if (!string.Equals(tag, "SliderPanel", StringComparison.OrdinalIgnoreCase))
+                        c.BackColor = BackPrimary;
+                    c.ForeColor = TextPrimary;
+                }
                 c.Invalidate();
             }
 
