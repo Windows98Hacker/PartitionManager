@@ -33,6 +33,17 @@ $refs = @(
 # Compiles a single target platform binary (x86, x64, or anycpu) to bin\<outName>
 function Invoke-TargetBuild($compiler, $platform, $outName) {
     $outPath = Join-Path $binDir $outName
+    Get-ChildItem -Path $binDir -Filter "$outName*.old" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $outPath) {
+        Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $outPath) {
+            $oldPath = "$outPath.old"
+            if (Test-Path -LiteralPath $oldPath) {
+                $oldPath = "$outPath.$([DateTime]::UtcNow.Ticks).old"
+            }
+            Move-Item -LiteralPath $outPath -Destination $oldPath -Force -ErrorAction SilentlyContinue
+        }
+    }
     Write-Host "Building $outName (/platform:$platform)..." -ForegroundColor Cyan
     $compilerArgs = @(
         "/nologo",

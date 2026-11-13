@@ -45,8 +45,9 @@ namespace WinParted.UI
         private MountedReadOnlyVolume _boundExplorerVolume;
         private Label _lblStatus;
         private ContextMenuStrip _partContextMenu;
+        private Button _btnFormatDrive;
 
-        private ToolStripButton _tbNew, _tbDelete, _tbResize, _tbCopy, _tbPaste, _tbFormat, _tbFlags, _tbWipe, _tbMountRo, _tbBrowseFs, _tbUndo, _tbApply;
+        private ToolStripButton _tbNew, _tbDelete, _tbResize, _tbCopy, _tbPaste, _tbFormat, _tbFlags, _tbWipe, _tbMountRo, _tbBrowseFs, _tbFormatDrive, _tbUndo, _tbApply;
 
         public MainForm()
         {
@@ -56,9 +57,23 @@ namespace WinParted.UI
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9f);
             BackColor = ThemeManager.BackPrimary;
+            DoubleBuffered = true;
 
             BuildUi();
             LoadInitialDisks();
+        }
+
+        private static void EnableDoubleBuffering(Control control)
+        {
+            if (control == null) return;
+            try
+            {
+                var prop = typeof(Control).GetProperty(
+                    "DoubleBuffered",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (prop != null) prop.SetValue(control, true, null);
+            }
+            catch { }
         }
 
         private void BuildUi()
@@ -99,6 +114,9 @@ namespace WinParted.UI
             var mDevice = new ToolStripMenuItem("Device");
             mDevice.DropDownItems.Add("Create Partition Table (GPT)...", null, (s, e) => QueueCreatePartitionTable(PartitionTableStyle.GPT));
             mDevice.DropDownItems.Add("Create Partition Table (MBR)...", null, (s, e) => QueueCreatePartitionTable(PartitionTableStyle.MBR));
+            mDevice.DropDownItems.Add(new ToolStripSeparator());
+            mDevice.DropDownItems.Add("Format Entire Drive...", null, (s, e) => QueueFormatEntireDrive());
+            mDevice.DropDownItems.Add("Wipe Boot Sector & Hybrid ISO Headers...", null, (s, e) => WipeBootSectorInteractive());
             mDevice.DropDownItems.Add(new ToolStripSeparator());
             mDevice.DropDownItems.Add("Backup Partition Table (.gptbak)...", null, (s, e) => BackupPartitionTable());
             mDevice.DropDownItems.Add("Restore Partition Table (.gptbak)...", null, (s, e) => RestorePartitionTable());
@@ -151,15 +169,15 @@ namespace WinParted.UI
 
             topFlow.Controls.Add(new Label { Text = "Drive:", AutoSize = true, Margin = new Padding(2, 7, 6, 0), Font = new Font("Segoe UI", 9.5f, FontStyle.Bold) });
 
-            _cmbDrives = new ComboBox { Width = 380, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 4, 12, 0) };
+            _cmbDrives = new ComboBox { Width = 305, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 4, 10, 0) };
             _cmbDrives.SelectedIndexChanged += (s, e) => OnDriveSelected();
             topFlow.Controls.Add(_cmbDrives);
 
-            _chkSmartScale = new CheckBox { Text = "Smart Scale", AutoSize = true, Checked = true, Margin = new Padding(0, 6, 12, 0) };
+            _chkSmartScale = new CheckBox { Text = "Smart Scale", AutoSize = true, Checked = true, Margin = new Padding(0, 6, 10, 0) };
             _chkSmartScale.CheckedChanged += (s, e) => { if (_ribbon != null) _ribbon.SmartScale = _chkSmartScale.Checked; };
             topFlow.Controls.Add(_chkSmartScale);
 
-            _chkDarkMode = new CheckBox { Text = "Dark Mode", AutoSize = true, Checked = ThemeManager.IsDarkMode, Margin = new Padding(0, 6, 14, 0) };
+            _chkDarkMode = new CheckBox { Text = "Dark Mode", AutoSize = true, Checked = ThemeManager.IsDarkMode, Margin = new Padding(0, 6, 10, 0) };
             _chkDarkMode.CheckedChanged += (s, e) =>
             {
                 if (_chkDarkMode.Checked != ThemeManager.IsDarkMode)
@@ -171,7 +189,7 @@ namespace WinParted.UI
             {
                 Text = Win32DiskInterop.GetArchitectureBadge(),
                 AutoSize = true,
-                Margin = new Padding(0, 7, 14, 0),
+                Margin = new Padding(0, 7, 10, 0),
                 ForeColor = Win32DiskInterop.IsAdministrator() ? ThemeManager.AccentGreen : ThemeManager.AccentAmber,
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 Tag = "KeepForeColor"
@@ -182,8 +200,8 @@ namespace WinParted.UI
             {
                 Text = "Run as Admin",
                 AutoSize = true,
-                MinimumSize = new Size(108, 28),
-                Padding = new Padding(8, 2, 8, 2),
+                MinimumSize = new Size(102, 28),
+                Padding = new Padding(6, 2, 6, 2),
                 Margin = new Padding(0, 2, 8, 0),
                 Visible = !Win32DiskInterop.IsAdministrator(),
                 Tag = "ElevateButton"
@@ -199,13 +217,25 @@ namespace WinParted.UI
             {
                 Text = "Reset Demo Disk",
                 AutoSize = true,
-                MinimumSize = new Size(128, 28),
-                Padding = new Padding(8, 2, 8, 2),
-                Margin = new Padding(0, 2, 0, 0),
+                MinimumSize = new Size(118, 28),
+                Padding = new Padding(6, 2, 6, 2),
+                Margin = new Padding(0, 2, 8, 0),
                 Tag = "TonalButton"
             };
             btnNewDemo.Click += (s, e) => CreateAndMountDemoDisk();
             topFlow.Controls.Add(btnNewDemo);
+
+            _btnFormatDrive = new Button
+            {
+                Text = "Format Drive...",
+                AutoSize = true,
+                MinimumSize = new Size(114, 28),
+                Padding = new Padding(8, 2, 8, 2),
+                Margin = new Padding(0, 2, 0, 0),
+                Tag = "DangerButton"
+            };
+            _btnFormatDrive.Click += (s, e) => QueueFormatEntireDrive();
+            topFlow.Controls.Add(_btnFormatDrive);
 
             // 3. Action ToolStrip
             var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(6, 4, 6, 4) };
@@ -217,6 +247,7 @@ namespace WinParted.UI
             _tbFormat = new ToolStripButton("Format", null, (s, e) => QueueFormatPartition());
             _tbFlags = new ToolStripButton("Flags", null, (s, e) => QueueManageFlags());
             _tbWipe = new ToolStripButton("Wipe", null, (s, e) => QueueWipePartition());
+            _tbFormatDrive = new ToolStripButton("Format Drive", null, (s, e) => QueueFormatEntireDrive()) { ToolTipText = "Wipe boot sectors / hybrid ISO headers & format entire drive (non-OS disks only)" };
             _tbMountRo = new ToolStripButton("Mount (RO)", null, (s, e) => ToggleReadOnlyMount()) { ToolTipText = "Mount/unmount non-Microsoft partition in read-only mode" };
             _tbBrowseFs = new ToolStripButton("Browse FS", null, (s, e) => BrowseNonMicrosoftFileSystem()) { ToolTipText = "Browse files inside non-Microsoft partition (read-only)" };
             _tbUndo = new ToolStripButton("Undo", null, (s, e) => UndoOperation());
@@ -229,7 +260,7 @@ namespace WinParted.UI
             {
                 _tbNew, _tbDelete, new ToolStripSeparator(),
                 _tbResize, _tbCopy, _tbPaste, new ToolStripSeparator(),
-                _tbFormat, _tbFlags, _tbWipe, new ToolStripSeparator(),
+                _tbFormat, _tbFlags, _tbWipe, _tbFormatDrive, new ToolStripSeparator(),
                 _tbMountRo, _tbBrowseFs, new ToolStripSeparator(),
                 tbHex, tbAlign, new ToolStripSeparator(),
                 _tbUndo, _tbApply, new ToolStripSeparator(), tbRefresh
@@ -250,6 +281,7 @@ namespace WinParted.UI
             var centerContainer = new Panel { Dock = DockStyle.Fill };
 
             _deviceInfoPanel = new Panel { Dock = DockStyle.Left, Width = 248, AutoScroll = true, Padding = new Padding(12), BorderStyle = BorderStyle.None, Tag = "SurfacePanel" };
+            EnableDoubleBuffering(_deviceInfoPanel);
             _lblDeviceInfo = new Label { Location = new Point(12, 12), AutoSize = true, MaximumSize = new Size(220, 0), Font = new Font("Segoe UI", 8.8f) };
             _deviceInfoPanel.Controls.Add(_lblDeviceInfo);
 
@@ -308,6 +340,7 @@ namespace WinParted.UI
             _gridPartitions.CellDoubleClick += OnGridCellDoubleClick;
             _gridPartitions.CellPainting += OnGridCellPainting;
             _gridPartitions.MouseDown += OnGridMouseDown;
+            EnableDoubleBuffering(_gridPartitions);
 
             mainSplit.Panel1.Controls.Add(_gridPartitions);
 
@@ -347,6 +380,7 @@ namespace WinParted.UI
                     SelectDiskByNumber(op.TargetDiskNumber);
                 }
             };
+            EnableDoubleBuffering(_lvOperations);
 
             bottomSplit.Panel1.Controls.Add(_lvOperations);
             bottomSplit.Panel1.Controls.Add(opsHeader);
@@ -581,6 +615,8 @@ namespace WinParted.UI
                 remembered = layout.FirstOrDefault(p => !p.IsUnallocated) ?? layout[0];
             }
 
+            bool isProtectedSystemDisk = _currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage;
+
             // Populate Device Information panel
             _lblDeviceInfo.Text = string.Format(
                 "DEVICE INFORMATION\r\n" +
@@ -593,7 +629,8 @@ namespace WinParted.UI
                 "Logical Sector:\r\n  {6} bytes\r\n" +
                 "Physical Sector:\r\n  {7} bytes\r\n\r\n" +
                 "Partitions:\r\n  {8} active (max {9})\r\n\r\n" +
-                "Disk GUID / Sig:\r\n  {10}",
+                "Disk GUID / Sig:\r\n  {10}\r\n\r\n" +
+                "OS Boot Disk:\r\n  {11}",
                 _currentPreviewDisk.Model,
                 _currentPreviewDisk.DevicePath,
                 ByteFormatter.FormatBytes(_currentPreviewDisk.TotalSizeBytes),
@@ -604,10 +641,12 @@ namespace WinParted.UI
                 _currentPreviewDisk.PhysicalSectorSize,
                 _currentPreviewDisk.Partitions.Count(p => !p.IsUnallocated),
                 _currentPreviewDisk.MaxPartitions,
-                _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT ? _currentPreviewDisk.GptDiskGuid.ToString() : string.Format("0x{0:X8}", _currentPreviewDisk.MbrSignature)
+                _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT ? _currentPreviewDisk.GptDiskGuid.ToString() : string.Format("0x{0:X8}", _currentPreviewDisk.MbrSignature),
+                isProtectedSystemDisk ? "YES (Windows OS — Protected)" : "No (Fully Editable)"
             );
 
             _suppressUiEvents = true;
+            _gridPartitions.SuspendLayout();
             try
             {
                 _ribbon.SetLayout(layout, remembered);
@@ -626,6 +665,18 @@ namespace WinParted.UI
                             ? (roMount.ExperimentalWriteEnabled ? "[EXP-RW: " : "[RO: ") + roMount.MountPath + "]"
                             : (string.IsNullOrEmpty(p.DriveLetter) ? p.PartitionName : p.DriveLetter));
 
+                    string flagsText = p.FlagsSummary ?? "";
+                    if (!p.IsUnallocated)
+                    {
+                        bool isBootOrEsp = p.FileSystem == FileSystemType.EfiSystem ||
+                            p.MbrBootable ||
+                            flagsText.IndexOf("esp", StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (p.IsSystemOrBoot && isProtectedSystemDisk)
+                            flagsText = string.IsNullOrEmpty(flagsText) ? "[OS BOOT — PROTECTED]" : (flagsText + " [OS BOOT — PROTECTED]");
+                        else if (isBootOrEsp)
+                            flagsText = string.IsNullOrEmpty(flagsText) ? "[BOOT / ESP]" : (flagsText + " [BOOT / ESP]");
+                    }
+
                     int rowIdx = _gridPartitions.Rows.Add(
                         p.IsUnallocated ? "unallocated" : p.ShortDeviceName,
                         nameOrLetter,
@@ -634,7 +685,7 @@ namespace WinParted.UI
                         ByteFormatter.FormatBytes(p.PartitionLength),
                         p.UsedBytes.HasValue ? ByteFormatter.FormatBytes(p.UsedBytes.Value) : "-",
                         p.FreeBytes.HasValue ? ByteFormatter.FormatBytes(p.FreeBytes.Value) : "-",
-                        p.FlagsSummary,
+                        flagsText,
                         p.IsUnallocated ? "-" : (p.IsAligned1MiB ? "1 MiB (OK)" : (p.IsAligned4K ? "4K (OK)" : "Misaligned")),
                         string.Format("{0:N0}..{1:N0}", p.StartLba, p.EndLba)
                     );
@@ -653,6 +704,7 @@ namespace WinParted.UI
             }
             finally
             {
+                _gridPartitions.ResumeLayout();
                 _suppressUiEvents = false;
             }
 
@@ -821,15 +873,28 @@ namespace WinParted.UI
             bool hasSel = sel != null;
             bool isUnalloc = hasSel && sel.IsUnallocated;
             bool isPart = hasSel && !sel.IsUnallocated;
+            bool isOsProtectedPart = isPart &&
+                _currentPreviewDisk != null &&
+                !_currentPreviewDisk.IsVirtualImage &&
+                _currentPreviewDisk.IsSystemDisk &&
+                sel.IsSystemOrBoot;
+            bool canEditWholeDisk = _currentPreviewDisk != null &&
+                (!_currentPreviewDisk.IsSystemDisk || _currentPreviewDisk.IsVirtualImage);
 
             _tbNew.Enabled = isUnalloc;
-            _tbDelete.Enabled = isPart;
-            _tbResize.Enabled = isPart;
+            _tbDelete.Enabled = isPart && !isOsProtectedPart;
+            _tbResize.Enabled = isPart && !isOsProtectedPart;
             _tbCopy.Enabled = isPart;
             _tbPaste.Enabled = isUnalloc && _clipboardPartition != null;
-            _tbFormat.Enabled = isPart;
+            _tbFormat.Enabled = isPart && !isOsProtectedPart;
             _tbFlags.Enabled = isPart;
-            _tbWipe.Enabled = isPart;
+            _tbWipe.Enabled = isPart && !isOsProtectedPart;
+            if (_tbFormatDrive != null) _tbFormatDrive.Enabled = canEditWholeDisk;
+            if (_btnFormatDrive != null)
+            {
+                _btnFormatDrive.Enabled = canEditWholeDisk;
+                _btnFormatDrive.BackColor = canEditWholeDisk ? Color.FromArgb(185, 28, 28) : Color.FromArgb(95, 25, 28);
+            }
 
             bool canRoMount = isPart && ReadOnlyFileSystemMountEngine.IsSupportedNonMicrosoftFs(sel.FileSystem);
             bool isRoMounted = canRoMount && _currentPreviewDisk != null &&
@@ -952,22 +1017,30 @@ namespace WinParted.UI
 
         private void RefreshOperationsList()
         {
-            _lvOperations.Items.Clear();
-            int idx = 1;
-            foreach (var op in _queueManager.Queue)
+            _lvOperations.BeginUpdate();
+            try
             {
-                var targetDisk = _queueManager.GetBaselineDisk(op.TargetDiskNumber);
-                string diskTag = targetDisk != null && targetDisk.IsVirtualImage
-                    ? string.Format("Virtual #{0}", op.TargetDiskNumber)
-                    : string.Format("Disk {0}", op.TargetDiskNumber);
+                _lvOperations.Items.Clear();
+                int idx = 1;
+                foreach (var op in _queueManager.Queue)
+                {
+                    var targetDisk = _queueManager.GetBaselineDisk(op.TargetDiskNumber);
+                    string diskTag = targetDisk != null && targetDisk.IsVirtualImage
+                        ? string.Format("Virtual #{0}", op.TargetDiskNumber)
+                        : string.Format("Disk {0}", op.TargetDiskNumber);
 
-                var item = new ListViewItem(idx++.ToString());
-                item.SubItems.Add(diskTag);
-                item.SubItems.Add(op.Summary);
-                item.SubItems.Add(op.DetailDescription);
-                item.SubItems.Add(op.RiskLevel);
-                item.Tag = op;
-                _lvOperations.Items.Add(item);
+                    var item = new ListViewItem(idx++.ToString());
+                    item.SubItems.Add(diskTag);
+                    item.SubItems.Add(op.Summary);
+                    item.SubItems.Add(op.DetailDescription);
+                    item.SubItems.Add(op.RiskLevel);
+                    item.Tag = op;
+                    _lvOperations.Items.Add(item);
+                }
+            }
+            finally
+            {
+                _lvOperations.EndUpdate();
             }
             UpdateActionStates();
         }
@@ -1028,9 +1101,9 @@ namespace WinParted.UI
         {
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
-            if (sel.IsSystemOrBoot && !_currentPreviewDisk.IsVirtualImage)
+            if (sel.IsSystemOrBoot && _currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
             {
-                MessageBox.Show(this, "Cannot delete an active Windows system/boot partition.", "Safety Guardrail", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "Cannot delete a partition required by the running Windows OS on the boot disk.", "Safety Guardrail", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -1052,6 +1125,11 @@ namespace WinParted.UI
         {
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
+            if (sel.IsSystemOrBoot && _currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
+            {
+                MessageBox.Show(this, "Safety Guardrail: Cannot resize or move an active Windows OS boot partition.", "Safety Guardrail", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             var layout = _currentPreviewDisk.GetFullLayoutWithUnallocated();
             int idx = layout.FindIndex(p => p.StartingOffset == sel.StartingOffset && p.PartitionLength == sel.PartitionLength);
@@ -1089,6 +1167,11 @@ namespace WinParted.UI
         {
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
+            if (sel.IsSystemOrBoot && _currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
+            {
+                MessageBox.Show(this, "Safety Guardrail: Cannot format an active Windows OS boot partition.", "Safety Guardrail", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             using (var dlg = new Form { Text = "Format Partition — " + sel.ShortDeviceName, Size = new Size(440, 230), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
             {
@@ -1239,6 +1322,11 @@ namespace WinParted.UI
         {
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
+            if (sel.IsSystemOrBoot && _currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
+            {
+                MessageBox.Show(this, "Safety Guardrail: Cannot wipe an active Windows OS boot partition.", "Safety Guardrail", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             using (var dlg = new WipePartitionDialog(sel))
             {
@@ -1333,6 +1421,124 @@ namespace WinParted.UI
                     RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "Critical"
                 });
             }
+        }
+
+        private void QueueFormatEntireDrive()
+        {
+            if (_currentPreviewDisk == null) return;
+            if (_currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
+            {
+                MessageBox.Show(this, "Safety Guardrail: Cannot wipe or format the active Windows OS boot disk.", "Blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            using (var dlg = new FormatEntireDriveDialog(_currentPreviewDisk))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                int diskNum = _currentPreviewDisk.DiskNumber;
+                string diskPath = _currentPreviewDisk.DevicePath;
+                bool isVirtual = _currentPreviewDisk.IsVirtualImage;
+                string risk = isVirtual ? "Safe (Img)" : "Critical";
+
+                if (!TryEnqueue(new PendingOperation
+                {
+                    Type = OperationType.CreatePartitionTable,
+                    TargetDiskNumber = diskNum,
+                    TargetDiskPath = diskPath,
+                    NewTableStyle = dlg.ResultTableStyle,
+                    Summary = string.Format("Wipe & Reinitialize {0} ({1})",
+                        isVirtual ? "Virtual Disk" : "Disk " + diskNum,
+                        dlg.ResultTableStyle),
+                    DetailDescription = dlg.ResultWipeBootSectors
+                        ? "Wipes LBA 0..255 + hybrid ISO/boot headers & backup GPT, writes clean " + dlg.ResultTableStyle
+                        : "Initializes clean " + dlg.ResultTableStyle + " partition table",
+                    RiskLevel = risk
+                }))
+                {
+                    return;
+                }
+
+                var simDisk = _queueManager.GetPreviewDisk(diskNum) ?? _currentPreviewDisk;
+                var unalloc = simDisk.GetFullLayoutWithUnallocated().FirstOrDefault(p => p.IsUnallocated);
+                if (unalloc == null || unalloc.PartitionLength <= 0)
+                    return;
+
+                long sectorSize = simDisk.LogicalSectorSize > 0 ? simDisk.LogicalSectorSize : 512L;
+                long alignUnit = unalloc.PartitionLength >= 4L * 1048576L ? 1048576L : sectorSize;
+                long startOffset = ByteFormatter.AlignUp(Math.Max(unalloc.StartingOffset, alignUnit), alignUnit);
+                if (startOffset < unalloc.StartingOffset || startOffset >= unalloc.EndOffset)
+                    startOffset = ByteFormatter.AlignUp(unalloc.StartingOffset, sectorSize);
+
+                long endOffset = (unalloc.EndOffset / alignUnit) * alignUnit;
+                if (endOffset <= startOffset)
+                    endOffset = (unalloc.EndOffset / sectorSize) * sectorSize;
+
+                long length = endOffset - startOffset;
+                if (length <= 0)
+                    return;
+
+                TryEnqueue(new PendingOperation
+                {
+                    Type = OperationType.CreatePartition,
+                    TargetDiskNumber = diskNum,
+                    TargetDiskPath = diskPath,
+                    StartOffset = startOffset,
+                    Length = length,
+                    NewFileSystem = dlg.ResultFileSystem,
+                    NewLabel = dlg.ResultLabel,
+                    NewPartitionName = string.IsNullOrEmpty(dlg.ResultLabel) ? "Data" : dlg.ResultLabel,
+                    NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(dlg.ResultFileSystem),
+                    NewMbrType = RawDiskEngine.GetDefaultMbrType(dlg.ResultFileSystem),
+                    Summary = string.Format("Format Full Drive Partition ({0}, {1})",
+                        FileSystemColors.GetDisplayName(dlg.ResultFileSystem),
+                        ByteFormatter.FormatBytes(length)),
+                    DetailDescription = string.Format("Start 0x{0:X}, Length {1}, Label '{2}'",
+                        startOffset, ByteFormatter.FormatBytes(length), dlg.ResultLabel),
+                    RiskLevel = risk
+                });
+            }
+        }
+
+        private void WipeBootSectorInteractive()
+        {
+            if (_currentPreviewDisk == null) return;
+            if (_currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
+            {
+                MessageBox.Show(this, "Safety Guardrail: Cannot wipe boot sectors on the active Windows OS boot disk.", "Blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            PartitionTableStyle targetStyle = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.MBR
+                ? PartitionTableStyle.MBR
+                : PartitionTableStyle.GPT;
+
+            if (MessageBox.Show(this,
+                string.Format(
+                    "Wipe the active boot sector, hybrid ISO headers (LBA 0..255), and backup GPT on {0}, then initialize a clean {1} partition table?\n\n" +
+                    "This queues erasing all existing partitions and bootloaders on this drive.",
+                    _currentPreviewDisk.DisplayName,
+                    targetStyle),
+                "Wipe Boot Sector & Hybrid ISO Headers",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning) != DialogResult.Yes)
+            {
+                return;
+            }
+
+            TryEnqueue(new PendingOperation
+            {
+                Type = OperationType.CreatePartitionTable,
+                TargetDiskNumber = _currentPreviewDisk.DiskNumber,
+                TargetDiskPath = _currentPreviewDisk.DevicePath,
+                NewTableStyle = targetStyle,
+                Summary = string.Format("Wipe Boot Sectors & Reset {0} ({1})",
+                    _currentPreviewDisk.IsVirtualImage ? "Virtual Disk" : "Disk " + _currentPreviewDisk.DiskNumber,
+                    targetStyle),
+                DetailDescription = "Wipes LBA 0..255, hybrid ISO9660 descriptors, and backup GPT before rebuilding clean partition table",
+                RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "Critical"
+            });
         }
 
         private void BackupPartitionTable()
