@@ -30,6 +30,8 @@ namespace WinParted.Models
         LVM2,
         BitLocker,
         APFS,
+        HFSPlus,
+        HFS,
         EfiSystem,
         MicrosoftReserved,
         WindowsRecovery,
@@ -77,6 +79,11 @@ namespace WinParted.Models
         public static readonly Guid LinuxLvm = new Guid("e6d6d379-f507-44c2-a23c-238f2a3df928");
         public static readonly Guid BiosBoot = new Guid("21686148-6449-6e6f-744e-656564454649");
         public static readonly Guid AppleApfs = new Guid("7c3457ef-0000-11aa-aa11-00306543ecac");
+        public static readonly Guid AppleHfs = new Guid("48465300-0000-11aa-aa11-00306543ecac");
+        public static readonly Guid AppleBoot = new Guid("426f6f74-0000-11aa-aa11-00306543ecac");
+        public static readonly Guid AppleUfs = new Guid("55465300-0000-11aa-aa11-00306543ecac");
+        public static readonly Guid AppleCoreStorage = new Guid("53746f72-6167-11aa-aa11-00306543ecac");
+        public static readonly Guid AppleRaid = new Guid("52414944-0000-11aa-aa11-00306543ecac");
 
         public static string Describe(Guid g)
         {
@@ -90,6 +97,11 @@ namespace WinParted.Models
             if (g == LinuxLvm) return "Linux LVM";
             if (g == BiosBoot) return "BIOS Boot Partition";
             if (g == AppleApfs) return "Apple APFS";
+            if (g == AppleHfs) return "Apple HFS+ / HFSX";
+            if (g == AppleBoot) return "Apple Boot / Recovery HD";
+            if (g == AppleUfs) return "Apple UFS";
+            if (g == AppleCoreStorage) return "Apple CoreStorage";
+            if (g == AppleRaid) return "Apple RAID";
             return g.ToString("B");
         }
 
@@ -115,6 +127,9 @@ namespace WinParted.Models
                     return LinuxLvm;
                 case FileSystemType.APFS:
                     return AppleApfs;
+                case FileSystemType.HFSPlus:
+                case FileSystemType.HFS:
+                    return AppleHfs;
                 default:
                     return BasicData;
             }
@@ -142,6 +157,8 @@ namespace WinParted.Models
                 case FileSystemType.LVM2: return Color.FromArgb(124, 58, 237);
                 case FileSystemType.BitLocker: return Color.FromArgb(217, 119, 6);
                 case FileSystemType.APFS: return Color.FromArgb(14, 165, 233);
+                case FileSystemType.HFSPlus: return Color.FromArgb(99, 102, 241);
+                case FileSystemType.HFS: return Color.FromArgb(139, 92, 246);
                 case FileSystemType.EfiSystem: return Color.FromArgb(168, 85, 247);
                 case FileSystemType.MicrosoftReserved: return Color.FromArgb(100, 116, 139);
                 case FileSystemType.WindowsRecovery: return Color.FromArgb(220, 38, 38);
@@ -189,6 +206,8 @@ namespace WinParted.Models
                 case FileSystemType.LVM2: return "lvm2 pv";
                 case FileSystemType.BitLocker: return "bitlocker";
                 case FileSystemType.APFS: return "apfs";
+                case FileSystemType.HFSPlus: return "hfs+";
+                case FileSystemType.HFS: return "hfs";
                 case FileSystemType.EfiSystem: return "fat32 (ESP)";
                 case FileSystemType.MicrosoftReserved: return "msftres";
                 case FileSystemType.WindowsRecovery: return "ntfs (WinRE)";

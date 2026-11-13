@@ -939,10 +939,85 @@ namespace WinParted.Core
                 return;
             }
 
-            // Check APFS ("NXSB" at +32)
-            if (MatchesAscii(data, 32, "NXSB"))
+            // Check APFS ("NXSB" or "APSB" at +32)
+            if (MatchesAscii(data, 32, "NXSB") || MatchesAscii(data, 32, "APSB"))
             {
                 part.FileSystem = FileSystemType.APFS;
+                if (data.Length >= 88)
+                {
+                    uint blockSize = BitConverter.ToUInt32(data, 36);
+                    if (blockSize == 0) blockSize = 4096;
+                    byte[] uuidBytes = new byte[16];
+                    Array.Copy(data, 0x48, uuidBytes, 0, 16);
+                    if (uuidBytes.Any(b => b != 0))
+                        part.UUID = FormatRfcUuid(uuidBytes);
+                }
+                string apfsLbl = ReadCustomLabelHint(data, 0x1A0);
+                if (string.IsNullOrEmpty(apfsLbl) && data.Length >= 0x300)
+                    apfsLbl = Encoding.UTF8.GetString(data, 0x2C0, 64).TrimEnd('\0', ' ');
+                if (!string.IsNullOrEmpty(apfsLbl))
+                    part.Label = apfsLbl;
+                long apfsUsed = ReadCustomUsedHint(data, 0x1C0);
+                if (apfsUsed >= 0 && apfsUsed <= part.PartitionLength)
+                {
+                    part.UsedBytes = apfsUsed;
+                    part.FreeBytes = part.PartitionLength - apfsUsed;
+                }
+                return;
+            }
+
+            // Check Apple HFS+ / HFSX (Volume Header "H+" or "HX" at +0x400, or wrapped in "BD" at +0x47C)
+            if (data.Length >= 1536 &&
+                (MatchesAscii(data, 0x400, "H+") || MatchesAscii(data, 0x400, "HX") ||
+                 (MatchesAscii(data, 0x400, "BD") && (MatchesAscii(data, 0x47C, "H+") || MatchesAscii(data, 0x47C, "HX")))))
+            {
+                part.FileSystem = FileSystemType.HFSPlus;
+                if (MatchesAscii(data, 0x400, "H+") || MatchesAscii(data, 0x400, "HX"))
+                {
+                    uint blockSize = ReadUInt32BE(data, 0x428);
+                    if (blockSize == 0) blockSize = 4096;
+                    uint totalBlocks = ReadUInt32BE(data, 0x42C);
+                    uint freeBlocks = ReadUInt32BE(data, 0x430);
+                    ulong hfsId = BitConverter.ToUInt64(data, 0x468);
+                    if (hfsId != 0)
+                        part.UUID = hfsId.ToString("X16");
+                    string hfsLbl = ReadCustomLabelHint(data, 0x1A0);
+                    if (!string.IsNullOrEmpty(hfsLbl))
+                        part.Label = hfsLbl;
+                    if (totalBlocks > 0 && freeBlocks <= totalBlocks)
+                    {
+                        part.FreeBytes = Math.Min(part.PartitionLength, (long)freeBlocks * blockSize);
+                        part.UsedBytes = Math.Max(0, Math.Min(part.PartitionLength, (long)(totalBlocks - freeBlocks) * blockSize));
+                    }
+                }
+                return;
+            }
+
+            // Check Classic Macintosh HFS (Master Directory Block "BD" at +0x400)
+            if (data.Length >= 1200 && MatchesAscii(data, 0x400, "BD"))
+            {
+                part.FileSystem = FileSystemType.HFS;
+                ushort totalAlBlks = ReadUInt16BE(data, 0x412);
+                uint alBlkSize = ReadUInt32BE(data, 0x414);
+                if (alBlkSize == 0) alBlkSize = 4096;
+                ushort freeAlBlks = ReadUInt16BE(data, 0x422);
+                int vnLen = Math.Min(27, (int)data[0x424]);
+                if (vnLen > 0)
+                    part.Label = Encoding.UTF8.GetString(data, 0x425, vnLen).TrimEnd('\0');
+                ulong macId = BitConverter.ToUInt64(data, 0x474);
+                if (macId != 0)
+                    part.UUID = macId.ToString("X16");
+                long macUsed = ReadCustomUsedHint(data, 0x1C0);
+                if (macUsed >= 0 && macUsed <= part.PartitionLength)
+                {
+                    part.UsedBytes = macUsed;
+                    part.FreeBytes = part.PartitionLength - macUsed;
+                }
+                else if (totalAlBlks > 0 && freeAlBlks <= totalAlBlks)
+                {
+                    part.FreeBytes = Math.Min(part.PartitionLength, (long)freeAlBlks * alBlkSize);
+                    part.UsedBytes = Math.Max(0, Math.Min(part.PartitionLength, (long)(totalAlBlks - freeAlBlks) * alBlkSize));
+                }
                 return;
             }
 
@@ -1104,6 +1179,68 @@ namespace WinParted.Core
                     part.FreeBytes = (long)(xfsFreeBlocks * xfsBlockSize);
                     break;
 
+                case FileSystemType.APFS:
+                    uint apfsBlockSize = 4096;
+                    ulong apfsBlocks = (ulong)Math.Max(1, part.PartitionLength / apfsBlockSize);
+                    Encoding.ASCII.GetBytes("NXSB").CopyTo(buf, 32);
+                    BitConverter.GetBytes(apfsBlockSize).CopyTo(buf, 36);
+                    BitConverter.GetBytes(apfsBlocks).CopyTo(buf, 40);
+                    Guid apfsUuid = Guid.NewGuid();
+                    byte[] apfsUuidBytes = apfsUuid.ToByteArray();
+                    apfsUuidBytes.CopyTo(buf, 0x48);
+                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                    long apfsUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
+                    WriteCustomUsedHint(buf, 0x1C0, apfsUsed);
+                    part.UUID = FormatRfcUuid(apfsUuidBytes);
+                    part.UsedBytes = apfsUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - apfsUsed);
+                    break;
+
+                case FileSystemType.HFSPlus:
+                    Encoding.ASCII.GetBytes("LK").CopyTo(buf, 0);
+                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                    uint hfsBlockSize = 4096;
+                    uint hfsTotalBlocks = (uint)Math.Max(1, Math.Min((long)uint.MaxValue, part.PartitionLength / hfsBlockSize));
+                    long hfsUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
+                    uint hfsUsedBlocks = (uint)Math.Min((long)hfsTotalBlocks, hfsUsed / hfsBlockSize);
+                    uint hfsFreeBlocks = hfsTotalBlocks > hfsUsedBlocks ? hfsTotalBlocks - hfsUsedBlocks : 0;
+                    Encoding.ASCII.GetBytes("H+").CopyTo(buf, 0x400);
+                    WriteUInt16BE(buf, 0x402, 4);
+                    WriteUInt32BE(buf, 0x404, 0x00002100u);
+                    Encoding.ASCII.GetBytes("HFSJ").CopyTo(buf, 0x408);
+                    WriteUInt32BE(buf, 0x428, hfsBlockSize);
+                    WriteUInt32BE(buf, 0x42C, hfsTotalBlocks);
+                    WriteUInt32BE(buf, 0x430, hfsFreeBlocks);
+                    ulong hfsPlusUuid = ((ulong)(uint)Math.Abs((part.Label + part.StartingOffset + "HFS+").GetHashCode()) << 32) | 0x48465350UL;
+                    BitConverter.GetBytes(hfsPlusUuid).CopyTo(buf, 0x468);
+                    part.UUID = hfsPlusUuid.ToString("X16");
+                    part.UsedBytes = hfsUsedBlocks * (long)hfsBlockSize;
+                    part.FreeBytes = hfsFreeBlocks * (long)hfsBlockSize;
+                    break;
+
+                case FileSystemType.HFS:
+                    uint macAlBlkSize = (uint)Math.Max(4096L, ((part.PartitionLength / 65000L) / 512L + 1L) * 512L);
+                    ushort macTotalBlks = (ushort)Math.Max(1, Math.Min(65535L, part.PartitionLength / macAlBlkSize));
+                    long macUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 1048576L);
+                    ushort macUsedBlks = (ushort)Math.Min((int)macTotalBlks, (int)(macUsed / macAlBlkSize));
+                    ushort macFreeBlks = (ushort)(macTotalBlks > macUsedBlks ? macTotalBlks - macUsedBlks : 0);
+                    Encoding.ASCII.GetBytes("BD").CopyTo(buf, 0x400);
+                    WriteUInt16BE(buf, 0x412, macTotalBlks);
+                    WriteUInt32BE(buf, 0x414, macAlBlkSize);
+                    WriteUInt16BE(buf, 0x422, macFreeBlks);
+                    string macLbl = string.IsNullOrEmpty(part.Label) ? "Macintosh HD" : part.Label;
+                    byte[] macLblBytes = Encoding.UTF8.GetBytes(macLbl);
+                    int macLblLen = Math.Min(27, macLblBytes.Length);
+                    buf[0x424] = (byte)macLblLen;
+                    Array.Copy(macLblBytes, 0, buf, 0x425, macLblLen);
+                    ulong macUuid = ((ulong)(uint)Math.Abs((macLbl + part.StartingOffset + "HFS").GetHashCode()) << 32) | 0x4D414348UL;
+                    BitConverter.GetBytes(macUuid).CopyTo(buf, 0x474);
+                    WriteCustomUsedHint(buf, 0x1C0, macUsed);
+                    part.UUID = macUuid.ToString("X16");
+                    part.UsedBytes = macUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - macUsed);
+                    break;
+
                 case FileSystemType.RAW:
                     // buf is zeroed, clearing any stale filesystem signatures
                     part.UUID = string.Empty;
@@ -1235,6 +1372,71 @@ namespace WinParted.Core
                 WriteBytes(disk, part.StartingOffset, buf);
                 return;
             }
+
+            if (MatchesAscii(buf, 32, "NXSB") || MatchesAscii(buf, 32, "APSB"))
+            {
+                uint blockSize = BitConverter.ToUInt32(buf, 36);
+                if (blockSize == 0) blockSize = 4096;
+                ulong newBlocks = (ulong)Math.Max(1, part.PartitionLength / blockSize);
+                BitConverter.GetBytes(newBlocks).CopyTo(buf, 40);
+                long used = ReadCustomUsedHint(buf, 0x1C0);
+                if (used < 0 && part.UsedBytes.HasValue) used = part.UsedBytes.Value;
+                if (used >= 0)
+                {
+                    if (used > part.PartitionLength) used = part.PartitionLength;
+                    WriteCustomUsedHint(buf, 0x1C0, used);
+                    part.UsedBytes = used;
+                    part.FreeBytes = part.PartitionLength - used;
+                }
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1536 && (MatchesAscii(buf, 0x400, "H+") || MatchesAscii(buf, 0x400, "HX")))
+            {
+                uint blockSize = ReadUInt32BE(buf, 0x428);
+                if (blockSize == 0) blockSize = 4096;
+                uint oldTotal = ReadUInt32BE(buf, 0x42C);
+                uint oldFree = ReadUInt32BE(buf, 0x430);
+                uint usedBlocks = oldTotal > oldFree ? oldTotal - oldFree : 0;
+
+                uint newTotal = (uint)Math.Max(1, Math.Min((long)uint.MaxValue, part.PartitionLength / blockSize));
+                if (usedBlocks > newTotal) usedBlocks = newTotal;
+                uint newFree = newTotal - usedBlocks;
+
+                WriteUInt32BE(buf, 0x42C, newTotal);
+                WriteUInt32BE(buf, 0x430, newFree);
+                part.UsedBytes = usedBlocks * (long)blockSize;
+                part.FreeBytes = newFree * (long)blockSize;
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1200 && MatchesAscii(buf, 0x400, "BD"))
+            {
+                uint oldAlBlkSize = ReadUInt32BE(buf, 0x414);
+                if (oldAlBlkSize == 0) oldAlBlkSize = 4096;
+                ushort oldTotal = ReadUInt16BE(buf, 0x412);
+                ushort oldFree = ReadUInt16BE(buf, 0x422);
+                long used = ReadCustomUsedHint(buf, 0x1C0);
+                if (used < 0)
+                    used = part.UsedBytes.HasValue ? part.UsedBytes.Value : (oldTotal > oldFree ? (long)(oldTotal - oldFree) * oldAlBlkSize : 0L);
+                if (used > part.PartitionLength) used = part.PartitionLength;
+
+                uint newAlBlkSize = (uint)Math.Max(4096L, ((part.PartitionLength / 65000L) / 512L + 1L) * 512L);
+                ushort newTotal = (ushort)Math.Max(1, Math.Min(65535L, part.PartitionLength / newAlBlkSize));
+                ushort newUsed = (ushort)Math.Min((int)newTotal, (int)(used / newAlBlkSize));
+                ushort newFree = (ushort)(newTotal > newUsed ? newTotal - newUsed : 0);
+
+                WriteUInt16BE(buf, 0x412, newTotal);
+                WriteUInt32BE(buf, 0x414, newAlBlkSize);
+                WriteUInt16BE(buf, 0x422, newFree);
+                WriteCustomUsedHint(buf, 0x1C0, used);
+                part.UsedBytes = used;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - used);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
         }
 
         public static void UpdateFileSystemLabelInPlace(DiskInfo disk, PartitionEntry part)
@@ -1296,6 +1498,34 @@ namespace WinParted.Core
                 string xLbl = part.Label ?? string.Empty;
                 if (xLbl.Length > 12) xLbl = xLbl.Substring(0, 12);
                 Encoding.UTF8.GetBytes(xLbl).CopyTo(buf, 108);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (MatchesAscii(buf, 32, "NXSB") || MatchesAscii(buf, 32, "APSB"))
+            {
+                Array.Clear(buf, 0x1A0, 32);
+                WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1536 && (MatchesAscii(buf, 0x400, "H+") || MatchesAscii(buf, 0x400, "HX")))
+            {
+                Array.Clear(buf, 0x1A0, 32);
+                WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1200 && MatchesAscii(buf, 0x400, "BD"))
+            {
+                Array.Clear(buf, 0x424, 28);
+                string macLbl = string.IsNullOrEmpty(part.Label) ? "Macintosh HD" : part.Label;
+                byte[] macLblBytes = Encoding.UTF8.GetBytes(macLbl);
+                int macLblLen = Math.Min(27, macLblBytes.Length);
+                buf[0x424] = (byte)macLblLen;
+                Array.Copy(macLblBytes, 0, buf, 0x425, macLblLen);
                 WriteBytes(disk, part.StartingOffset, buf);
                 return;
             }
@@ -1483,9 +1713,37 @@ namespace WinParted.Core
                     return 0x83;
                 case FileSystemType.LVM2:
                     return 0x8E;
+                case FileSystemType.APFS:
+                case FileSystemType.HFSPlus:
+                case FileSystemType.HFS:
+                    return 0xAF;
                 default:
                     return 0x07;
             }
+        }
+
+        private static ushort ReadUInt16BE(byte[] data, int offset)
+        {
+            return (ushort)((data[offset] << 8) | data[offset + 1]);
+        }
+
+        private static uint ReadUInt32BE(byte[] data, int offset)
+        {
+            return ((uint)data[offset] << 24) | ((uint)data[offset + 1] << 16) | ((uint)data[offset + 2] << 8) | data[offset + 3];
+        }
+
+        private static void WriteUInt16BE(byte[] data, int offset, ushort val)
+        {
+            data[offset] = (byte)(val >> 8);
+            data[offset + 1] = (byte)(val & 0xFF);
+        }
+
+        private static void WriteUInt32BE(byte[] data, int offset, uint val)
+        {
+            data[offset] = (byte)(val >> 24);
+            data[offset + 1] = (byte)((val >> 16) & 0xFF);
+            data[offset + 2] = (byte)((val >> 8) & 0xFF);
+            data[offset + 3] = (byte)(val & 0xFF);
         }
 
         private static bool MatchesAscii(byte[] data, int offset, string text)

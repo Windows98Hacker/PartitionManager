@@ -589,6 +589,9 @@ namespace WinParted.Interop
             if (upper == "FAT") return FileSystemType.FAT16;
             if (upper == "EXFAT") return FileSystemType.exFAT;
             if (upper == "REFS") return FileSystemType.ReFS;
+            if (upper == "APFS") return FileSystemType.APFS;
+            if (upper == "HFS+" || upper == "HFSPLUS" || upper == "HFSX") return FileSystemType.HFSPlus;
+            if (upper == "HFS") return FileSystemType.HFS;
             return fallback;
         }
 
@@ -607,6 +610,9 @@ namespace WinParted.Interop
                 case 0x82: return FileSystemType.LinuxSwap;
                 case 0x83: return FileSystemType.Ext4;
                 case 0x8E: return FileSystemType.LVM2;
+                case 0xA8: return FileSystemType.HFS;
+                case 0xAB:
+                case 0xAF: return FileSystemType.HFSPlus;
                 case 0xEF: return FileSystemType.EfiSystem;
                 case 0x27: return FileSystemType.WindowsRecovery;
                 default: return FileSystemType.RAW;
@@ -622,6 +628,11 @@ namespace WinParted.Interop
             if (typeGuid == GptPartitionTypeGuids.LinuxLvm) return FileSystemType.LVM2;
             if (typeGuid == GptPartitionTypeGuids.LinuxFilesystem) return FileSystemType.Ext4;
             if (typeGuid == GptPartitionTypeGuids.AppleApfs) return FileSystemType.APFS;
+            if (typeGuid == GptPartitionTypeGuids.AppleHfs ||
+                typeGuid == GptPartitionTypeGuids.AppleBoot ||
+                typeGuid == GptPartitionTypeGuids.AppleCoreStorage ||
+                typeGuid == GptPartitionTypeGuids.AppleRaid) return FileSystemType.HFSPlus;
+            if (typeGuid == GptPartitionTypeGuids.AppleUfs) return FileSystemType.HFS;
             return FileSystemType.RAW;
         }
 
@@ -639,6 +650,12 @@ namespace WinParted.Interop
                 flags.Add("diag");
             if (typeGuid == GptPartitionTypeGuids.BasicData)
                 flags.Add("msftdata");
+            if (typeGuid == GptPartitionTypeGuids.AppleApfs)
+                flags.Add("apfs");
+            if (typeGuid == GptPartitionTypeGuids.AppleHfs || typeGuid == GptPartitionTypeGuids.AppleCoreStorage)
+                flags.Add("apple_hfs");
+            if (typeGuid == GptPartitionTypeGuids.AppleBoot)
+                flags.Add("apple_boot");
             if ((attrs & 0x1UL) != 0) flags.Add("required");
             if ((attrs & 0x4UL) != 0) flags.Add("legacy_boot");
             if ((attrs & (1UL << 60)) != 0) flags.Add("readonly");

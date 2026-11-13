@@ -28,6 +28,7 @@ namespace WinParted.Core
                 RunStress3_LinuxResizeMoveRelabelDataSafety(tempDir, log);
                 RunStress4_CrossDiskCloneSafety(tempDir, log);
                 RunStress5_PartitionTableSafetyAndRecovery(tempDir, log);
+                RunStress6_AppleAndMacDataSafety(tempDir, log);
 
                 log("STRESS_TEST_ALL_PASSED");
                 return true;
@@ -469,6 +470,124 @@ namespace WinParted.Core
             VerifyDataPayloads(recovered, recovered.Partitions[2], extPayloads, "Ext4 after Backup GPT recovery");
 
             log("  -> Stress 5 PASSED (Overlap, GPT LBA bounds, UsedBytes shrink, MBR 4-slot limit rejected; Backup GPT recovery verified).");
+        }
+
+        private static void RunStress6_AppleAndMacDataSafety(string tempDir, Action<string> log)
+        {
+            log("[Stress 6] Apple/Macintosh Partitions (APFS, HFS+, Classic HFS) Detection, Resize/Move & Relabel...");
+            string imgPath = Path.Combine(tempDir, "stress6_apple.img");
+            var disk = RawDiskEngine.CreateBlankVirtualDisk(imgPath, 96 * MiB, PartitionTableStyle.GPT);
+            disk.DiskNumber = 96;
+
+            var qm = new OperationQueueManager();
+            qm.SetBaselineDisks(null, new[] { disk });
+
+            // Create APFS, HFS+, and Classic HFS partitions with expansion headroom
+            qm.Enqueue(MakeCreateOp(96, imgPath, 1 * MiB, 16 * MiB, FileSystemType.APFS, "MacAPFS"));
+            qm.Enqueue(MakeCreateOp(96, imgPath, 29 * MiB, 16 * MiB, FileSystemType.HFSPlus, "MacintoshHD"));
+            qm.Enqueue(MakeCreateOp(96, imgPath, 57 * MiB, 16 * MiB, FileSystemType.HFS, "ClassicMac"));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 96);
+            if (disk.Partitions.Count != 3)
+                throw new Exception("Expected 3 Apple/Mac partitions, got " + disk.Partitions.Count);
+
+            if (disk.Partitions[0].FileSystem != FileSystemType.APFS ||
+                disk.Partitions[0].GptTypeGuid != GptPartitionTypeGuids.AppleApfs ||
+                disk.Partitions[0].Label != "MacAPFS")
+                throw new Exception("APFS detection/label/GPT GUID mismatch.");
+
+            if (disk.Partitions[1].FileSystem != FileSystemType.HFSPlus ||
+                disk.Partitions[1].GptTypeGuid != GptPartitionTypeGuids.AppleHfs ||
+                disk.Partitions[1].Label != "MacintoshHD")
+                throw new Exception("HFS+ detection/label/GPT GUID mismatch.");
+
+            if (disk.Partitions[2].FileSystem != FileSystemType.HFS ||
+                disk.Partitions[2].GptTypeGuid != GptPartitionTypeGuids.AppleHfs ||
+                disk.Partitions[2].Label != "ClassicMac")
+                throw new Exception("Classic HFS detection/label/GPT GUID mismatch.");
+
+            string uuidApfs = disk.Partitions[0].UUID;
+            string uuidHfsPlus = disk.Partitions[1].UUID;
+            string uuidHfs = disk.Partitions[2].UUID;
+            if (string.IsNullOrEmpty(uuidApfs) || string.IsNullOrEmpty(uuidHfsPlus) || string.IsNullOrEmpty(uuidHfs))
+                throw new Exception("Expected non-empty UUIDs on APFS/HFS+/HFS partitions.");
+
+            long[] testOffsets = new[] { 256 * 1024L, 1 * MiB, 2 * MiB, 4 * MiB };
+            var apfsPayloads = WriteDataPayloads(disk, disk.Partitions[0], testOffsets, 262144);
+            var hfsPlusPayloads = WriteDataPayloads(disk, disk.Partitions[1], testOffsets, 262144);
+            var hfsPayloads = WriteDataPayloads(disk, disk.Partitions[2], testOffsets, 262144);
+
+            // Phase A: Grow all three partitions
+            qm.SetBaselineDisks(null, new[] { disk });
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[0], 1 * MiB, 22 * MiB));
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[1], 29 * MiB, 22 * MiB));
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[2], 57 * MiB, 22 * MiB));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 96);
+            AssertIntegrity(disk);
+            if (disk.Partitions[0].FileSystem != FileSystemType.APFS ||
+                disk.Partitions[1].FileSystem != FileSystemType.HFSPlus ||
+                disk.Partitions[2].FileSystem != FileSystemType.HFS)
+                throw new Exception("Apple/Mac filesystem type lost after Grow.");
+            VerifyDataPayloads(disk, disk.Partitions[0], apfsPayloads, "APFS after Grow");
+            VerifyDataPayloads(disk, disk.Partitions[1], hfsPlusPayloads, "HFS+ after Grow");
+            VerifyDataPayloads(disk, disk.Partitions[2], hfsPayloads, "Classic HFS after Grow");
+
+            // Phase B: Shrink + Overlapping Right Move
+            qm.SetBaselineDisks(null, new[] { disk });
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[0], 5 * MiB, 14 * MiB));
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[1], 33 * MiB, 14 * MiB));
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[2], 61 * MiB, 14 * MiB));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 96);
+            AssertIntegrity(disk);
+            VerifyDataPayloads(disk, disk.Partitions[0], apfsPayloads, "APFS after Shrink+OverlapRight");
+            VerifyDataPayloads(disk, disk.Partitions[1], hfsPlusPayloads, "HFS+ after Shrink+OverlapRight");
+            VerifyDataPayloads(disk, disk.Partitions[2], hfsPayloads, "Classic HFS after Shrink+OverlapRight");
+
+            // Phase C: Move Left + Relabel in-place
+            qm.SetBaselineDisks(null, new[] { disk });
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[0], 2 * MiB, 14 * MiB));
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[1], 30 * MiB, 14 * MiB));
+            qm.Enqueue(MakeResizeOp(96, imgPath, disk.Partitions[2], 58 * MiB, 14 * MiB));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 96);
+            qm.SetBaselineDisks(null, new[] { disk });
+            string[] newLabels = new[] { "MacAPFS2", "MacHFSPlus2", "ClassicMac2" };
+            for (int i = 0; i < 3; i++)
+            {
+                var p = disk.Partitions[i];
+                qm.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.ChangeLabel,
+                    TargetDiskNumber = 96,
+                    TargetDiskPath = imgPath,
+                    TargetPartitionNumber = p.PartitionNumber,
+                    OriginalStartOffset = p.StartingOffset,
+                    OriginalLength = p.PartitionLength,
+                    NewLabel = newLabels[i],
+                    NewPartitionName = newLabels[i],
+                    Summary = "Relabel " + p.ShortDeviceName
+                });
+            }
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 96);
+            AssertIntegrity(disk);
+            if (disk.Partitions[0].UUID != uuidApfs || disk.Partitions[1].UUID != uuidHfsPlus || disk.Partitions[2].UUID != uuidHfs)
+                throw new Exception("Relabel/Resize altered Apple/Mac partition UUIDs!");
+            if (disk.Partitions[0].Label != "MacAPFS2" || disk.Partitions[1].Label != "MacHFSPlus2" || disk.Partitions[2].Label != "ClassicMac2")
+                throw new Exception("Relabel failed on Apple/Mac partitions.");
+
+            VerifyDataPayloads(disk, disk.Partitions[0], apfsPayloads, "APFS after MoveLeft+Relabel");
+            VerifyDataPayloads(disk, disk.Partitions[1], hfsPlusPayloads, "HFS+ after MoveLeft+Relabel");
+            VerifyDataPayloads(disk, disk.Partitions[2], hfsPayloads, "Classic HFS after MoveLeft+Relabel");
+
+            log("  -> Stress 6 PASSED (APFS, HFS+, Classic HFS detection, GPT GUIDs, 100% payload & UUID integrity across grow/shrink/move/relabel).");
         }
 
         private static PendingOperation MakeCreateOp(int diskNum, string diskPath, long start, long len, FileSystemType fs, string label)
