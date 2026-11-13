@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Text;
 using WinParted.Models;
@@ -32,6 +33,8 @@ namespace WinParted.Core
         public byte[] InlineContent { get; set; }
         public List<KeyValuePair<long, long>> ContentExtents { get; set; }
         public List<VirtualFsNode> Children { get; set; }
+        internal string HostShadowFilePath { get; set; }
+        internal long HostShadowOffset { get; set; }
     }
 
     /// <summary>
@@ -56,6 +59,8 @@ namespace WinParted.Core
         public bool ExperimentalWriteEnabled { get; set; }
         public bool IsReadOnly { get { return !ExperimentalWriteEnabled; } }
         public VirtualFsNode RootNode { get; set; }
+        public bool OverlayUsingHostShadow { get; set; }
+        public string OverlayShadowMessage { get; set; }
         internal long OverlayNextDataRelOffset { get; set; }
         internal List<OverlayRecord> OverlayRecords { get; set; }
     }
@@ -255,6 +260,32 @@ namespace WinParted.Core
                     if (onProgress != null) onProgress(toWrite, toWrite);
                 }
                 return toWrite;
+            }
+
+            if (!string.IsNullOrEmpty(fileNode.HostShadowFilePath) && fileNode.ContentLength > 0 && File.Exists(fileNode.HostShadowFilePath))
+            {
+                using (var sfs = new FileStream(fileNode.HostShadowFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    if (fileNode.HostShadowOffset >= 0 && fileNode.HostShadowOffset < sfs.Length)
+                    {
+                        long avail = sfs.Length - fileNode.HostShadowOffset;
+                        long shadowTotal = Math.Min(Math.Min(fileNode.ContentLength, maxBytesToCopy), avail);
+                        long shadowWritten = 0;
+                        sfs.Seek(fileNode.HostShadowOffset, SeekOrigin.Begin);
+                        byte[] buf = new byte[(int)Math.Min(CopyStreamChunkBytes, Math.Max(4096L, shadowTotal))];
+
+                        while (shadowWritten < shadowTotal)
+                        {
+                            int toRead = (int)Math.Min((long)buf.Length, shadowTotal - shadowWritten);
+                            int actual = sfs.Read(buf, 0, toRead);
+                            if (actual <= 0) break;
+                            destination.Write(buf, 0, actual);
+                            shadowWritten += actual;
+                            if (onProgress != null) onProgress(shadowWritten, shadowTotal);
+                        }
+                        return shadowWritten;
+                    }
+                }
             }
 
             if (fileNode.ContentExtents != null && fileNode.ContentExtents.Count > 0 && fileNode.ContentLength > 0)
@@ -676,7 +707,7 @@ namespace WinParted.Core
 
                 byte[] sectorBuf = new byte[(int)alignedWriteLen];
                 Array.Copy(data, sectorBuf, data.Length);
-                RawDiskEngine.WriteBytes(disk, part.StartingOffset + relDataOffset, sectorBuf);
+                WriteOverlayRegionBytes(disk, part, vol, relDataOffset, sectorBuf);
                 vol.OverlayNextDataRelOffset = relDataOffset + alignedWriteLen;
             }
 
@@ -685,6 +716,7 @@ namespace WinParted.Core
             if (existing != null)
                 parentDir.Children.Remove(existing);
 
+            string activeShadowPath = vol.OverlayUsingHostShadow ? GetHostShadowOverlayFilePath(disk, part) : null;
             var fileNode = new VirtualFsNode
             {
                 Name = cleanName,
@@ -694,9 +726,11 @@ namespace WinParted.Core
                 InodeOrObjectId = NextOverlayInodeId(vol),
                 PermissionsString = "-rw-r--r--",
                 ModifiedUtc = now,
-                ContentOffset = data.Length > 0 ? (part.StartingOffset + relDataOffset) : 0,
+                ContentOffset = (data.Length > 0 && !vol.OverlayUsingHostShadow) ? (part.StartingOffset + relDataOffset) : 0,
                 ContentLength = data.Length,
-                InlineContent = data.Length == 0 ? new byte[0] : null
+                InlineContent = data.Length == 0 ? new byte[0] : null,
+                HostShadowFilePath = (data.Length > 0 && !string.IsNullOrEmpty(activeShadowPath)) ? activeShadowPath : null,
+                HostShadowOffset = relDataOffset
             };
             parentDir.Children.Add(fileNode);
             SortAndAssignPaths(parentDir, parentDir.FullPath);
@@ -820,8 +854,86 @@ namespace WinParted.Core
             vol.OverlayRecords.Add(rec);
         }
 
+        internal static string ShadowOverlayRootOverride;
+
+        internal static string GetHostShadowOverlayFilePath(DiskInfo disk, PartitionEntry part)
+        {
+            string baseDir = !string.IsNullOrEmpty(ShadowOverlayRootOverride)
+                ? ShadowOverlayRootOverride
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinParted", "ExperimentalOverlays");
+            string identity = string.Format("{0}|{1}|{2}|{3}|{4}",
+                disk != null ? (disk.SerialNumber ?? string.Empty) : string.Empty,
+                disk != null ? (disk.Model ?? string.Empty) : string.Empty,
+                part != null ? part.StartingOffset : 0,
+                part != null ? part.PartitionLength : 0,
+                part != null ? (part.UUID ?? string.Empty) : string.Empty);
+            string hashHex = ComputeFnv1a64Hex(identity);
+            long startOff = part != null ? part.StartingOffset : 0;
+            int diskNum = disk != null ? disk.DiskNumber : 0;
+            return Path.Combine(baseDir, string.Format("ovl_d{0}_{1:X}_{2}.bin", diskNum, startOff, hashHex));
+        }
+
+        private static string ComputeFnv1a64Hex(string text)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(text ?? string.Empty);
+            ulong hash = 14695981039346656037UL;
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                hash ^= bytes[i];
+                hash *= 1099511628211UL;
+            }
+            return hash.ToString("X16");
+        }
+
+        internal static void WriteShadowRegionBytes(string shadowPath, long relOffset, byte[] data)
+        {
+            string dir = Path.GetDirectoryName(shadowPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            using (var fs = new FileStream(shadowPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite))
+            {
+                long requiredLen = Math.Max(0x24000L, relOffset + data.Length);
+                if (fs.Length < requiredLen)
+                    fs.SetLength(requiredLen);
+                fs.Seek(relOffset, SeekOrigin.Begin);
+                fs.Write(data, 0, data.Length);
+                fs.Flush();
+            }
+        }
+
+        private static void WriteOverlayRegionBytes(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, long relOffset, byte[] data)
+        {
+            if (disk.IsVirtualImage)
+            {
+                RawDiskEngine.WriteBytes(disk, part.StartingOffset + relOffset, data);
+                return;
+            }
+
+            string shadowPath = GetHostShadowOverlayFilePath(disk, part);
+            if (!vol.OverlayUsingHostShadow)
+            {
+                try
+                {
+                    RawDiskEngine.WriteBytes(disk, part.StartingOffset + relOffset, data);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    if (!(ex is Win32Exception) && !(ex is UnauthorizedAccessException) && !(ex is IOException))
+                        throw;
+
+                    vol.OverlayUsingHostShadow = true;
+                    vol.OverlayShadowMessage = "Host shadow overlay active (physical medium blocked raw write; stored locally on host).";
+                }
+            }
+
+            WriteShadowRegionBytes(shadowPath, relOffset, data);
+        }
+
         /// <summary>
-        /// Serializes up to 16 KiB of <c>WPRWOVL1</c> overlay directory/file/tombstone records at partition <c>+0x20000</c>.
+        /// Serializes up to 16 KiB of <c>WPRWOVL1</c> overlay directory/file/tombstone records at partition <c>+0x20000</c>
+        /// (falling back to the host shadow overlay file on physical disks when raw sector writes are rejected).
         /// </summary>
         private static void SaveExperimentalOverlay(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
@@ -852,25 +964,56 @@ namespace WinParted.Core
             }
 
             BitConverter.GetBytes(writtenCount).CopyTo(buf, 16);
-            RawDiskEngine.WriteBytes(disk, part.StartingOffset + 0x20000L, buf);
+            WriteOverlayRegionBytes(disk, part, vol, 0x20000L, buf);
         }
 
         /// <summary>
-        /// Loads any persisted <c>WPRWOVL1</c> experimental write overlay at partition <c>+0x20000</c>
-        /// and merges its upserts and tombstones on top of the natively parsed volume tree.
+        /// Loads any persisted <c>WPRWOVL1</c> experimental write overlay from partition <c>+0x20000</c>
+        /// (or from a physical partition's host shadow file if present) and merges it onto the volume tree.
         /// </summary>
-        private static void LoadAndMergeExperimentalOverlay(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
+        internal static void LoadAndMergeExperimentalOverlay(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             if (part.PartitionLength < 0x30000L || vol.RootNode == null) return;
             try
             {
-                byte[] probe = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x20000L, 4096);
-                if (probe.Length < 20 || !MatchesAscii(probe, 0, "WPRWOVL1"))
-                    return;
+                byte[] table = null;
+                string activeShadowPath = null;
 
-                byte[] table = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x20000L, 16384);
-                if (table.Length < 20 || !MatchesAscii(table, 0, "WPRWOVL1"))
-                    return;
+                if (!disk.IsVirtualImage)
+                {
+                    string shadowPath = GetHostShadowOverlayFilePath(disk, part);
+                    if (File.Exists(shadowPath))
+                    {
+                        using (var sfs = new FileStream(shadowPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        {
+                            if (sfs.Length >= 0x20000L + 20)
+                            {
+                                int toRead = (int)Math.Min(16384L, sfs.Length - 0x20000L);
+                                byte[] sTable = new byte[toRead];
+                                sfs.Seek(0x20000L, SeekOrigin.Begin);
+                                int n = sfs.Read(sTable, 0, toRead);
+                                if (n >= 20 && MatchesAscii(sTable, 0, "WPRWOVL1"))
+                                {
+                                    table = sTable;
+                                    activeShadowPath = shadowPath;
+                                    vol.OverlayUsingHostShadow = true;
+                                    vol.OverlayShadowMessage = "Host shadow overlay active (loaded local host overlay for physical partition).";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (table == null)
+                {
+                    byte[] probe = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x20000L, 4096);
+                    if (probe.Length < 20 || !MatchesAscii(probe, 0, "WPRWOVL1"))
+                        return;
+
+                    table = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x20000L, 16384);
+                    if (table.Length < 20 || !MatchesAscii(table, 0, "WPRWOVL1"))
+                        return;
+                }
 
                 ulong nextData = BitConverter.ToUInt64(table, 8);
                 vol.OverlayNextDataRelOffset = (long)Math.Max(0x24000UL, nextData);
@@ -907,7 +1050,7 @@ namespace WinParted.Core
                     }
                     else if (op == 1)
                     {
-                        ApplyOverlayUpsertToTree(part, vol, rec);
+                        ApplyOverlayUpsertToTree(part, vol, rec, activeShadowPath);
                     }
                 }
 
@@ -918,7 +1061,7 @@ namespace WinParted.Core
             }
         }
 
-        private static void ApplyOverlayUpsertToTree(PartitionEntry part, MountedReadOnlyVolume vol, OverlayRecord rec)
+        private static void ApplyOverlayUpsertToTree(PartitionEntry part, MountedReadOnlyVolume vol, OverlayRecord rec, string shadowFilePath)
         {
             if (string.IsNullOrEmpty(rec.FullPath) || rec.FullPath == "/") return;
             string[] parts = rec.FullPath.Trim('/').Split(new char[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
@@ -966,6 +1109,7 @@ namespace WinParted.Core
             {
                 if (existing != null)
                     parent.Children.Remove(existing);
+                bool hasShadow = !string.IsNullOrEmpty(shadowFilePath) && rec.DataLength > 0 && rec.RelDataOffset > 0;
                 parent.Children.Add(new VirtualFsNode
                 {
                     Name = leafName,
@@ -975,9 +1119,11 @@ namespace WinParted.Core
                     InodeOrObjectId = NextOverlayInodeId(vol),
                     PermissionsString = "-rw-r--r--",
                     ModifiedUtc = mtime,
-                    ContentOffset = (rec.DataLength > 0 && rec.RelDataOffset > 0) ? (part.StartingOffset + rec.RelDataOffset) : 0,
+                    ContentOffset = (!hasShadow && rec.DataLength > 0 && rec.RelDataOffset > 0) ? (part.StartingOffset + rec.RelDataOffset) : 0,
                     ContentLength = rec.DataLength,
-                    InlineContent = rec.DataLength == 0 ? new byte[0] : null
+                    InlineContent = rec.DataLength == 0 ? new byte[0] : null,
+                    HostShadowFilePath = hasShadow ? shadowFilePath : null,
+                    HostShadowOffset = rec.RelDataOffset
                 });
             }
         }

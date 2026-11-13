@@ -884,16 +884,21 @@ namespace WinParted.UI
             if (_volume.ExperimentalWriteEnabled)
             {
                 _lblVolumeBanner.ForeColor = ThemeManager.AccentRed;
-                _lblVolumeBanner.Text = string.Format("EXPERIMENTAL RW ACTIVE  |  {0} ({1})  |  Label: {2}",
-                    _volume.MountPath, FileSystemColors.GetDisplayName(_volume.FileSystem),
+                string modeLabel = _volume.OverlayUsingHostShadow ? "EXPERIMENTAL RW [EXP-RW SHADOW]" : "EXPERIMENTAL RW ACTIVE";
+                _lblVolumeBanner.Text = string.Format("{0}  |  {1} ({2})  |  Label: {3}",
+                    modeLabel, _volume.MountPath, FileSystemColors.GetDisplayName(_volume.FileSystem),
                     string.IsNullOrEmpty(_volume.Label) ? "(none)" : _volume.Label);
             }
             else
             {
                 _lblVolumeBanner.ForeColor = ThemeManager.AccentGreen;
-                _lblVolumeBanner.Text = string.Format("READ-ONLY MOUNT  |  {0}  |  {1}",
-                    _volume.MountPath, _volume.SuperblockSummary);
+                string roLabel = _volume.OverlayUsingHostShadow ? "READ-ONLY MOUNT + SHADOW OVERLAY" : "READ-ONLY MOUNT";
+                _lblVolumeBanner.Text = string.Format("{0}  |  {1}  |  {2}",
+                    roLabel, _volume.MountPath, _volume.SuperblockSummary);
             }
+
+            if (_volume.OverlayUsingHostShadow && _lblExplorerStatus != null)
+                _lblExplorerStatus.Text = "[EXP-RW SHADOW] " + (_volume.OverlayShadowMessage ?? "Host shadow overlay active.");
         }
 
         private void TogglePreviewPane()
@@ -1594,7 +1599,12 @@ namespace WinParted.UI
                     VirtualFsNode targetDir = GetCurrentDirectoryNode();
                     var created = ReadOnlyFileSystemMountEngine.WriteHostFileToVolume(_disk, _partition, _volume, targetDir, ofd.FileName);
                     RefreshTreeKeepingPath(targetDir.FullPath);
-                    MessageBox.Show(this, "Experimental write succeeded:\n" + created.FullPath, "Experimental Write", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    UpdateBannerText();
+                    NotifyVolumeStateChanged();
+                    string extra = _volume.OverlayUsingHostShadow && !string.IsNullOrEmpty(_volume.OverlayShadowMessage)
+                        ? ("\n\n" + _volume.OverlayShadowMessage)
+                        : string.Empty;
+                    MessageBox.Show(this, "Experimental write succeeded:\n" + created.FullPath + extra, "Experimental Write", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 catch (Exception ex)
                 {
@@ -1616,8 +1626,13 @@ namespace WinParted.UI
                     int foldersWritten;
                     var created = ReadOnlyFileSystemMountEngine.WriteHostDirectoryToVolume(_disk, _partition, _volume, targetDir, fbd.SelectedPath, out filesWritten, out foldersWritten);
                     RefreshTreeKeepingPath(targetDir.FullPath);
+                    UpdateBannerText();
+                    NotifyVolumeStateChanged();
+                    string extra = _volume.OverlayUsingHostShadow && !string.IsNullOrEmpty(_volume.OverlayShadowMessage)
+                        ? ("\n\n" + _volume.OverlayShadowMessage)
+                        : string.Empty;
                     MessageBox.Show(this,
-                        string.Format("Experimental folder write succeeded:\n{0}\n\nFolders: {1}, Files: {2}", created.FullPath, foldersWritten, filesWritten),
+                        string.Format("Experimental folder write succeeded:\n{0}\n\nFolders: {1}, Files: {2}{3}", created.FullPath, foldersWritten, filesWritten, extra),
                         "Experimental Write", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 catch (Exception ex)
@@ -1637,6 +1652,8 @@ namespace WinParted.UI
                 VirtualFsNode targetDir = GetCurrentDirectoryNode();
                 var created = ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(_disk, _partition, _volume, targetDir, name);
                 RefreshTreeKeepingPath(targetDir.FullPath);
+                UpdateBannerText();
+                NotifyVolumeStateChanged();
                 _lblSelectedFile.Text = "Created folder: " + created.FullPath;
             }
             catch (Exception ex)
@@ -1661,6 +1678,8 @@ namespace WinParted.UI
                 string curDirPath = GetCurrentDirectoryNode().FullPath;
                 ReadOnlyFileSystemMountEngine.DeleteNodeFromVolume(_disk, _partition, _volume, node);
                 RefreshTreeKeepingPath(curDirPath);
+                UpdateBannerText();
+                NotifyVolumeStateChanged();
             }
             catch (Exception ex)
             {

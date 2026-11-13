@@ -76,7 +76,8 @@ Every core parser and formatter operates solely through `RawDiskEngine.ReadBytes
 - **Virtual Disks (`disk.IsVirtualImage == true`)**: Backed by raw `.img` files via `FileStream`. All byte offsets are exact file offsets, requiring no Administrator privileges.
 - **Physical Disks (`disk.IsVirtualImage == false`)**: Backed by `Win32DiskInterop`:
   1. `EnumeratePhysicalDisks()` queries `\\.\PhysicalDriveN` geometry (`IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`) and maps drive letters/GUID volumes via `FindFirstVolume`/`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`.
-  2. `ReadRawDiskSectors()` aligns reads to `LogicalSectorSize` (typically 512 B or 4096 B). If direct `PhysicalDrive` writes encounter Windows lock protection inside an active partition, `WriteRawDiskSectors()` locks/dismounts matching volumes (`FSCTL_LOCK_VOLUME`, `FSCTL_DISMOUNT_VOLUME`) and can fall back to the raw `\Device\HarddiskVolume...` / `\\?\GLOBALROOT\Device\HarddiskN\PartitionP` handle via `PreparePartitionForRawWrite()`.
+  2. `ReadRawDiskSectors()` aligns reads to `LogicalSectorSize` (typically 512 B or 4096 B).
+  3. `WriteRawDiskSectors()` acquires exclusive volume locks (`FSCTL_LOCK_VOLUME`) across all mounted/overlapping volumes on the target disk (`OpenAndLockVolumeNoDismount`) **without** sending `FSCTL_DISMOUNT_VOLUME` before `WriteFile` — critical for `\FileSystem\RAW` handles on Linux/ISO installer partitions, where premature dismount sets `VCB_STATE_FLAG_DISMOUNTED` and rejects writes with Win32 error `1` (`ERROR_INVALID_FUNCTION`). It keeps those locks held while trying (1) the covering volume handle, (2) `\Device\HarddiskN\PartitionP`, and (3) `\\.\PhysicalDriveN` (clearing `DISK_ATTRIBUTE_READ_ONLY` via `IOCTL_DISK_SET_DISK_ATTRIBUTES` and enforcing 4K Read-Modify-Write sector alignment + chunked retry), only dismounting/offlining as a final retry.
 
 ### 3.2 Non-Destructive Queue & Simulated Preview (`OperationQueueManager`)
 
@@ -103,11 +104,12 @@ When the user clicks **Apply All Operations**:
 **Multi-GB Copy Architecture (`CopyFileNodeToStream`)**:
 Previously, loading an entire file into a single `byte[]` truncated or failed on multi-GB files (such as a `1.6 GB` macOS `BaseSystem.dmg`). `CopyFileNodeToStream` now iterates across `ContentExtents` (or contiguous `ContentOffset` + `ContentLength`) in **4 MiB (`4,194,304 B`) chunks** (`CopyStreamChunkBytes`), writing directly into the host `FileStream` while reporting live progress and checking cancellation flags.
 
-### 3.4 Experimental Write Overlay (`WPRWOVL1`)
+### 3.4 Experimental Write Overlay (`WPRWOVL1`) & Host Shadow Fallback
 
 Because full in-place B-tree/journal mutation on foreign volumes is high-risk, `ReadOnlyFileSystemMountEngine` provides an opt-in overlay table gated behind the red toggle (`ExperimentalToggle`) in `IntegratedFileSystemExplorerControl`:
 - **Overlay Header (`+0x20000`, 16 KiB)**: ASCII magic `WPRWOVL1`, next payload offset (`>= +0x24000`), record count, and variable-length records (`Op=1` upsert file/directory, `Op=2` tombstone delete, `RelDataOffset`, `DataLength`, `ModifiedUtcTicks`, UTF-8 `FullPath`).
-- **Load/Merge**: Whenever `MountReadOnly()` opens a partition, `LoadAndMergeExperimentalOverlay()` reads `+0x20000` and overlays any persisted creates, uploads, overwrites, or deletions onto the native read-only tree.
+- **Load/Merge**: Whenever `MountReadOnly()` opens a partition, `LoadAndMergeExperimentalOverlay()` reads `+0x20000` (checking any host shadow file for physical disks first) and overlays any persisted creates, uploads, overwrites, or deletions onto the native read-only tree.
+- **Physical Host Shadow Fallback**: If a physical drive/USB controller or non-elevated session blocks raw sector writes (`Win32Exception`, `UnauthorizedAccessException`, `IOException`), `WriteOverlayRegionBytes` falls back cleanly to a deterministic shadow overlay file in `%LocalAppData%\WinParted\ExperimentalOverlays\ovl_d<N>_<offset>_<fnv1a64>.bin`, marks `OverlayUsingHostShadow = true` (`[EXP-RW SHADOW]`), and streams reads/exports transparently from the shadow file. Virtual `.img` disks never use the shadow fallback and always persist directly in-image.
 
 ---
 
