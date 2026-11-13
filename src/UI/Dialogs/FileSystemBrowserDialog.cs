@@ -6,6 +6,10 @@ using WinParted.Models;
 
 namespace WinParted.UI.Dialogs
 {
+    /// <summary>
+    /// Modal full-window host wrapping <see cref="IntegratedFileSystemExplorerControl"/> for dedicated
+    /// browsing of a mounted foreign or developer partition.
+    /// </summary>
     public class FileSystemBrowserDialog : Form
     {
         private readonly IntegratedFileSystemExplorerControl _explorer;

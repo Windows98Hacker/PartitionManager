@@ -4,6 +4,14 @@ using System.Windows.Forms;
 
 namespace WinParted.UI
 {
+    /// <summary>
+    /// Centralized Google Material Design 3 (M3) light/dark theme tokens and recursive WinForms
+    /// styler. Controls opt into semantic M3 roles via <c>Control.Tag</c> (<c>PrimaryButton</c>,
+    /// <c>TonalButton</c>, <c>DangerButton</c>, <c>ElevateButton</c>, <c>ExperimentalToggle</c>,
+    /// <c>ExperimentalLabel</c>, <c>KeepForeColor</c>, <c>ExperimentalPanel</c>,
+    /// <c>ExperimentalHeaderPanel</c>, <c>SurfacePanel</c>, <c>ElevatedPanel</c>,
+    /// <c>ContainerHighPanel</c>, <c>StatusBar</c>, <c>SliderPanel</c>, <c>ConsoleColors</c>).
+    /// </summary>
     public static class ThemeManager
     {
         public static bool IsDarkMode = true;
@@ -114,6 +122,9 @@ namespace WinParted.UI
             get { return IsDarkMode ? Color.FromArgb(254, 202, 202) : Color.FromArgb(153, 27, 27); }
         }
 
+        /// <summary>
+        /// Flips between Material Design 3 Dark and Light palettes and notifies subscribed windows/controls.
+        /// </summary>
         public static void ToggleTheme()
         {
             IsDarkMode = !IsDarkMode;
@@ -122,6 +133,9 @@ namespace WinParted.UI
                 handler(null, EventArgs.Empty);
         }
 
+        /// <summary>
+        /// Recursively applies the active M3 palette and renderer to a Form or UserControl hierarchy.
+        /// </summary>
         public static void ApplyTheme(Control root)
         {
             if (root == null) return;

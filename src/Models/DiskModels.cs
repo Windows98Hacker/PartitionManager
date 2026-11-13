@@ -5,6 +5,9 @@ using System.Linq;
 
 namespace WinParted.Models
 {
+    /// <summary>
+    /// Partition table layout format detected on or written to a disk.
+    /// </summary>
     public enum PartitionTableStyle
     {
         Unknown = 0,
@@ -13,6 +16,9 @@ namespace WinParted.Models
         RAW = 3
     }
 
+    /// <summary>
+    /// Supported filesystems and partition container types across Windows, Linux, BSD/Unix, and macOS.
+    /// </summary>
     public enum FileSystemType
     {
         Unallocated,
@@ -44,6 +50,9 @@ namespace WinParted.Models
         RAW
     }
 
+    /// <summary>
+    /// Queued non-destructive operation types managed by <see cref="WinParted.Core.OperationQueueManager"/>.
+    /// </summary>
     public enum OperationType
     {
         CreatePartition,
@@ -58,6 +67,9 @@ namespace WinParted.Models
         RestorePartitionTable
     }
 
+    /// <summary>
+    /// Partition start/size alignment strategy (1 MiB SSD standard, legacy cylinder, or unaligned sector).
+    /// </summary>
     public enum AlignmentMode
     {
         MiB = 0,
@@ -65,6 +77,9 @@ namespace WinParted.Models
         None = 2
     }
 
+    /// <summary>
+    /// Data overwrite pattern used during secure partition wiping.
+    /// </summary>
     public enum WipePattern
     {
         ZeroFill = 0,
@@ -72,6 +87,9 @@ namespace WinParted.Models
         RandomDoD = 2
     }
 
+    /// <summary>
+    /// Standard UEFI / GPT partition type GUID definitions and helpers.
+    /// </summary>
     public static class GptPartitionTypeGuids
     {
         public static readonly Guid Unused = Guid.Empty;
@@ -150,6 +168,9 @@ namespace WinParted.Models
         }
     }
 
+    /// <summary>
+    /// Provides Material Design 3-inspired border, fill, used-capacity colors, and display labels per filesystem.
+    /// </summary>
     public static class FileSystemColors
     {
         public static Color GetBorderColor(FileSystemType fs)
@@ -261,6 +282,9 @@ namespace WinParted.Models
         }
     }
 
+    /// <summary>
+    /// Represents a single partition slice (or synthetic unallocated gap) on a physical or virtual disk.
+    /// </summary>
     public class PartitionEntry
     {
         public PartitionEntry()
@@ -355,6 +379,10 @@ namespace WinParted.Models
         }
     }
 
+    /// <summary>
+    /// Represents an entire physical drive (<c>\\.\PhysicalDriveN</c>) or virtual raw disk image (<c>.img</c>),
+    /// along with its geometry, partition table header metadata, and parsed partitions.
+    /// </summary>
     public class DiskInfo
     {
         public DiskInfo()
@@ -437,6 +465,10 @@ namespace WinParted.Models
             }
         }
 
+        /// <summary>
+        /// Computes the complete contiguous visual disk map by interleaving allocated partitions
+        /// with synthetic <see cref="FileSystemType.Unallocated"/> gap entries between usable boundaries.
+        /// </summary>
         public List<PartitionEntry> GetFullLayoutWithUnallocated()
         {
             var result = new List<PartitionEntry>();
@@ -520,6 +552,9 @@ namespace WinParted.Models
         }
     }
 
+    /// <summary>
+    /// Immutable-intent action payload stored in the pending queue until the user clicks Apply.
+    /// </summary>
     public class PendingOperation
     {
         public PendingOperation()
@@ -571,6 +606,9 @@ namespace WinParted.Models
         public Func<bool> ExecuteCallback { get; set; }
     }
 
+    /// <summary>
+    /// Byte formatting and boundary alignment helpers (KiB/MiB/GiB and floor/ceil alignment).
+    /// </summary>
     public static class ByteFormatter
     {
         public static string FormatBytes(long bytes)

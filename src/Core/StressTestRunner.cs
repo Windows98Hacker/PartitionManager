@@ -8,10 +8,19 @@ using WinParted.UI;
 
 namespace WinParted.Core
 {
+    /// <summary>
+    /// End-to-end automated regression and data-safety test suite operating strictly on temporary
+    /// virtual <c>.img</c> disk files (multi-disk UI queue isolation, NTFS/FAT/exFAT/Ext/Btrfs/XFS/Swap/Apple
+    /// resize/move/relabel data preservation, GPT backup recovery, >16 MiB HFS+ Extents Overflow streaming,
+    /// and native read-only mount + experimental write overlay round-trips).
+    /// </summary>
     public static class StressTestRunner
     {
         private const long MiB = 1048576L;
 
+        /// <summary>
+        /// Executes all 8 automated stress and filesystem verification suites in an isolated temporary directory.
+        /// </summary>
         public static bool RunAll(Action<string> log)
         {
             if (log == null) log = delegate(string s) { Console.WriteLine(s); };
@@ -41,6 +50,9 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Stress 1: Multi-disk ribbon isolation and per-disk selective undo (<see cref="OperationQueueManager.UndoLastForDisk"/>).
+        /// </summary>
         private static void RunStress1_MultiDiskSwitching(string tempDir, Action<string> log)
         {
             log("[Stress 1] Rapid Multi-Disk Switching, UI Ribbon Isolation & Interleaved Queue...");
@@ -148,6 +160,9 @@ namespace WinParted.Core
             log("  -> Stress 1 PASSED (4 disks, 60 rapid switches, ribbon isolation & interleaved queue verified).");
         }
 
+        /// <summary>
+        /// Stress 2: Windows NTFS, FAT32, and exFAT grow, shrink, overlapping move, and in-place relabel byte verification.
+        /// </summary>
         private static void RunStress2_WindowsResizeMoveDataSafety(string tempDir, Action<string> log)
         {
             log("[Stress 2] Windows Partitions (NTFS, FAT32, exFAT) Grow/Shrink/Overlapping-Move Data Safety...");
@@ -234,6 +249,9 @@ namespace WinParted.Core
             log("  -> Stress 2 PASSED (NTFS, FAT32, exFAT 100% payload & UUID integrity across grow/shrink/overlap-move/relabel).");
         }
 
+        /// <summary>
+        /// Stress 3: Linux Ext4, Btrfs, XFS, and Linux Swap grow, shrink, overlapping move, and UUID/payload preservation.
+        /// </summary>
         private static void RunStress3_LinuxResizeMoveRelabelDataSafety(string tempDir, Action<string> log)
         {
             log("[Stress 3] Linux Partitions (ext4, Btrfs, XFS, Swap) Grow/Shrink/Overlapping-Move/Relabel Data Safety...");
@@ -328,6 +346,9 @@ namespace WinParted.Core
             log("  -> Stress 3 PASSED (ext4, Btrfs, XFS, LinuxSwap 100% payload & UUID integrity across grow/shrink/overlap-move/relabel).");
         }
 
+        /// <summary>
+        /// Stress 4: Cross-disk partition cloning and post-clone target expansion byte-for-byte integrity.
+        /// </summary>
         private static void RunStress4_CrossDiskCloneSafety(string tempDir, Action<string> log)
         {
             log("[Stress 4] Cross-Disk Partition Clone & Expansion Verification...");
@@ -400,6 +421,9 @@ namespace WinParted.Core
             log("  -> Stress 4 PASSED (Cross-disk clone + expansion preserved 100% of user data on both disks).");
         }
 
+        /// <summary>
+        /// Stress 5: Guardrails rejecting overlaps, out-of-bounds GPT ranges, unsafe shrinks, MBR >4 slots, plus GPT backup recovery.
+        /// </summary>
         private static void RunStress5_PartitionTableSafetyAndRecovery(string tempDir, Action<string> log)
         {
             log("[Stress 5] Partition Table Safety Guardrails, Corruption Rejection & Backup GPT Recovery...");
@@ -474,6 +498,9 @@ namespace WinParted.Core
             log("  -> Stress 5 PASSED (Overlap, GPT LBA bounds, UsedBytes shrink, MBR 4-slot limit rejected; Backup GPT recovery verified).");
         }
 
+        /// <summary>
+        /// Stress 6: Apple APFS, HFS+, and Classic HFS superblock detection, GPT type GUIDs, move/resize, and relabeling.
+        /// </summary>
         private static void RunStress6_AppleAndMacDataSafety(string tempDir, Action<string> log)
         {
             log("[Stress 6] Apple/Macintosh Partitions (APFS, HFS+, Classic HFS) Detection, Resize/Move & Relabel...");
@@ -592,6 +619,9 @@ namespace WinParted.Core
             log("  -> Stress 6 PASSED (APFS, HFS+, Classic HFS detection, GPT GUIDs, 100% payload & UUID integrity across grow/shrink/move/relabel).");
         }
 
+        /// <summary>
+        /// Stress 7: Physical USB GPT/MBR Ext4 DiskPart script generation and FAT32-to-Ext4 superblock/type replacement.
+        /// </summary>
         private static void RunStress7_PhysicalDiskScriptAndFormatType(string tempDir, Action<string> log)
         {
             log("[Stress 7] Physical USB Ext4 Format Scripts, MBR/GPT Type IDs & Superblock Reload...");
@@ -674,6 +704,10 @@ namespace WinParted.Core
             log("  -> Stress 7 PASSED (Physical USB GPT/MBR Ext4 format script & FAT32->Ext4 superblock/type verification).");
         }
 
+        /// <summary>
+        /// Stress 8: Native read-only mount, search, host export, experimental write overlay persistence,
+        /// developer filesystems (Btrfs/XFS/Ext2/F2FS/ZFS/SquashFS/ISO9660/UDF/FAT16/ReFS), and >16 MiB HFS+ overflow streaming.
+        /// </summary>
         private static void RunStress8_ReadOnlyNonMicrosoftMountAndBrowse(string tempDir, Action<string> log)
         {
             log("[Stress 8] Read-Only Mounting & Browsing Non-Microsoft Filesystems (Virtual Test Image Only)...");
@@ -869,6 +903,10 @@ namespace WinParted.Core
             log("  -> Stress 8 PASSED (6 foreign FSs, >16 MiB HFS+ overflow, native Btrfs/XFS/Ext2/ISO9660 & dev FSs verified).");
         }
 
+        /// <summary>
+        /// Verifies native formatting, detection, read-only mounting, search, host export, and experimental writes
+        /// across Btrfs, XFS, Ext2, F2FS, ZFS, SquashFS, ISO9660, UDF, FAT16, and ReFS on a virtual test image.
+        /// </summary>
         private static void VerifyDevFileSystemsMountAndFormat(string tempDir, Action<string> log)
         {
             string devImg = Path.Combine(tempDir, "stress8_devfs.img");
@@ -1165,6 +1203,10 @@ namespace WinParted.Core
             return dataOff + 168;
         }
 
+        /// <summary>
+        /// Regression test for large HFS+ files exceeding 8 inline fork extents: constructs a 20 MiB sparse
+        /// Extents Overflow B-Tree file and verifies complete 20 MiB streaming export in 4 MiB chunks.
+        /// </summary>
         private static void VerifyLargeHfsPlusOverflowExport(string tempDir, Action<string> log)
         {
             const long DiskBytes = 34L * 1048576L;

@@ -12,6 +12,10 @@ using WinParted.UI.Dialogs;
 
 namespace WinParted.UI
 {
+    /// <summary>
+    /// Primary WinParted desktop window: hosts the drive selector, graphical <see cref="PartitionRibbonControl"/>,
+    /// partition detail grid, queued operation list, and collapsible M3 Integrated File Explorer.
+    /// </summary>
     public class MainForm : Form
     {
         private readonly OperationQueueManager _queueManager = new OperationQueueManager();
@@ -785,6 +789,10 @@ namespace WinParted.UI
             UpdateActionStates();
         }
 
+        /// <summary>
+        /// Refreshes the integrated M3 file explorer when selection moves to a different disk/partition
+        /// or mount state changes; auto-mounts supported virtual disk partitions when clicked.
+        /// </summary>
         private void UpdateIntegratedExplorerSelection()
         {
             if (_integratedExplorer == null) return;
@@ -859,6 +867,10 @@ namespace WinParted.UI
                 QueueResizeMovePartition();
         }
 
+        /// <summary>
+        /// Toggles read-only userspace mounting for the selected foreign/developer partition and opens
+        /// the standalone browser dialog when mounting succeeds.
+        /// </summary>
         private void ToggleReadOnlyMount()
         {
             var sel = GetSelectedPartition();
@@ -960,6 +972,10 @@ namespace WinParted.UI
             UpdateActionStates();
         }
 
+        /// <summary>
+        /// Validates and queues a <see cref="PendingOperation"/> in <see cref="OperationQueueManager"/>,
+        /// updating the simulated ribbon and partition table without mutating disk bytes yet.
+        /// </summary>
         private bool TryEnqueue(PendingOperation op)
         {
             try
@@ -1376,6 +1392,9 @@ namespace WinParted.UI
             RefreshOperationsList();
         }
 
+        /// <summary>
+        /// Prompts for confirmation and commits all pending operations to virtual images or live disks.
+        /// </summary>
         private void ApplyOperations()
         {
             if (_queueManager.PendingCount == 0) return;

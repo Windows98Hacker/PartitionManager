@@ -9,6 +9,11 @@ using WinParted.Models;
 
 namespace WinParted.Core
 {
+    /// <summary>
+    /// Coordinates non-destructive queued partition operations, simulated UI layout previews
+    /// (<see cref="GetPreviewDisk"/>), overlap/bounds validation, and transactional execution against
+    /// both virtual <c>.img</c> files and live physical drives (hybrid DiskPart + raw sector I/O).
+    /// </summary>
     public class OperationQueueManager
     {
         private readonly List<DiskInfo> _baselineDisks = new List<DiskInfo>();
@@ -18,6 +23,9 @@ namespace WinParted.Core
         public IReadOnlyList<PendingOperation> Queue { get { return _queue; } }
         public int PendingCount { get { return _queue.Count; } }
 
+        /// <summary>
+        /// Replaces the baseline snapshot of physical and virtual disks against which previews are simulated.
+        /// </summary>
         public void SetBaselineDisks(IEnumerable<DiskInfo> physicalDisks, IEnumerable<DiskInfo> virtualDisks)
         {
             _baselineDisks.Clear();
@@ -47,6 +55,10 @@ namespace WinParted.Core
             return result;
         }
 
+        /// <summary>
+        /// Clones the baseline disk model and replays all pending operations for <paramref name="diskNumber"/>
+        /// so the UI and ribbon reflect the post-queue layout without mutating disk bytes yet.
+        /// </summary>
         public DiskInfo GetPreviewDisk(int diskNumber)
         {
             var baseline = GetBaselineDisk(diskNumber);
@@ -60,6 +72,10 @@ namespace WinParted.Core
             return preview;
         }
 
+        /// <summary>
+        /// Validates an operation (bounds, MiB alignment, collisions against simulated state, active OS boot
+        /// protection, and generated DiskPart script) before appending it to the pending queue.
+        /// </summary>
         public void Enqueue(PendingOperation op)
         {
             if (op == null) throw new ArgumentNullException("op");
@@ -129,6 +145,9 @@ namespace WinParted.Core
             return sb.ToString();
         }
 
+        /// <summary>
+        /// Pure in-memory simulation of a single <see cref="PendingOperation"/> on a cloned <see cref="DiskInfo"/>.
+        /// </summary>
         public static void ApplyOperationToModel(DiskInfo disk, PendingOperation op)
         {
             switch (op.Type)
@@ -286,6 +305,10 @@ namespace WinParted.Core
             disk.Partitions = sorted;
         }
 
+        /// <summary>
+        /// Executes all queued operations sequentially across virtual and physical disks, updating
+        /// baseline models as each operation succeeds.
+        /// </summary>
         public List<string> ApplyAll(Action<int, string> progressCallback = null)
         {
             var log = new List<string>();
@@ -329,6 +352,10 @@ namespace WinParted.Core
             return log;
         }
 
+        /// <summary>
+        /// Executes an operation on a virtual <c>.img</c> file with primary/backup GPT+MBR snapshot rollback,
+        /// raw payload preservation during Move/Resize/Clone, and post-write CRC32/MBR integrity verification.
+        /// </summary>
         private void ExecuteVirtualDiskOperation(DiskInfo disk, PendingOperation op)
         {
             int sec = disk.LogicalSectorSize > 0 ? disk.LogicalSectorSize : 512;
@@ -444,6 +471,11 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Executes an operation on a live Windows physical disk (requires Administrator elevation):
+        /// uses Win32 volume locking + raw sector writes for non-Microsoft filesystems and <c>diskpart.exe</c>
+        /// for native Windows partitioning/formatting.
+        /// </summary>
         private void ExecutePhysicalDiskOperation(DiskInfo disk, PendingOperation op)
         {
             if (!Win32DiskInterop.IsAdministrator())
@@ -576,6 +608,9 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Generates the equivalent Windows <c>diskpart.exe</c> script (for live execution or user export).
+        /// </summary>
         public static string BuildDiskPartScript(PendingOperation op, PartitionTableStyle tableStyle = PartitionTableStyle.GPT)
         {
             var sb = new StringBuilder();
