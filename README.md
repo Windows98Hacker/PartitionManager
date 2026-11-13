@@ -3,8 +3,8 @@
 A GParted-inspired disk and partition manager for **32-bit (x86)** and **64-bit (x64)** Windows.
 
 Entirely experimental and vibe-coded. I don't know a thing about programming, but I do know that I dislike
-the windows partition manager, and have had great success with gparted on linux. I wanted this to be freely available for windows, but found that my only options were rather terrible and pay to use. I think that sucks.
-So I told AI to make this in hopes that this creates a better alternative to what is already available.
+the windows partition manager, and have had great success with gparted on linux. I wanted freely available partition manager for windows, but found that my only options were either terrible and/or licensed software. I think that sucks.
+So I used AI to make this in hopes that this creates a better alternative to what is already available.
 
 USE AT YOUR OWN RISK!!! I have not tested this extensively, and have no idea how stable or accurate this program is. I hope others will help me with the testing and development of this project.
 
