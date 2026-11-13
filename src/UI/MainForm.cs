@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Drawing;
 using System.IO;
 using System.Linq;
@@ -228,11 +229,7 @@ namespace WinParted.UI
             // 4. Visual Ribbon
             _ribbon = new PartitionRibbonControl { Dock = DockStyle.Top, Height = 136 };
             _ribbon.SelectedPartitionChanged += (s, part) => OnRibbonSelectionChanged(part);
-            _ribbon.PartitionDoubleClicked += (s, part) =>
-            {
-                if (part.IsUnallocated) QueueNewPartition();
-                else QueueResizeMovePartition();
-            };
+            _ribbon.PartitionDoubleClicked += (s, part) => OnPartitionDoubleClicked(part);
             _ribbon.PartitionContextMenuRequested += (part, pt) =>
             {
                 SyncGridSelectionToPartition(part);
@@ -290,6 +287,7 @@ namespace WinParted.UI
             SetGridColumnSizing("LBA", 135, 125);
 
             _gridPartitions.SelectionChanged += (s, e) => OnGridSelectionChanged();
+            _gridPartitions.CellDoubleClick += OnGridCellDoubleClick;
             _gridPartitions.CellPainting += OnGridCellPainting;
             _gridPartitions.MouseDown += OnGridMouseDown;
 
@@ -761,6 +759,27 @@ namespace WinParted.UI
             _tbApply.Enabled = _queueManager.PendingCount > 0;
         }
 
+        private void OnGridCellDoubleClick(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0) return;
+            var p = _gridPartitions.Rows[e.RowIndex].Tag as PartitionEntry;
+            if (p != null)
+                OnPartitionDoubleClicked(p);
+        }
+
+        private void OnPartitionDoubleClicked(PartitionEntry part)
+        {
+            if (part == null) return;
+            SyncGridSelectionToPartition(part);
+            UpdateActionStates();
+            if (part.IsUnallocated)
+                QueueNewPartition();
+            else if (ReadOnlyFileSystemMountEngine.IsSupportedNonMicrosoftFs(part.FileSystem))
+                BrowseNonMicrosoftFileSystem();
+            else
+                QueueResizeMovePartition();
+        }
+
         private void ToggleReadOnlyMount()
         {
             var sel = GetSelectedPartition();
@@ -782,10 +801,12 @@ namespace WinParted.UI
                 RenderCurrentDisk();
                 _lblStatus.Text = string.Format("Mounted {0} read-only at {1} ({2})",
                     sel.ShortDeviceName, vol.MountPath, FileSystemColors.GetDisplayName(vol.FileSystem));
+                using (var dlg = new FileSystemBrowserDialog(_currentPreviewDisk, sel, vol))
+                    dlg.ShowDialog(this);
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, ex.Message, "Read-Only Mount", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                HandleReadOnlyMountException(ex, sel, "Read-Only Mount");
             }
         }
 
@@ -804,8 +825,34 @@ namespace WinParted.UI
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, ex.Message, "Read-Only Filesystem Viewer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                HandleReadOnlyMountException(ex, sel, "Read-Only Filesystem Viewer");
             }
+        }
+
+        private void HandleReadOnlyMountException(Exception ex, PartitionEntry sel, string title)
+        {
+            var win32 = ex as Win32Exception;
+            bool accessDenied = (ex is UnauthorizedAccessException) ||
+                                (win32 != null && win32.NativeErrorCode == 5);
+            if (_currentPreviewDisk != null && !_currentPreviewDisk.IsVirtualImage &&
+                !Win32DiskInterop.IsAdministrator() && (accessDenied || !_currentPreviewDisk.CanRawRead))
+            {
+                var dr = MessageBox.Show(this,
+                    string.Format(
+                        "Windows requires Administrator privileges to read raw {0} sectors from a physical drive ({1}).\n\n" +
+                        "Details: {2}\n\nRestart WinParted as Administrator now?",
+                        FileSystemColors.GetDisplayName(sel.FileSystem),
+                        _currentPreviewDisk.DevicePath,
+                        ex.Message),
+                    title + " — Administrator Required",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+                if (dr == DialogResult.Yes && Win32DiskInterop.RelaunchAsAdministrator())
+                    Close();
+                return;
+            }
+
+            MessageBox.Show(this, ex.Message, title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void RefreshOperationsList()
