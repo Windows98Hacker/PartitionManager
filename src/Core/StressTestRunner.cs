@@ -778,6 +778,9 @@ namespace WinParted.Core
                     ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, part.StartingOffset);
             }
 
+            // 4b. Verify >16 MiB Multi-Extent + HFS+ Extents Overflow B-Tree Streaming Copy (20 MiB BaseSystem.dmg)
+            VerifyLargeHfsPlusOverflowExport(tempDir, log);
+
             byte[] afterBytes = File.ReadAllBytes(imgPath);
             uint crcAfterUnmount = Crc32.Compute(afterBytes, 0, afterBytes.Length);
             if (crcAfterUnmount != crcBeforeMount)
@@ -974,6 +977,260 @@ namespace WinParted.Core
             string report;
             if (!RawDiskEngine.VerifyDiskPartitionTableIntegrity(disk, out report))
                 throw new Exception("Partition table integrity failed on Disk " + disk.DiskNumber + ": " + report);
+        }
+
+        private static void WriteBE16(byte[] buf, int off, ushort val)
+        {
+            buf[off] = (byte)(val >> 8);
+            buf[off + 1] = (byte)(val & 0xFF);
+        }
+
+        private static void WriteBES16(byte[] buf, int off, short val)
+        {
+            WriteBE16(buf, off, unchecked((ushort)val));
+        }
+
+        private static void WriteBE32(byte[] buf, int off, uint val)
+        {
+            buf[off] = (byte)(val >> 24);
+            buf[off + 1] = (byte)((val >> 16) & 0xFF);
+            buf[off + 2] = (byte)((val >> 8) & 0xFF);
+            buf[off + 3] = (byte)(val & 0xFF);
+        }
+
+        private static void WriteBE64(byte[] buf, int off, ulong val)
+        {
+            WriteBE32(buf, off, (uint)(val >> 32));
+            WriteBE32(buf, off + 4, (uint)(val & 0xFFFFFFFFUL));
+        }
+
+        private static int BuildHfsCatalogFolderRecord(byte[] buf, int recOff, uint parentId, string name, uint folderId)
+        {
+            byte[] utf16 = Encoding.BigEndianUnicode.GetBytes(name);
+            ushort keyLen = (ushort)(6 + utf16.Length);
+            WriteBE16(buf, recOff, keyLen);
+            WriteBE32(buf, recOff + 2, parentId);
+            WriteBE16(buf, recOff + 6, (ushort)name.Length);
+            Array.Copy(utf16, 0, buf, recOff + 8, utf16.Length);
+
+            int dataOff = recOff + 2 + keyLen;
+            if ((dataOff & 1) != 0) dataOff++;
+
+            WriteBES16(buf, dataOff, 1); // kHFSPlusFolderRecord
+            WriteBE32(buf, dataOff + 8, folderId);
+            WriteBE16(buf, dataOff + 42, 0x41ED);
+            return dataOff + 88;
+        }
+
+        private static int BuildHfsCatalogFileRecord(
+            byte[] buf, int recOff, uint parentId, string name, uint fileId,
+            ulong logicalSize, uint[] startBlocks, uint[] blockCounts)
+        {
+            byte[] utf16 = Encoding.BigEndianUnicode.GetBytes(name);
+            ushort keyLen = (ushort)(6 + utf16.Length);
+            WriteBE16(buf, recOff, keyLen);
+            WriteBE32(buf, recOff + 2, parentId);
+            WriteBE16(buf, recOff + 6, (ushort)name.Length);
+            Array.Copy(utf16, 0, buf, recOff + 8, utf16.Length);
+
+            int dataOff = recOff + 2 + keyLen;
+            if ((dataOff & 1) != 0) dataOff++;
+
+            WriteBES16(buf, dataOff, 2); // kHFSPlusFileRecord
+            WriteBE32(buf, dataOff + 8, fileId);
+            WriteBE16(buf, dataOff + 42, 0x81A4);
+            WriteBE64(buf, dataOff + 88, logicalSize);
+
+            int count = Math.Min(8, Math.Min(startBlocks.Length, blockCounts.Length));
+            for (int i = 0; i < count; i++)
+            {
+                WriteBE32(buf, dataOff + 104 + i * 8, startBlocks[i]);
+                WriteBE32(buf, dataOff + 104 + i * 8 + 4, blockCounts[i]);
+            }
+            return dataOff + 168;
+        }
+
+        private static void VerifyLargeHfsPlusOverflowExport(string tempDir, Action<string> log)
+        {
+            const long DiskBytes = 34L * 1048576L;
+            const uint BlockSize = 4096u;
+            const uint TotalBlocks = 8192u; // 32 MiB
+            const long ExpectedDmgSize = 20L * 1048576L; // > 16 MiB!
+
+            string hfsImg = Path.Combine(tempDir, "stress8_hfs_large.img");
+            var disk = RawDiskEngine.CreateBlankVirtualDisk(hfsImg, DiskBytes, PartitionTableStyle.GPT);
+            disk.DiskNumber = 97;
+
+            long partStart = 1 * MiB;
+            long partLen = 32 * MiB;
+            var qm = new OperationQueueManager();
+            qm.SetBaselineDisks(null, new[] { disk });
+            qm.Enqueue(MakeCreateOp(97, hfsImg, partStart, partLen, FileSystemType.HFSPlus, "MojaveUSB"));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(hfsImg, 97);
+            var hfsPart = disk.Partitions[0];
+
+            // Build Volume Header (block 0 @ +1024)
+            byte[] vh = new byte[512];
+            Encoding.ASCII.GetBytes("H+").CopyTo(vh, 0);
+            WriteBE16(vh, 2, 4);
+            WriteBE32(vh, 40, BlockSize);
+            WriteBE32(vh, 44, TotalBlocks);
+            WriteBE32(vh, 48, 2500u);
+            WriteBE64(vh, 192, 8192UL); // extentsFile logicalSize (2 nodes * 4096)
+            WriteBE32(vh, 208, 2u);     // extentsFile startBlock = 2
+            WriteBE32(vh, 212, 2u);     // extentsFile blockCount = 2
+            WriteBE64(vh, 272, 8192UL); // catalogFile logicalSize (2 nodes * 4096)
+            WriteBE32(vh, 288, 4u);     // catalogFile startBlock = 4
+            WriteBE32(vh, 292, 2u);     // catalogFile blockCount = 2
+            RawDiskEngine.WriteBytes(disk, hfsPart.StartingOffset + 0x400, vh);
+
+            // Extents Overflow B-Tree Node 0 (Header) + Node 1 (Leaf) @ blocks 2..3
+            byte[] extNodes = new byte[8192];
+            extNodes[8] = 1; // kBTHeaderNode
+            WriteBE16(extNodes, 10, 3);
+            WriteBE32(extNodes, 16, 1u);    // rootNode
+            WriteBE32(extNodes, 20, 1u);    // leafRecords
+            WriteBE32(extNodes, 24, 1u);    // firstLeafNode
+            WriteBE16(extNodes, 32, 4096);  // nodeSize
+
+            int extLeaf = 4096;
+            extNodes[extLeaf + 8] = 0xFF;   // kBTLeafNode (-1)
+            extNodes[extLeaf + 9] = 1;
+            WriteBE16(extNodes, extLeaf + 10, 1); // 1 record
+            int extRec = extLeaf + 14;
+            WriteBE16(extNodes, extRec, 10);       // keyLength = 10
+            extNodes[extRec + 2] = 0;              // data fork
+            WriteBE32(extNodes, extRec + 4, 16u);  // fileId = 16 (BaseSystem.dmg)
+            WriteBE32(extNodes, extRec + 8, 3072u);// startBlock after 8 inline extents (8 * 384)
+            int extDataOff = extRec + 12;
+            uint[] ovStarts = new uint[] { 3300u, 3820u, 4340u, 4860u };
+            uint[] ovCounts = new uint[] { 512u, 512u, 512u, 512u };
+            for (int i = 0; i < 4; i++)
+            {
+                WriteBE32(extNodes, extDataOff + i * 8, ovStarts[i]);
+                WriteBE32(extNodes, extDataOff + i * 8 + 4, ovCounts[i]);
+            }
+            WriteBE16(extNodes, extLeaf + 4094, 14);
+            WriteBE16(extNodes, extLeaf + 4092, (ushort)(extDataOff + 64 - extLeaf));
+            RawDiskEngine.WriteBytes(disk, hfsPart.StartingOffset + 2L * BlockSize, extNodes);
+
+            // Catalog B-Tree Node 0 (Header) + Node 1 (Leaf) @ blocks 4..5
+            byte[] catNodes = new byte[8192];
+            catNodes[8] = 1; // kBTHeaderNode
+            WriteBE16(catNodes, 10, 3);
+            WriteBE32(catNodes, 16, 1u);    // rootNode
+            WriteBE32(catNodes, 20, 3u);    // leafRecords
+            WriteBE32(catNodes, 24, 1u);    // firstLeafNode
+            WriteBE16(catNodes, 32, 4096);  // nodeSize
+
+            int catLeaf = 4096;
+            catNodes[catLeaf + 8] = 0xFF;   // kBTLeafNode (-1)
+            catNodes[catLeaf + 9] = 1;
+            WriteBE16(catNodes, catLeaf + 10, 3);
+
+            uint[] inStarts = new uint[8];
+            uint[] inCounts = new uint[8];
+            for (int i = 0; i < 8; i++)
+            {
+                inStarts[i] = (uint)(20 + i * 400);
+                inCounts[i] = 384u;
+            }
+
+            int r0 = catLeaf + 14;
+            int r1 = BuildHfsCatalogFolderRecord(catNodes, r0, 1u, "MojaveUSB", 2u);
+            int r2 = BuildHfsCatalogFolderRecord(catNodes, r1, 2u, "SharedSupport", 15u);
+            int r3End = BuildHfsCatalogFileRecord(catNodes, r2, 15u, "BaseSystem.dmg", 16u, (ulong)ExpectedDmgSize, inStarts, inCounts);
+
+            WriteBE16(catNodes, catLeaf + 4094, (ushort)(r0 - catLeaf));
+            WriteBE16(catNodes, catLeaf + 4092, (ushort)(r1 - catLeaf));
+            WriteBE16(catNodes, catLeaf + 4090, (ushort)(r2 - catLeaf));
+            WriteBE16(catNodes, catLeaf + 4088, (ushort)(r3End - catLeaf));
+            RawDiskEngine.WriteBytes(disk, hfsPart.StartingOffset + 4L * BlockSize, catNodes);
+
+            // Stamp unique verification signatures into inline and overflow extents (including past 16 MiB!)
+            var allExtents = new List<uint>();
+            var allCounts = new List<uint>();
+            allExtents.AddRange(inStarts);
+            allCounts.AddRange(inCounts);
+            allExtents.AddRange(ovStarts);
+            allCounts.AddRange(ovCounts);
+
+            byte[] stamp = new byte[64];
+            for (int ex = 0; ex < allExtents.Count; ex++)
+            {
+                string tag = string.Format("EXTENT_{0:D2}_START", ex);
+                Array.Clear(stamp, 0, stamp.Length);
+                Encoding.ASCII.GetBytes(tag).CopyTo(stamp, 0);
+                RawDiskEngine.WriteBytes(disk, hfsPart.StartingOffset + (long)allExtents[ex] * BlockSize, stamp);
+
+                string endTag = string.Format("EXTENT_{0:D2}_TAIL!", ex);
+                Array.Clear(stamp, 0, stamp.Length);
+                Encoding.ASCII.GetBytes(endTag).CopyTo(stamp, 0);
+                long tailOff = hfsPart.StartingOffset + ((long)(allExtents[ex] + allCounts[ex]) * BlockSize) - 64;
+                RawDiskEngine.WriteBytes(disk, tailOff, stamp);
+            }
+
+            var vol = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, hfsPart, true);
+            try
+            {
+                var dmgNode = FindFsNodeByPath(vol.RootNode, "/SharedSupport/BaseSystem.dmg");
+                if (dmgNode == null)
+                    throw new Exception("Large HFS+ BaseSystem.dmg not found in Catalog B-Tree.");
+                if (dmgNode.SizeBytes != ExpectedDmgSize)
+                    throw new Exception(string.Format("Expected BaseSystem.dmg size {0}, got {1}.", ExpectedDmgSize, dmgNode.SizeBytes));
+
+                // Preview read must remain safely capped
+                byte[] preview = ReadOnlyFileSystemMountEngine.ReadFileBytes(disk, hfsPart, dmgNode, 131072);
+                if (preview.Length != 131072)
+                    throw new Exception("Preview cap failed: got " + preview.Length + " bytes.");
+
+                // Full copy to host must stream all 20 MiB (>16 MiB!) across all 12 extents (inline + overflow B-Tree)
+                string hostDmg = Path.Combine(tempDir, "BaseSystem_exported.dmg");
+                int fc;
+                int dc;
+                long bc;
+                ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, hfsPart, dmgNode, hostDmg, out fc, out dc, out bc);
+
+                var fi = new FileInfo(hostDmg);
+                if (!fi.Exists || fi.Length != ExpectedDmgSize || bc != ExpectedDmgSize)
+                    throw new Exception(string.Format("BaseSystem.dmg export truncated! Expected {0} bytes, exported file={1}, reported={2}.",
+                        ExpectedDmgSize, fi.Exists ? fi.Length : -1, bc));
+
+                using (var fs = new FileStream(hostDmg, FileMode.Open, FileAccess.Read))
+                {
+                    byte[] checkBuf = new byte[32];
+                    long logicalCursor = 0;
+                    for (int ex = 0; ex < allCounts.Count; ex++)
+                    {
+                        long extBytes = (long)allCounts[ex] * BlockSize;
+                        fs.Seek(logicalCursor, SeekOrigin.Begin);
+                        fs.Read(checkBuf, 0, checkBuf.Length);
+                        string actualStart = Encoding.ASCII.GetString(checkBuf, 0, 15);
+                        string expectedStart = string.Format("EXTENT_{0:D2}_START", ex);
+                        if (actualStart != expectedStart)
+                            throw new Exception(string.Format("Extent {0} start mismatch at logical offset {1}: expected '{2}', got '{3}'.",
+                                ex, logicalCursor, expectedStart, actualStart));
+
+                        fs.Seek(logicalCursor + extBytes - 64, SeekOrigin.Begin);
+                        fs.Read(checkBuf, 0, checkBuf.Length);
+                        string actualTail = Encoding.ASCII.GetString(checkBuf, 0, 15);
+                        string expectedTail = string.Format("EXTENT_{0:D2}_TAIL!", ex);
+                        if (actualTail != expectedTail)
+                            throw new Exception(string.Format("Extent {0} tail mismatch at logical offset {1}: expected '{2}', got '{3}'.",
+                                ex, logicalCursor + extBytes - 64, expectedTail, actualTail));
+
+                        logicalCursor += extBytes;
+                    }
+                }
+
+                log("  -> Verified 20 MiB fragmented HFS+ BaseSystem.dmg (8 inline + 4 Extents Overflow B-Tree) exported 100% intact.");
+            }
+            finally
+            {
+                ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, hfsPart.StartingOffset);
+            }
         }
 
         private static void ExpectRejected(Action act, string scenario)

@@ -11,67 +11,92 @@ namespace WinParted.UI
 
         public static Color BackPrimary
         {
-            get { return IsDarkMode ? Color.FromArgb(24, 27, 34) : Color.FromArgb(248, 250, 252); }
+            get { return IsDarkMode ? Color.FromArgb(17, 19, 24) : Color.FromArgb(249, 249, 255); }
         }
 
         public static Color BackSurface
         {
-            get { return IsDarkMode ? Color.FromArgb(31, 35, 44) : Color.White; }
+            get { return IsDarkMode ? Color.FromArgb(25, 28, 34) : Color.White; }
         }
 
         public static Color BackElevated
         {
-            get { return IsDarkMode ? Color.FromArgb(38, 43, 54) : Color.FromArgb(241, 245, 249); }
+            get { return IsDarkMode ? Color.FromArgb(30, 34, 41) : Color.FromArgb(243, 243, 250); }
+        }
+
+        public static Color BackContainerHigh
+        {
+            get { return IsDarkMode ? Color.FromArgb(40, 44, 53) : Color.FromArgb(231, 232, 238); }
         }
 
         public static Color BackAltRow
         {
-            get { return IsDarkMode ? Color.FromArgb(28, 33, 43) : Color.FromArgb(248, 250, 252); }
+            get { return IsDarkMode ? Color.FromArgb(21, 24, 30) : Color.FromArgb(247, 247, 253); }
         }
 
         public static Color BackInput
         {
-            get { return IsDarkMode ? Color.FromArgb(42, 48, 60) : Color.White; }
+            get { return IsDarkMode ? Color.FromArgb(40, 44, 53) : Color.White; }
         }
 
         public static Color BackSelection
         {
-            get { return IsDarkMode ? Color.FromArgb(49, 78, 124) : Color.FromArgb(219, 234, 254); }
+            get { return IsDarkMode ? Color.FromArgb(30, 58, 95) : Color.FromArgb(211, 227, 253); }
+        }
+
+        public static Color BackHover
+        {
+            get { return IsDarkMode ? Color.FromArgb(50, 55, 66) : Color.FromArgb(232, 234, 243); }
+        }
+
+        public static Color TonalButtonBack
+        {
+            get { return IsDarkMode ? Color.FromArgb(43, 59, 84) : Color.FromArgb(211, 227, 253); }
+        }
+
+        public static Color TonalButtonFore
+        {
+            get { return IsDarkMode ? Color.FromArgb(211, 227, 253) : Color.FromArgb(4, 30, 73); }
         }
 
         public static Color TextPrimary
         {
-            get { return IsDarkMode ? Color.FromArgb(226, 232, 240) : Color.FromArgb(15, 23, 42); }
+            get { return IsDarkMode ? Color.FromArgb(226, 226, 233) : Color.FromArgb(25, 28, 32); }
         }
 
         public static Color TextSecondary
         {
-            get { return IsDarkMode ? Color.FromArgb(148, 163, 184) : Color.FromArgb(71, 85, 105); }
+            get { return IsDarkMode ? Color.FromArgb(196, 198, 208) : Color.FromArgb(68, 71, 78); }
         }
 
         public static Color BorderColor
         {
-            get { return IsDarkMode ? Color.FromArgb(56, 65, 82) : Color.FromArgb(203, 213, 225); }
+            get { return IsDarkMode ? Color.FromArgb(68, 71, 78) : Color.FromArgb(196, 198, 208); }
         }
 
         public static Color AccentBlue
         {
-            get { return IsDarkMode ? Color.FromArgb(59, 130, 246) : Color.FromArgb(37, 99, 235); }
+            get { return IsDarkMode ? Color.FromArgb(27, 110, 243) : Color.FromArgb(11, 87, 208); }
+        }
+
+        public static Color AccentBlueSoft
+        {
+            get { return IsDarkMode ? Color.FromArgb(168, 199, 250) : Color.FromArgb(11, 87, 208); }
         }
 
         public static Color AccentGreen
         {
-            get { return IsDarkMode ? Color.FromArgb(74, 222, 128) : Color.FromArgb(22, 163, 74); }
+            get { return IsDarkMode ? Color.FromArgb(129, 201, 149) : Color.FromArgb(19, 115, 51); }
         }
 
         public static Color AccentAmber
         {
-            get { return IsDarkMode ? Color.FromArgb(251, 191, 36) : Color.FromArgb(180, 83, 9); }
+            get { return IsDarkMode ? Color.FromArgb(253, 214, 99) : Color.FromArgb(176, 96, 0); }
         }
 
         public static Color AccentRed
         {
-            get { return IsDarkMode ? Color.FromArgb(239, 68, 68) : Color.FromArgb(220, 38, 38); }
+            get { return IsDarkMode ? Color.FromArgb(242, 139, 130) : Color.FromArgb(179, 38, 30); }
         }
 
         public static Color ExperimentalSurface
@@ -122,10 +147,7 @@ namespace WinParted.UI
                 var ts = (ToolStrip)c;
                 ts.BackColor = c is MenuStrip ? BackPrimary : BackElevated;
                 ts.ForeColor = TextPrimary;
-                if (IsDarkMode)
-                    ts.Renderer = new DarkToolStripRenderer();
-                else
-                    ts.RenderMode = ToolStripRenderMode.System;
+                ts.Renderer = new M3ToolStripRenderer();
 
                 ApplyToolStripItems(ts.Items);
             }
@@ -136,11 +158,12 @@ namespace WinParted.UI
                 grid.BackgroundColor = BackSurface;
                 grid.GridColor = BorderColor;
                 grid.ForeColor = TextPrimary;
-                grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single;
+                grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+                grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
                 grid.ColumnHeadersDefaultCellStyle.BackColor = BackElevated;
-                grid.ColumnHeadersDefaultCellStyle.ForeColor = TextPrimary;
+                grid.ColumnHeadersDefaultCellStyle.ForeColor = TextSecondary;
                 grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = BackElevated;
-                grid.ColumnHeadersDefaultCellStyle.SelectionForeColor = TextPrimary;
+                grid.ColumnHeadersDefaultCellStyle.SelectionForeColor = TextSecondary;
                 grid.DefaultCellStyle.BackColor = BackSurface;
                 grid.DefaultCellStyle.ForeColor = TextPrimary;
                 grid.DefaultCellStyle.SelectionBackColor = BackSelection;
@@ -178,7 +201,7 @@ namespace WinParted.UI
                 var cb = (ComboBox)c;
                 cb.BackColor = BackInput;
                 cb.ForeColor = TextPrimary;
-                cb.FlatStyle = IsDarkMode ? FlatStyle.Flat : FlatStyle.Standard;
+                cb.FlatStyle = FlatStyle.Flat;
             }
             else if (c is NumericUpDown)
             {
@@ -190,28 +213,45 @@ namespace WinParted.UI
             {
                 var btn = (Button)c;
                 btn.FlatStyle = FlatStyle.Flat;
-                btn.FlatAppearance.BorderColor = BorderColor;
-                btn.FlatAppearance.BorderSize = 1;
                 if (string.Equals(tag, "PrimaryButton", StringComparison.OrdinalIgnoreCase))
                 {
                     btn.BackColor = AccentBlue;
                     btn.ForeColor = Color.White;
+                    btn.FlatAppearance.BorderSize = 0;
+                    btn.FlatAppearance.MouseOverBackColor = IsDarkMode ? Color.FromArgb(48, 128, 252) : Color.FromArgb(26, 102, 224);
+                    btn.FlatAppearance.MouseDownBackColor = IsDarkMode ? Color.FromArgb(22, 92, 210) : Color.FromArgb(8, 70, 175);
+                }
+                else if (string.Equals(tag, "TonalButton", StringComparison.OrdinalIgnoreCase))
+                {
+                    btn.BackColor = TonalButtonBack;
+                    btn.ForeColor = TonalButtonFore;
+                    btn.FlatAppearance.BorderSize = 0;
+                    btn.FlatAppearance.MouseOverBackColor = BackSelection;
+                    btn.FlatAppearance.MouseDownBackColor = BackContainerHigh;
                 }
                 else if (string.Equals(tag, "DangerButton", StringComparison.OrdinalIgnoreCase))
                 {
                     btn.BackColor = btn.Enabled ? Color.FromArgb(185, 28, 28) : Color.FromArgb(95, 25, 28);
                     btn.ForeColor = Color.White;
+                    btn.FlatAppearance.BorderSize = 1;
                     btn.FlatAppearance.BorderColor = Color.FromArgb(248, 113, 113);
+                    btn.FlatAppearance.MouseOverBackColor = Color.FromArgb(220, 38, 38);
                 }
                 else if (string.Equals(tag, "ElevateButton", StringComparison.OrdinalIgnoreCase))
                 {
                     btn.BackColor = IsDarkMode ? Color.FromArgb(120, 53, 15) : Color.FromArgb(254, 243, 199);
                     btn.ForeColor = IsDarkMode ? Color.FromArgb(254, 243, 199) : Color.FromArgb(146, 64, 14);
+                    btn.FlatAppearance.BorderSize = 1;
+                    btn.FlatAppearance.BorderColor = AccentAmber;
                 }
                 else
                 {
-                    btn.BackColor = BackElevated;
+                    btn.BackColor = BackContainerHigh;
                     btn.ForeColor = TextPrimary;
+                    btn.FlatAppearance.BorderSize = 1;
+                    btn.FlatAppearance.BorderColor = BorderColor;
+                    btn.FlatAppearance.MouseOverBackColor = BackHover;
+                    btn.FlatAppearance.MouseDownBackColor = BackSelection;
                 }
             }
             else if (c is CheckBox && string.Equals(tag, "ExperimentalToggle", StringComparison.OrdinalIgnoreCase))
@@ -269,6 +309,8 @@ namespace WinParted.UI
                         c.BackColor = BackSurface;
                     else if (string.Equals(tag, "ElevatedPanel", StringComparison.OrdinalIgnoreCase))
                         c.BackColor = BackElevated;
+                    else if (string.Equals(tag, "ContainerHighPanel", StringComparison.OrdinalIgnoreCase))
+                        c.BackColor = BackContainerHigh;
                     else if (string.Equals(tag, "StatusBar", StringComparison.OrdinalIgnoreCase))
                         c.BackColor = BackElevated;
                     else if (!string.Equals(tag, "SliderPanel", StringComparison.OrdinalIgnoreCase))
@@ -290,10 +332,7 @@ namespace WinParted.UI
             if (cms == null) return;
             cms.BackColor = BackElevated;
             cms.ForeColor = TextPrimary;
-            if (IsDarkMode)
-                cms.Renderer = new DarkToolStripRenderer();
-            else
-                cms.RenderMode = ToolStripRenderMode.System;
+            cms.Renderer = new M3ToolStripRenderer();
             ApplyToolStripItems(cms.Items);
         }
 
@@ -316,17 +355,18 @@ namespace WinParted.UI
             }
         }
 
-        private class DarkToolStripRenderer : ToolStripProfessionalRenderer
+        private class M3ToolStripRenderer : ToolStripProfessionalRenderer
         {
-            public DarkToolStripRenderer()
-                : base(new DarkColorTable())
+            public M3ToolStripRenderer()
+                : base(new M3ColorTable())
             {
+                RoundedEdges = false;
             }
 
             protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
             {
                 if (!e.Item.Enabled)
-                    e.TextColor = Color.FromArgb(100, 116, 139);
+                    e.TextColor = TextSecondary;
                 else if (string.Equals(e.Item.Tag as string, "ApplyHighlight", StringComparison.OrdinalIgnoreCase))
                     e.TextColor = AccentGreen;
                 else
@@ -335,7 +375,7 @@ namespace WinParted.UI
             }
         }
 
-        private class DarkColorTable : ProfessionalColorTable
+        private class M3ColorTable : ProfessionalColorTable
         {
             public override Color ToolStripDropDownBackground { get { return BackElevated; } }
             public override Color ImageMarginGradientBegin { get { return BackElevated; } }

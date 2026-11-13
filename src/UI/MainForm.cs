@@ -47,8 +47,8 @@ namespace WinParted.UI
         public MainForm()
         {
             Text = "WinParted — Windows Partition Manager (GParted Edition)";
-            Size = new Size(1280, 820);
-            MinimumSize = new Size(1020, 660);
+            Size = new Size(1360, 860);
+            MinimumSize = new Size(1060, 700);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9f);
             BackColor = ThemeManager.BackPrimary;
@@ -197,13 +197,14 @@ namespace WinParted.UI
                 AutoSize = true,
                 MinimumSize = new Size(128, 28),
                 Padding = new Padding(8, 2, 8, 2),
-                Margin = new Padding(0, 2, 0, 0)
+                Margin = new Padding(0, 2, 0, 0),
+                Tag = "TonalButton"
             };
             btnNewDemo.Click += (s, e) => CreateAndMountDemoDisk();
             topFlow.Controls.Add(btnNewDemo);
 
             // 3. Action ToolStrip
-            var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(4, 3, 4, 3) };
+            var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(6, 4, 6, 4) };
             _tbNew = new ToolStripButton("New", null, (s, e) => QueueNewPartition()) { ToolTipText = "Create new partition in unallocated space" };
             _tbDelete = new ToolStripButton("Delete", null, (s, e) => QueueDeletePartition()) { ToolTipText = "Delete selected partition" };
             _tbResize = new ToolStripButton("Resize/Move", null, (s, e) => QueueResizeMovePartition()) { ToolTipText = "Resize or move selected partition" };
@@ -231,7 +232,7 @@ namespace WinParted.UI
             });
 
             // 4. Visual Ribbon
-            _ribbon = new PartitionRibbonControl { Dock = DockStyle.Top, Height = 136 };
+            _ribbon = new PartitionRibbonControl { Dock = DockStyle.Top, Height = 128 };
             _ribbon.SelectedPartitionChanged += (s, part) => OnRibbonSelectionChanged(part);
             _ribbon.PartitionDoubleClicked += (s, part) => OnPartitionDoubleClicked(part);
             _ribbon.PartitionContextMenuRequested += (part, pt) =>
@@ -244,19 +245,20 @@ namespace WinParted.UI
             // 5. Device Info Side Panel + Main Split
             var centerContainer = new Panel { Dock = DockStyle.Fill };
 
-            _deviceInfoPanel = new Panel { Dock = DockStyle.Left, Width = 275, AutoScroll = true, Padding = new Padding(10), BorderStyle = BorderStyle.FixedSingle, Tag = "SurfacePanel" };
-            _lblDeviceInfo = new Label { Location = new Point(10, 10), AutoSize = true, MaximumSize = new Size(245, 0), Font = new Font("Segoe UI", 8.8f) };
+            _deviceInfoPanel = new Panel { Dock = DockStyle.Left, Width = 248, AutoScroll = true, Padding = new Padding(12), BorderStyle = BorderStyle.None, Tag = "SurfacePanel" };
+            _lblDeviceInfo = new Label { Location = new Point(12, 12), AutoSize = true, MaximumSize = new Size(220, 0), Font = new Font("Segoe UI", 8.8f) };
             _deviceInfoPanel.Controls.Add(_lblDeviceInfo);
 
             var mainSplit = new SplitContainer
             {
-                Size = new Size(1000, 600),
+                Size = new Size(1060, 620),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
                 Panel1MinSize = 25,
-                Panel2MinSize = 25
+                Panel2MinSize = 25,
+                SplitterWidth = 5
             };
-            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 260);
+            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 235);
 
             _gridPartitions = new DataGridView
             {
@@ -308,15 +310,16 @@ namespace WinParted.UI
             // Bottom Split: Left = Pending Operations Queue | Right = Integrated Foreign Filesystem Explorer
             var bottomSplit = new SplitContainer
             {
-                Size = new Size(1000, 320),
+                Size = new Size(1060, 360),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Vertical,
                 Panel1MinSize = 25,
-                Panel2MinSize = 25
+                Panel2MinSize = 25,
+                SplitterWidth = 5
             };
-            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 300);
+            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 275);
 
-            var opsHeader = new Panel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(8, 6, 8, 4), Tag = "ElevatedPanel" };
+            var opsHeader = new Panel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(10, 6, 10, 4), Tag = "ElevatedPanel" };
             opsHeader.Controls.Add(new Label { Text = "Pending Operations Queue (Safe Until 'Apply All')", Dock = DockStyle.Left, AutoSize = true, Font = new Font("Segoe UI", 8.8f, FontStyle.Bold) });
 
             _lvOperations = new ListView
@@ -324,7 +327,8 @@ namespace WinParted.UI
                 Dock = DockStyle.Fill,
                 View = View.Details,
                 FullRowSelect = true,
-                GridLines = true
+                GridLines = false,
+                BorderStyle = BorderStyle.None
             };
             _lvOperations.Columns.Add("#", 38);
             _lvOperations.Columns.Add("Disk", 90);
@@ -387,8 +391,8 @@ namespace WinParted.UI
             ThemeManager.ThemeChanged += OnThemeChangedHandler;
             Load += (s, e) =>
             {
-                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 260);
-                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 320);
+                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 235);
+                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 275);
             };
             FormClosed += (s, e) => ThemeManager.ThemeChanged -= OnThemeChangedHandler;
             ApplyMainFormTheme();
