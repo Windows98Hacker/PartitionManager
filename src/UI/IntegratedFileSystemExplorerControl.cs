@@ -125,7 +125,7 @@ namespace WinParted.UI
             _lblVolumeBanner = new Label
             {
                 Dock = DockStyle.Fill,
-                Text = "Foreign Filesystem Explorer — select a non-Microsoft partition (ext4, HFS+, APFS, Btrfs, XFS)",
+                Text = "Foreign Filesystem Explorer — select a non-Microsoft/dev partition (ext2/3/4, Btrfs, XFS, F2FS, ZFS, SquashFS, ISO9660, UDF, APFS, HFS+)",
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
                 TextAlign = ContentAlignment.MiddleLeft,
                 AutoEllipsis = true,
@@ -808,7 +808,7 @@ namespace WinParted.UI
             if (part == null || part.IsUnallocated)
             {
                 _lblVolumeBanner.ForeColor = ThemeManager.TextSecondary;
-                _lblVolumeBanner.Text = "Foreign Filesystem Explorer — select an ext2/3/4, Btrfs, XFS, APFS, HFS+, or HFS partition.";
+                _lblVolumeBanner.Text = "Foreign Filesystem Explorer — select an ext2/3/4, Btrfs, XFS, F2FS, ZFS, SquashFS, ISO9660, UDF, APFS, HFS+, or HFS partition.";
                 _txtPreview.Text = "No foreign filesystem partition selected.";
                 _lblExplorerStatus.Text = "Ready";
             }

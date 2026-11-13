@@ -26,6 +26,11 @@ namespace WinParted.Models
         Ext4,
         Btrfs,
         XFS,
+        F2FS,
+        ZFS,
+        SquashFS,
+        ISO9660,
+        UDF,
         LinuxSwap,
         LVM2,
         BitLocker,
@@ -77,6 +82,7 @@ namespace WinParted.Models
         public static readonly Guid LinuxFilesystem = new Guid("0fc63daf-8483-4772-8e79-3d69d8477de4");
         public static readonly Guid LinuxSwap = new Guid("0657fd6d-a4ab-43c4-84e5-0933c84b4f4f");
         public static readonly Guid LinuxLvm = new Guid("e6d6d379-f507-44c2-a23c-238f2a3df928");
+        public static readonly Guid ZfsMember = new Guid("6a898cc3-1dd2-11b2-99a6-080020736631");
         public static readonly Guid BiosBoot = new Guid("21686148-6449-6e6f-744e-656564454649");
         public static readonly Guid AppleApfs = new Guid("7c3457ef-0000-11aa-aa11-00306543ecac");
         public static readonly Guid AppleHfs = new Guid("48465300-0000-11aa-aa11-00306543ecac");
@@ -95,6 +101,7 @@ namespace WinParted.Models
             if (g == LinuxFilesystem) return "Linux Filesystem Data";
             if (g == LinuxSwap) return "Linux Swap";
             if (g == LinuxLvm) return "Linux LVM";
+            if (g == ZfsMember) return "OpenZFS / Solaris Pool";
             if (g == BiosBoot) return "BIOS Boot Partition";
             if (g == AppleApfs) return "Apple APFS";
             if (g == AppleHfs) return "Apple HFS+ / HFSX";
@@ -120,7 +127,14 @@ namespace WinParted.Models
                 case FileSystemType.Ext4:
                 case FileSystemType.Btrfs:
                 case FileSystemType.XFS:
+                case FileSystemType.F2FS:
+                case FileSystemType.SquashFS:
                     return LinuxFilesystem;
+                case FileSystemType.ZFS:
+                    return ZfsMember;
+                case FileSystemType.ISO9660:
+                case FileSystemType.UDF:
+                    return BasicData;
                 case FileSystemType.LinuxSwap:
                     return LinuxSwap;
                 case FileSystemType.LVM2:
@@ -153,6 +167,11 @@ namespace WinParted.Models
                 case FileSystemType.Ext4: return Color.FromArgb(29, 78, 216);
                 case FileSystemType.Btrfs: return Color.FromArgb(234, 88, 12);
                 case FileSystemType.XFS: return Color.FromArgb(202, 138, 4);
+                case FileSystemType.F2FS: return Color.FromArgb(236, 72, 153);
+                case FileSystemType.ZFS: return Color.FromArgb(6, 182, 212);
+                case FileSystemType.SquashFS: return Color.FromArgb(101, 163, 13);
+                case FileSystemType.ISO9660: return Color.FromArgb(148, 82, 255);
+                case FileSystemType.UDF: return Color.FromArgb(192, 132, 252);
                 case FileSystemType.LinuxSwap: return Color.FromArgb(190, 18, 60);
                 case FileSystemType.LVM2: return Color.FromArgb(124, 58, 237);
                 case FileSystemType.BitLocker: return Color.FromArgb(217, 119, 6);
@@ -222,6 +241,11 @@ namespace WinParted.Models
                 case FileSystemType.Ext4: return "ext4";
                 case FileSystemType.Btrfs: return "btrfs";
                 case FileSystemType.XFS: return "xfs";
+                case FileSystemType.F2FS: return "f2fs";
+                case FileSystemType.ZFS: return "zfs";
+                case FileSystemType.SquashFS: return "squashfs";
+                case FileSystemType.ISO9660: return "iso9660";
+                case FileSystemType.UDF: return "udf";
                 case FileSystemType.LinuxSwap: return "linux-swap";
                 case FileSystemType.LVM2: return "lvm2 pv";
                 case FileSystemType.BitLocker: return "bitlocker";

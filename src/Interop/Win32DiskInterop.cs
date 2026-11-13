@@ -1054,6 +1054,8 @@ namespace WinParted.Interop
                 case 0x82: return FileSystemType.LinuxSwap;
                 case 0x83: return FileSystemType.Ext4;
                 case 0x8E: return FileSystemType.LVM2;
+                case 0xBF: return FileSystemType.ZFS;
+                case 0xCD: return FileSystemType.ISO9660;
                 case 0xA8: return FileSystemType.HFS;
                 case 0xAB:
                 case 0xAF: return FileSystemType.HFSPlus;
@@ -1070,6 +1072,7 @@ namespace WinParted.Interop
             if (typeGuid == GptPartitionTypeGuids.WindowsRecovery) return FileSystemType.WindowsRecovery;
             if (typeGuid == GptPartitionTypeGuids.LinuxSwap) return FileSystemType.LinuxSwap;
             if (typeGuid == GptPartitionTypeGuids.LinuxLvm) return FileSystemType.LVM2;
+            if (typeGuid == GptPartitionTypeGuids.ZfsMember) return FileSystemType.ZFS;
             if (typeGuid == GptPartitionTypeGuids.LinuxFilesystem) return FileSystemType.Ext4;
             if (typeGuid == GptPartitionTypeGuids.AppleApfs) return FileSystemType.APFS;
             if (typeGuid == GptPartitionTypeGuids.AppleHfs ||
