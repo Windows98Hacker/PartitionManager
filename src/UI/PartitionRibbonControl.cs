@@ -8,6 +8,10 @@ using WinParted.Models;
 
 namespace WinParted.UI
 {
+    /// <summary>
+    /// GParted-style graphical partition layout bar supporting Smart Scale (<c>bytes^0.30</c>)
+    /// or linear proportional slice widths, unallocated hatched regions, mount badges, and selection state.
+    /// </summary>
     public class PartitionRibbonControl : UserControl
     {
         private List<PartitionEntry> _layout = new List<PartitionEntry>();

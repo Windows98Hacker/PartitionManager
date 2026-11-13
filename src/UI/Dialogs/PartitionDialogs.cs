@@ -10,6 +10,10 @@ using WinParted.Models;
 
 namespace WinParted.UI.Dialogs
 {
+    /// <summary>
+    /// Modal dialog for creating a new partition in unallocated space or resizing/moving an existing
+    /// partition with an interactive GParted-style drag slider, MiB/Cylinder alignment, and FS selector.
+    /// </summary>
     public class CreateOrResizePartitionDialog : Form
     {
         private readonly bool _isCreateMode;
@@ -448,6 +452,9 @@ namespace WinParted.UI.Dialogs
         }
     }
 
+    /// <summary>
+    /// Modal dialog for editing GPT partition type GUIDs, GPT attribute flags, or MBR partition IDs and active flags.
+    /// </summary>
     public class ManageFlagsDialog : Form
     {
         private readonly DiskInfo _disk;
@@ -594,6 +601,9 @@ namespace WinParted.UI.Dialogs
         }
     }
 
+    /// <summary>
+    /// Modal dialog allowing the user to select a destructive wipe pattern (Zero, Ones, or PRNG Random) before queuing.
+    /// </summary>
     public class WipePartitionDialog : Form
     {
         private readonly RadioButton _rbZero;
@@ -664,6 +674,9 @@ namespace WinParted.UI.Dialogs
         }
     }
 
+    /// <summary>
+    /// Live raw 512-byte sector hex dump and superblock/MBR/GPT header decoder for any physical or virtual disk LBA.
+    /// </summary>
     public class HexSectorInspectorDialog : Form
     {
         private readonly DiskInfo _disk;
@@ -897,6 +910,9 @@ namespace WinParted.UI.Dialogs
         }
     }
 
+    /// <summary>
+    /// Audits 1 MiB / 4 KiB physical alignment and GPT/MBR structural health for every partition on the selected disk.
+    /// </summary>
     public class AlignmentAndHealthDialog : Form
     {
         public AlignmentAndHealthDialog(DiskInfo disk)

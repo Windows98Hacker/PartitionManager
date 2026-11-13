@@ -11,11 +11,19 @@ using WinParted.UI;
 
 namespace WinParted
 {
+    /// <summary>
+    /// Application entrypoint supporting interactive WinForms GUI execution as well as
+    /// headless CLI verification modes (<c>--self-test</c> and <c>--stress-test</c>).
+    /// </summary>
     internal static class Program
     {
+        // Ensures crisp text/ribbon rendering on high-DPI Windows displays
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
 
+        /// <summary>
+        /// Program entry point. Dispatches CLI self-test/stress modes or starts the DPI-aware WinForms UI.
+        /// </summary>
         [STAThread]
         private static int Main(string[] args)
         {
@@ -34,6 +42,10 @@ namespace WinParted
             return 0;
         }
 
+        /// <summary>
+        /// Executes end-to-end smoke checks on physical disk enumeration, GPT/MBR virtual image creation,
+        /// queued partition operations, backup/restore, and the full <see cref="StressTestRunner"/> suite.
+        /// </summary>
         private static int RunSelfTest()
         {
             string tempDir = Path.Combine(Path.GetTempPath(), "WinPartedSelfTest_" + Guid.NewGuid().ToString("N"));

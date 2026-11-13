@@ -6,6 +6,11 @@ using WinParted.Models;
 
 namespace WinParted.Core
 {
+    /// <summary>
+    /// In-memory representation of a file or directory node inside a mounted foreign filesystem,
+    /// supporting single-extent (<see cref="ContentOffset"/>), multi-extent (<see cref="ContentExtents"/>),
+    /// and inline small-file payloads (<see cref="InlineContent"/>).
+    /// </summary>
     public class VirtualFsNode
     {
         public VirtualFsNode()
@@ -29,6 +34,10 @@ namespace WinParted.Core
         public List<VirtualFsNode> Children { get; set; }
     }
 
+    /// <summary>
+    /// State and parsed directory tree for a mounted non-Microsoft (or ReFS) partition,
+    /// plus optional persistent experimental write-overlay state (<c>WPRWOVL1</c>).
+    /// </summary>
     public class MountedReadOnlyVolume
     {
         public string MountId { get; set; }
@@ -51,6 +60,9 @@ namespace WinParted.Core
         internal List<OverlayRecord> OverlayRecords { get; set; }
     }
 
+    /// <summary>
+    /// Single append/delete entry stored inside the <c>WPRWOVL1</c> experimental write overlay table.
+    /// </summary>
     internal class OverlayRecord
     {
         public byte Op { get; set; } // 1 = upsert, 2 = delete
@@ -61,11 +73,18 @@ namespace WinParted.Core
         public string FullPath { get; set; }
     }
 
+    /// <summary>
+    /// Native userspace filesystem reader, streaming exporter (4 MiB chunks), search indexer,
+    /// and opt-in experimental write overlay engine for foreign and developer filesystems.
+    /// </summary>
     public static class ReadOnlyFileSystemMountEngine
     {
         private static readonly object SyncLock = new object();
         private static readonly Dictionary<string, MountedReadOnlyVolume> ActiveMounts = new Dictionary<string, MountedReadOnlyVolume>();
 
+        /// <summary>
+        /// Returns true if the given filesystem can be opened in WinParted's integrated file explorer.
+        /// </summary>
         public static bool IsSupportedNonMicrosoftFs(FileSystemType fs)
         {
             switch (fs)
@@ -124,6 +143,10 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Mounts a partition read-only in userspace by dispatching to the native filesystem parser
+        /// (Ext2/3/4, HFS+, Btrfs, XFS, ISO9660, or WPROFS01/superblock fallback) and merging any <c>WPRWOVL1</c> overlay.
+        /// </summary>
         public static MountedReadOnlyVolume MountReadOnly(DiskInfo disk, PartitionEntry part, bool requireVirtualDisk = false)
         {
             if (disk == null) throw new ArgumentNullException("disk");
@@ -193,6 +216,9 @@ namespace WinParted.Core
 
         private const long CopyStreamChunkBytes = 4L * 1048576L; // 4 MiB chunked transfer for multi-GB exports
 
+        /// <summary>
+        /// Reads up to <paramref name="maxBytes"/> from a virtual file node for preview rendering.
+        /// </summary>
         public static byte[] ReadFileBytes(DiskInfo disk, PartitionEntry part, VirtualFsNode fileNode, int maxBytes = 262144)
         {
             if (fileNode == null || fileNode.IsDirectory || maxBytes <= 0)
@@ -205,6 +231,10 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Streams a file node's payload in 4 MiB chunks across inline data, multi-extent lists,
+        /// or a contiguous disk offset so multi-gigabyte files export safely with constant RAM usage.
+        /// </summary>
         public static long CopyFileNodeToStream(
             DiskInfo disk,
             PartitionEntry part,
@@ -287,6 +317,9 @@ namespace WinParted.Core
             return totalWritten;
         }
 
+        /// <summary>
+        /// Searches a mounted volume recursively by case-insensitive filename or full-path substring.
+        /// </summary>
         public static List<VirtualFsNode> SearchVolume(MountedReadOnlyVolume vol, string query)
         {
             var results = new List<VirtualFsNode>();
@@ -320,6 +353,9 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Exports a file or entire directory subtree to the host Windows filesystem.
+        /// </summary>
         public static void ExportNodeToHost(
             DiskInfo disk, PartitionEntry part, VirtualFsNode node, string hostDestinationPath,
             out int filesCopied, out int foldersCreated, out long bytesCopied)
@@ -327,6 +363,9 @@ namespace WinParted.Core
             ExportNodeToHost(disk, part, node, hostDestinationPath, null, null, out filesCopied, out foldersCreated, out bytesCopied);
         }
 
+        /// <summary>
+        /// Exports a file or directory tree to the host with byte-level progress callbacks and cancellation support.
+        /// </summary>
         public static void ExportNodeToHost(
             DiskInfo disk,
             PartitionEntry part,
@@ -461,12 +500,22 @@ namespace WinParted.Core
             return string.IsNullOrEmpty(cleaned) ? "unnamed" : cleaned;
         }
 
+        // =========================================================================
+        // Experimental Read-Write Overlay API (WPRWOVL1 @ +0x20000, Payloads @ +0x24000+)
+        // =========================================================================
+
+        /// <summary>
+        /// Enables or disables the red-banner experimental write toggle on a mounted volume.
+        /// </summary>
         public static void SetExperimentalWriteMode(MountedReadOnlyVolume vol, bool enabled)
         {
             if (vol == null) throw new ArgumentNullException("vol");
             vol.ExperimentalWriteEnabled = enabled;
         }
 
+        /// <summary>
+        /// Creates a directory inside the volume's persistent <c>WPRWOVL1</c> experimental overlay.
+        /// </summary>
         public static VirtualFsNode CreateDirectoryOnVolume(
             DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, VirtualFsNode parentDir, string folderName)
         {
@@ -510,6 +559,9 @@ namespace WinParted.Core
             return dirNode;
         }
 
+        /// <summary>
+        /// Writes raw bytes as a new or overwritten file into the experimental overlay.
+        /// </summary>
         public static VirtualFsNode WriteFileToVolume(
             DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, VirtualFsNode targetDir, string fileName, byte[] data)
         {
@@ -519,6 +571,9 @@ namespace WinParted.Core
             return node;
         }
 
+        /// <summary>
+        /// Copies a single file from the host OS into the mounted partition's experimental overlay.
+        /// </summary>
         public static VirtualFsNode WriteHostFileToVolume(
             DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, VirtualFsNode targetDir, string hostFilePath)
         {
@@ -532,6 +587,9 @@ namespace WinParted.Core
             return node;
         }
 
+        /// <summary>
+        /// Recursively copies a host directory and its files into the mounted partition's experimental overlay.
+        /// </summary>
         public static VirtualFsNode WriteHostDirectoryToVolume(
             DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, VirtualFsNode targetDir, string hostDirPath,
             out int filesWritten, out int foldersWritten)
@@ -573,6 +631,9 @@ namespace WinParted.Core
             return dirNode;
         }
 
+        /// <summary>
+        /// Records a tombstone deletion (<c>Op = 2</c>) for a node in the experimental overlay.
+        /// </summary>
         public static bool DeleteNodeFromVolume(
             DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, VirtualFsNode targetNode)
         {
@@ -759,6 +820,9 @@ namespace WinParted.Core
             vol.OverlayRecords.Add(rec);
         }
 
+        /// <summary>
+        /// Serializes up to 16 KiB of <c>WPRWOVL1</c> overlay directory/file/tombstone records at partition <c>+0x20000</c>.
+        /// </summary>
         private static void SaveExperimentalOverlay(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             const int tableSize = 16384; // 0x20000..0x23FFF
@@ -791,6 +855,10 @@ namespace WinParted.Core
             RawDiskEngine.WriteBytes(disk, part.StartingOffset + 0x20000L, buf);
         }
 
+        /// <summary>
+        /// Loads any persisted <c>WPRWOVL1</c> experimental write overlay at partition <c>+0x20000</c>
+        /// and merges its upserts and tombstones on top of the natively parsed volume tree.
+        /// </summary>
         private static void LoadAndMergeExperimentalOverlay(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             if (part.PartitionLength < 0x30000L || vol.RootNode == null) return;
@@ -927,6 +995,14 @@ namespace WinParted.Core
             return null;
         }
 
+        // =========================================================================
+        // Native Filesystem Parsers
+        // =========================================================================
+
+        /// <summary>
+        /// Parses an Ext2/Ext3/Ext4 superblock (<c>0xEF53</c>), Block Group 0 Descriptor, and root inode 2,
+        /// supporting both legacy direct/indirect blocks and Ext4 extent trees (<c>0xF30A</c>).
+        /// </summary>
         private static void ParseExtVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             byte[] sb = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 1024, 1024);
@@ -1227,6 +1303,10 @@ namespace WinParted.Core
             public HfsExtent[] Extents;
         }
 
+        /// <summary>
+        /// Parses an Apple HFS+ or HFSX Volume Header (including HFS wrapper embedding), Extents Overflow
+        /// B-Tree, and Catalog B-Tree to reconstruct files, folders, fork extents, and resource paths.
+        /// </summary>
         private static void ParseHfsPlusVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             int headerReadLen = (int)Math.Min(131072L, part.PartitionLength);
@@ -1787,6 +1867,10 @@ namespace WinParted.Core
             public uint MtimeSec;
         }
 
+        /// <summary>
+        /// Parses a Btrfs superblock (<c>_BHRfS_M</c> at <c>+0x10040</c>), decodes <c>sys_chunk_array</c>,
+        /// walks root/FS B-trees to collect inodes, directory items, and inline/regular <c>EXTENT_DATA</c>.
+        /// </summary>
         private static void ParseBtrfsVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             if (part.PartitionLength < 0x15000L)
@@ -2153,6 +2237,10 @@ namespace WinParted.Core
             public bool HasFtype;
         }
 
+        /// <summary>
+        /// Parses a Big-Endian XFS superblock (<c>XFSB</c>), converts AG/block-relative 64-bit inode numbers
+        /// to partition offsets, and reads <c>IN</c> shortform directories plus <c>XD2B</c>/<c>XDB3</c> extent blocks.
+        /// </summary>
         private static void ParseXfsVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             if (part.PartitionLength < 4096)
@@ -2386,6 +2474,10 @@ namespace WinParted.Core
             return node;
         }
 
+        /// <summary>
+        /// Parses an ISO9660 Primary Volume Descriptor (and optional Joliet SVD) at <c>+0x8000</c>
+        /// to recursively build the optical/live ISO directory tree with optional Rock Ridge <c>NM</c> names.
+        /// </summary>
         private static void ParseIso9660Volume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             if (part.PartitionLength < 0x9800L)
@@ -2533,6 +2625,10 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Summarizes F2FS, ZFS, SquashFS, UDF, ReFS, APFS, Classic HFS, Linux Swap, and LVM2 superblocks
+        /// and loads any embedded <c>WPROFS01</c> catalog (falling back to a read-only superblock metadata view).
+        /// </summary>
         private static void ParseCatalogOrMetadataVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
             int headerReadLen = (int)Math.Min(131072L, part.PartitionLength);
@@ -2577,6 +2673,9 @@ namespace WinParted.Core
             vol.RootNode = BuildSuperblockOnlyTree(part, vol, header);
         }
 
+        /// <summary>
+        /// Parses a WinParted Read-Only Catalog (<c>WPROFS01</c>) serialized by test/image formatting.
+        /// </summary>
         private static VirtualFsNode ParseRoCatalogTree(byte[] buf, int catOffset, long partStartOffset)
         {
             uint count = BitConverter.ToUInt32(buf, catOffset + 8);
@@ -2634,6 +2733,10 @@ namespace WinParted.Core
             return root;
         }
 
+        /// <summary>
+        /// Builds a synthetic single-directory tree exposing raw superblock/header info when a filesystem
+        /// lacks a native on-disk directory tree (e.g., Swap, LVM2, or minimal metadata volumes).
+        /// </summary>
         private static VirtualFsNode BuildSuperblockOnlyTree(PartitionEntry part, MountedReadOnlyVolume vol, byte[] headerBytes)
         {
             var root = new VirtualFsNode

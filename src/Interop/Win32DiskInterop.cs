@@ -13,8 +13,13 @@ using WinParted.Models;
 
 namespace WinParted.Interop
 {
+    /// <summary>
+    /// Low-level Win32 P/Invoke layer for enumerating physical drives, querying geometry/layouts via IOCTLs,
+    /// locking/dismounting Windows volumes, and performing sector-aligned raw reads and writes.
+    /// </summary>
     public static class Win32DiskInterop
     {
+        // CreateFile access, sharing, and unbuffered/write-through flags
         public const uint GENERIC_READ = 0x80000000;
         public const uint GENERIC_WRITE = 0x40000000;
         public const uint FILE_SHARE_READ = 0x00000001;
@@ -24,6 +29,7 @@ namespace WinParted.Interop
         public const uint FILE_FLAG_NO_BUFFERING = 0x20000000;
         public const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
 
+        // Win32 Disk/Volume/Storage IOCTL and FSCTL control codes
         public const uint IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0;
         public const uint IOCTL_DISK_GET_DRIVE_LAYOUT_EX = 0x00070050;
         public const uint IOCTL_DISK_SET_DRIVE_LAYOUT_EX = 0x0007C054;
@@ -188,6 +194,11 @@ namespace WinParted.Interop
             public uint VolumeSerial;
         }
 
+        /// <summary>
+        /// Enumerates attached physical drives (`\\.\PhysicalDrive0..15` and Windows volume extents), queries hardware
+        /// geometry/alignment/partition layouts via IOCTLs, inspects raw superblocks when readable, and enriches
+        /// Windows-mounted partitions with drive letters, labels, and free-space statistics.
+        /// </summary>
         public static List<DiskInfo> EnumeratePhysicalDisks()
         {
             var disksByNumber = new Dictionary<int, DiskInfo>();
@@ -627,6 +638,11 @@ namespace WinParted.Interop
             return ReadRawDiskSectors(devicePath, ExtractDiskNumber(devicePath), byteOffset, length);
         }
 
+        /// <summary>
+        /// Reads raw sectors from a physical drive using a three-tier fallback chain to handle Windows
+        /// handle locks: (1) direct <c>\\.\PhysicalDriveN</c>, (2) covering volume handle at relative offset,
+        /// and (3) NT partition device handle (<c>\\.\GLOBALROOT\Device\HarddiskN\PartitionP</c>).
+        /// </summary>
         public static byte[] ReadRawDiskSectors(string devicePath, int diskNumber, long byteOffset, int length)
         {
             if (length <= 0)
@@ -891,6 +907,11 @@ namespace WinParted.Interop
             }
         }
 
+        /// <summary>
+        /// Writes 4K-padded sector buffers to a physical disk when running elevated, locking and dismounting
+        /// any overlapping Windows volumes and retrying across PhysicalDrive / Partition handles so Windows
+        /// raw-disk write protection does not block formatting non-Microsoft filesystems.
+        /// </summary>
         public static void WriteRawDiskSectors(string devicePath, int diskNumber, long byteOffset, byte[] data, int sectorSize)
         {
             if (!IsAdministrator())
@@ -1039,6 +1060,10 @@ namespace WinParted.Interop
             return fallback;
         }
 
+        /// <summary>
+        /// Maps a single-byte MBR partition type identifier to the best default <see cref="FileSystemType"/>
+        /// prior to raw superblock inspection.
+        /// </summary>
         public static FileSystemType GuessFsFromMbrType(byte mbrType)
         {
             switch (mbrType)
@@ -1065,6 +1090,10 @@ namespace WinParted.Interop
             }
         }
 
+        /// <summary>
+        /// Maps a GPT partition type GUID to the initial <see cref="FileSystemType"/> guess before
+        /// on-disk superblock signatures refine the exact variant (e.g. LinuxFilesystem -> ext2/3/4/btrfs/xfs/f2fs).
+        /// </summary>
         public static FileSystemType GuessFsFromGptType(Guid typeGuid)
         {
             if (typeGuid == GptPartitionTypeGuids.EfiSystem) return FileSystemType.EfiSystem;

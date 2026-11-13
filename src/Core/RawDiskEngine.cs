@@ -8,6 +8,9 @@ using WinParted.Models;
 
 namespace WinParted.Core
 {
+    /// <summary>
+    /// IEEE 802.3 CRC32 implementation used for UEFI GPT header/entry-array checksums and backup files.
+    /// </summary>
     public static class Crc32
     {
         private static readonly uint[] Table = BuildTable();
@@ -25,6 +28,7 @@ namespace WinParted.Core
             return t;
         }
 
+        /// <summary>Computes the CRC32 digest over a byte slice.</summary>
         public static uint Compute(byte[] data, int offset, int length)
         {
             uint crc = 0xFFFFFFFFu;
@@ -34,10 +38,19 @@ namespace WinParted.Core
         }
     }
 
+    /// <summary>
+    /// Core raw-sector I/O, GPT/MBR partition table codec, safety validator, and multi-OS superblock
+    /// inspection/formatting/resizing engine. Operates identically against virtual disk images (<c>.img</c>)
+    /// and raw physical drives (via <see cref="Win32DiskInterop"/>).
+    /// </summary>
     public static class RawDiskEngine
     {
         private const ulong GPT_SIGNATURE = 0x5452415020494645UL; // "EFI PART"
 
+        /// <summary>
+        /// Reads <paramref name="length"/> bytes starting at <paramref name="offset"/> from either
+        /// a virtual image file or a physical drive handle.
+        /// </summary>
         public static byte[] ReadBytes(DiskInfo disk, long offset, int length)
         {
             if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath))
@@ -62,6 +75,9 @@ namespace WinParted.Core
             return Win32DiskInterop.ReadRawDiskSectors(disk.DevicePath, disk.DiskNumber, offset, length);
         }
 
+        /// <summary>
+        /// Writes <paramref name="data"/> at <paramref name="offset"/> to a virtual image file or physical drive.
+        /// </summary>
         public static void WriteBytes(DiskInfo disk, long offset, byte[] data)
         {
             if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath))
@@ -78,6 +94,10 @@ namespace WinParted.Core
             Win32DiskInterop.WriteRawDiskSectors(disk.DevicePath, disk.DiskNumber, offset, data, disk.LogicalSectorSize);
         }
 
+        /// <summary>
+        /// Opens a virtual raw disk image (<c>.img</c>), parses its GPT/MBR table, and probes all
+        /// partition superblocks to reconstruct a complete <see cref="DiskInfo"/> model.
+        /// </summary>
         public static DiskInfo LoadVirtualDisk(string filePath, int diskNumber)
         {
             var fi = new FileInfo(filePath);
@@ -109,6 +129,7 @@ namespace WinParted.Core
             return disk;
         }
 
+        /// <summary>Creates a blank virtual disk image file initialized with an empty GPT, MBR, or RAW header.</summary>
         public static DiskInfo CreateBlankVirtualDisk(string filePath, long sizeBytes, PartitionTableStyle style)
         {
             long alignedSize = Math.Max(4L * 1048576L, ByteFormatter.AlignUp(sizeBytes, 512));
@@ -141,6 +162,10 @@ namespace WinParted.Core
             return LoadVirtualDisk(filePath, disk.DiskNumber);
         }
 
+        /// <summary>
+        /// Generates a 128 MiB multi-OS GPT virtual disk containing EFI (FAT32), NTFS, Ext4, and Linux Swap
+        /// partitions plus trailing unallocated space for safe testing and experimentation.
+        /// </summary>
         public static DiskInfo CreateDemoVirtualDisk(string filePath, int diskNumber = 90)
         {
             long totalSize = 128L * 1048576L; // 128 MiB
@@ -240,6 +265,10 @@ namespace WinParted.Core
             return LoadVirtualDisk(filePath, diskNumber);
         }
 
+        /// <summary>
+        /// Reads LBA 0..33 to determine GPT vs MBR vs RAW layout, validates GPT header/entry CRC32 digests,
+        /// and populates <see cref="DiskInfo.Partitions"/>.
+        /// </summary>
         public static void ParseDiskPartitionTable(DiskInfo disk)
         {
             disk.Partitions.Clear();
@@ -373,6 +402,11 @@ namespace WinParted.Core
             disk.PartitionStyle = PartitionTableStyle.RAW;
         }
 
+        /// <summary>
+        /// Pre-flight layout safety validator: rejects overlapping partitions, out-of-bounds LBA ranges,
+        /// encroaching on Primary/Backup GPT sectors (LBA 0..33 and last 33 sectors), duplicate GPT GUIDs,
+        /// and exceeding MBR's 4-slot primary table limit.
+        /// </summary>
         public static bool ValidatePartitionTable(DiskInfo disk, out string errorMessage)
         {
             errorMessage = string.Empty;
@@ -464,6 +498,7 @@ namespace WinParted.Core
             return true;
         }
 
+        /// <summary>Verifies LBA 0 signature, Primary &amp; Backup GPT headers/entry arrays, CRC32s, and non-overlap rules.</summary>
         public static bool VerifyDiskPartitionTableIntegrity(DiskInfo disk, out string report)
         {
             var sb = new StringBuilder();
@@ -571,6 +606,7 @@ namespace WinParted.Core
             return true;
         }
 
+        /// <summary>Restores the Primary GPT Header (LBA 1) and Array (LBA 2..33) from a verified Backup GPT.</summary>
         public static void RecoverGptFromBackup(DiskInfo disk)
         {
             if (!disk.IsVirtualImage)
@@ -612,6 +648,10 @@ namespace WinParted.Core
                 InspectPartitionSuperblock(disk, p);
         }
 
+        /// <summary>
+        /// Validates and writes a complete MBR or GPT partition table (Protective MBR + Primary/Backup GPT
+        /// headers &amp; entry arrays with freshly computed CRC32 checksums) to disk.
+        /// </summary>
         public static void WritePartitionTable(DiskInfo disk)
         {
             string valErr;
@@ -741,6 +781,11 @@ namespace WinParted.Core
             return hdr;
         }
 
+        /// <summary>
+        /// Probes the first 128 KiB of a partition to identify its exact on-disk filesystem superblock,
+        /// UUID, volume label, and used/free byte counts across 18+ Windows, Linux, Unix, and macOS formats.
+        /// Falls back to <see cref="FileSystemType.RAW"/> when no recognized signature matches.
+        /// </summary>
         public static void InspectPartitionSuperblock(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 4096) return;
@@ -1196,6 +1241,10 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Formats a partition header area (first 128 KiB) with valid superblock metadata, UUIDs, labels,
+        /// and initial directory/B-tree/catalog structures for the target <see cref="PartitionEntry.FileSystem"/>.
+        /// </summary>
         public static void WriteFileSystemHeader(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 65536) return;
@@ -1697,6 +1746,10 @@ namespace WinParted.Core
             WriteBytes(disk, part.StartingOffset, buf);
         }
 
+        /// <summary>
+        /// Updates in-place superblock total/free block counters after a partition grow/shrink/move
+        /// while preserving existing user data and filesystem UUIDs.
+        /// </summary>
         public static void ResizeFileSystemInPlace(DiskInfo disk, PartitionEntry part, long oldLength)
         {
             if (part.IsUnallocated || part.PartitionLength < 65536) return;
@@ -2004,6 +2057,9 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Updates the volume label directly inside the partition's on-disk superblock or boot sector.
+        /// </summary>
         public static void UpdateFileSystemLabelInPlace(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 65536) return;
@@ -2165,6 +2221,7 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>Copies raw partition bytes in 1 MiB chunks from source disk/offset to a virtual destination.</summary>
         public static void CopyPartitionBytes(DiskInfo sourceDisk, long sourceOffset, DiskInfo destDisk, long destOffset, long length)
         {
             if (!destDisk.IsVirtualImage)
@@ -2189,6 +2246,10 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Overlap-safe partition data mover: copies chunks forward when moving left and backward
+        /// when moving right, then zeroes vacated leading header sectors so stale superblocks cannot linger.
+        /// </summary>
         public static void MovePartitionBytes(DiskInfo disk, long oldOffset, long newOffset, long length)
         {
             if (oldOffset == newOffset || length <= 0) return;
@@ -2244,6 +2305,7 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>Overwrites a byte range with Zero-Fill, Ones-Fill, or PRNG Random data.</summary>
         public static void WipeRange(DiskInfo disk, long startOffset, long length, WipePattern pattern)
         {
             const int chunkSize = 1048576;
@@ -2293,6 +2355,7 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>Saves Primary + Backup partition table sectors into a <c>.gptbak</c>/<c>.ptbak</c> binary file.</summary>
         public static void BackupPartitionTable(DiskInfo disk, string backupPath)
         {
             int sec = disk.LogicalSectorSize > 0 ? disk.LogicalSectorSize : 512;
@@ -2322,6 +2385,7 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>Restores Primary + Backup partition table sectors from a saved <c>WPTBAK01</c> backup file.</summary>
         public static void RestorePartitionTable(DiskInfo disk, string backupPath)
         {
             using (var br = new BinaryReader(File.Open(backupPath, FileMode.Open, FileAccess.Read)))
@@ -2346,6 +2410,7 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>Returns the canonical 1-byte MBR partition type ID for a given filesystem.</summary>
         public static byte GetDefaultMbrType(FileSystemType fs)
         {
             switch (fs)
@@ -2406,6 +2471,10 @@ namespace WinParted.Core
             public string FullPath;
         }
 
+        /// <summary>
+        /// Synthesizes an Ext2/Ext3/Ext4 Block Group 0 Descriptor, inode table, root directory block,
+        /// and default seed files/subdirectories so formatted Ext volumes mount natively.
+        /// </summary>
         private static void PopulateExtDirectoryTree(byte[] buf, PartitionEntry part, uint freeBlocks, uint freeInodes)
         {
             // Ensure standard 4096-byte superblock fields
@@ -2593,6 +2662,10 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Writes a compact WinParted Read-Only Filesystem Catalog (<c>WPROFS01</c> at <c>+0x3000</c>)
+        /// with file payloads starting at <c>+0x4000</c> for filesystems that share metadata-only layouts.
+        /// </summary>
         private static void PopulateReadOnlyFsCatalog(byte[] buf, PartitionEntry part)
         {
             if (buf.Length < 0x8000) return;
@@ -2772,6 +2845,10 @@ namespace WinParted.Core
             return string.Empty;
         }
 
+        /// <summary>
+        /// Populates an HFS+ Big-Endian Catalog B-Tree header node (<c>+0x8000</c>) and leaf node (<c>+0x9000</c>)
+        /// containing default macOS folder/file records readable by the native HFS+ catalog parser.
+        /// </summary>
         private static void PopulateHfsPlusCatalogBTree(byte[] buf, PartitionEntry part, byte[] macReadme, byte[] plistBytes, byte[] labelFile)
         {
             const int nodeSize = 4096;
@@ -2877,6 +2954,10 @@ namespace WinParted.Core
             public byte[] Payload;
         }
 
+        /// <summary>
+        /// Populates a Btrfs filesystem tree leaf node (<c>+0x14000</c>) plus CRC32C leaf checksums,
+        /// chunk tree mappings, and inline/regular <c>EXTENT_DATA</c> items for native mounting.
+        /// </summary>
         private static void PopulateBtrfsFsTree(byte[] buf, PartitionEntry part, byte[] fsid)
         {
             const int nodeOff = 0x14000;
@@ -3025,6 +3106,10 @@ namespace WinParted.Core
             return d;
         }
 
+        /// <summary>
+        /// Populates XFS v4/v5 Big-Endian inodes (<c>IN</c>, root inode 128 at <c>+0x10000</c>), shortform
+        /// directories, and 128-bit BMBT extent records so formatted XFS images mount natively.
+        /// </summary>
         private static void PopulateXfsFsTree(byte[] buf, PartitionEntry part)
         {
             // Root inode = 128 at 128 * 512 = 0x10000; data blocks 24..27 at 0x18000..0x1B000
@@ -3127,6 +3212,10 @@ namespace WinParted.Core
             WriteUInt64BE(buf, off + 108, lo);
         }
 
+        /// <summary>
+        /// Builds ECMA-119 ISO9660 directory records starting at LBA 17 (<c>+0x8800</c>) and links them
+        /// into the Primary Volume Descriptor root directory record at <c>+0x809C</c>.
+        /// </summary>
         private static void PopulateIso9660DirectoryTree(byte[] buf, PartitionEntry part, Guid uuid)
         {
             if (buf.Length < 0xB800) return;

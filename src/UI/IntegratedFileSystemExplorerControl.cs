@@ -14,6 +14,11 @@ using WinParted.Models;
 
 namespace WinParted.UI
 {
+    /// <summary>
+    /// Embedded Google Material Design 3 file explorer for browsing, searching, previewing, and
+    /// exporting foreign/developer filesystems, with an opt-in red Experimental Write sidebar powered
+    /// by <see cref="ReadOnlyFileSystemMountEngine"/>'s <c>WPRWOVL1</c> overlay.
+    /// </summary>
     public class IntegratedFileSystemExplorerControl : UserControl
     {
         private const string ParentSentinel = "..PARENT..";
@@ -743,6 +748,10 @@ namespace WinParted.UI
             }
         }
 
+        /// <summary>
+        /// Binds the explorer UI to the newly selected disk/partition, auto-mounting virtual partitions
+        /// when <paramref name="autoMount"/> is true or reusing an existing mount session.
+        /// </summary>
         public void BindPartition(DiskInfo disk, PartitionEntry partition, MountedReadOnlyVolume mountedVol, bool autoMount)
         {
             _disk = disk;
@@ -1363,6 +1372,11 @@ namespace WinParted.UI
             ExportNodeInteractive(dir);
         }
 
+        /// <summary>
+        /// Prompts the user for a host save path and runs a background streaming export
+        /// (<see cref="ReadOnlyFileSystemMountEngine.ExportNodeToHost"/> in 4 MiB chunks) with
+        /// throttled M3 progress bar updates and responsive cancellation.
+        /// </summary>
         private void ExportNodeInteractive(VirtualFsNode node)
         {
             if (_copyInProgress || node == null) return;
@@ -1523,6 +1537,10 @@ namespace WinParted.UI
             }
         }
 
+        /// <summary>
+        /// Handles the red Experimental Write Mode toggle with an explicit confirmation warning before
+        /// unlocking <c>WPRWOVL1</c> directory/file/delete operations on the mounted partition.
+        /// </summary>
         private void OnExperimentalToggleChanged(object sender, EventArgs e)
         {
             if (_suppressToggleEvent || _volume == null) return;
