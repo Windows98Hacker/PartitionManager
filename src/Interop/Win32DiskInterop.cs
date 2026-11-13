@@ -265,6 +265,8 @@ namespace WinParted.Interop
 
             // 4. Merge Windows Drive Letters, Volume Labels, Usage Stats, and System flags onto discovered partitions
             string systemDrive = Path.GetPathRoot(Environment.SystemDirectory) ?? "C:\\";
+            string envSysDrive = Environment.GetEnvironmentVariable("SystemDrive");
+            string normalizedEnvSysDrive = !string.IsNullOrEmpty(envSysDrive) ? (envSysDrive.TrimEnd('\\') + "\\") : string.Empty;
 
             foreach (var disk in disksByNumber.Values)
             {
@@ -280,7 +282,9 @@ namespace WinParted.Interop
                         if (!string.IsNullOrEmpty(match.DriveLetter))
                         {
                             part.DriveLetter = match.DriveLetter;
-                            if (string.Equals(match.DriveLetter.TrimEnd('\\') + "\\", systemDrive, StringComparison.OrdinalIgnoreCase))
+                            string normLetter = match.DriveLetter.TrimEnd('\\') + "\\";
+                            if (string.Equals(normLetter, systemDrive, StringComparison.OrdinalIgnoreCase) ||
+                                (!string.IsNullOrEmpty(normalizedEnvSysDrive) && string.Equals(normLetter, normalizedEnvSysDrive, StringComparison.OrdinalIgnoreCase)))
                             {
                                 part.IsSystemOrBoot = true;
                                 disk.IsSystemDisk = true;
@@ -300,6 +304,29 @@ namespace WinParted.Interop
                             part.UUID = string.Format("{0:X4}-{1:X4}", (match.VolumeSerial >> 16) & 0xFFFF, match.VolumeSerial & 0xFFFF);
                         }
                         part.IsMounted = !string.IsNullOrEmpty(match.DriveLetter) || !string.IsNullOrEmpty(match.VolumeGuidPath);
+                    }
+                }
+            }
+
+            // Second pass: mark EFI System, MSR, Recovery, and active MBR boot partitions as protected
+            // ONLY on the active host OS disk (never on USB sticks or secondary/removable drives).
+            foreach (var disk in disksByNumber.Values)
+            {
+                if (!disk.IsSystemDisk)
+                {
+                    foreach (var part in disk.Partitions)
+                        part.IsSystemOrBoot = false;
+                    continue;
+                }
+
+                foreach (var part in disk.Partitions)
+                {
+                    if (part.GptTypeGuid == GptPartitionTypeGuids.EfiSystem ||
+                        part.GptTypeGuid == GptPartitionTypeGuids.MicrosoftReserved ||
+                        part.GptTypeGuid == GptPartitionTypeGuids.WindowsRecovery ||
+                        part.MbrBootable)
+                    {
+                        part.IsSystemOrBoot = true;
                     }
                 }
             }
@@ -568,13 +595,6 @@ namespace WinParted.Interop
                         entry.PartitionName = name;
                         entry.FileSystem = GuessFsFromGptType(entry.GptTypeGuid);
                         entry.FlagsSummary = FormatGptFlags(entry.GptTypeGuid, attrs);
-
-                        if (entry.GptTypeGuid == GptPartitionTypeGuids.EfiSystem ||
-                            entry.GptTypeGuid == GptPartitionTypeGuids.MicrosoftReserved ||
-                            entry.GptTypeGuid == GptPartitionTypeGuids.WindowsRecovery)
-                        {
-                            entry.IsSystemOrBoot = true;
-                        }
                     }
 
                     disk.Partitions.Add(entry);
@@ -834,6 +854,119 @@ namespace WinParted.Interop
             DeviceIoControl(hDisk, IOCTL_DISK_SET_DISK_ATTRIBUTES, attrBuf, (uint)attrBuf.Length, null, 0, out ret, IntPtr.Zero);
         }
 
+        private static void ClearDiskAndPartitionWriteProtection(string devicePath, int diskNumber, long byteOffset)
+        {
+            try
+            {
+                string diskPath = !string.IsNullOrEmpty(devicePath) ? devicePath : (@"\\.\PhysicalDrive" + diskNumber);
+                using (SafeFileHandle hDisk = CreateFile(diskPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero))
+                {
+                    if (hDisk.IsInvalid)
+                        return;
+
+                    ClearDiskReadOnlyAttribute(hDisk);
+
+                    byte[] layoutBuf = new byte[32768];
+                    uint ret;
+                    if (!DeviceIoControl(hDisk, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, null, 0, layoutBuf, (uint)layoutBuf.Length, out ret, IntPtr.Zero) || ret < 48)
+                        return;
+
+                    int style = BitConverter.ToInt32(layoutBuf, 0);
+                    int partCount = BitConverter.ToInt32(layoutBuf, 4);
+                    if (style != 1 || partCount <= 0)
+                        return;
+
+                    bool anyCleared = false;
+                    const ulong GptReadOnlyBit = 1UL << 60;
+                    for (int i = 0; i < partCount; i++)
+                    {
+                        int off = 48 + i * 144;
+                        if (off + 144 > ret) break;
+
+                        int pStyle = BitConverter.ToInt32(layoutBuf, off);
+                        long startOffset = BitConverter.ToInt64(layoutBuf, off + 8);
+                        long partLen = BitConverter.ToInt64(layoutBuf, off + 16);
+                        if (pStyle != 1 || partLen <= 0)
+                            continue;
+
+                        bool covers = (byteOffset < 0) || (byteOffset >= startOffset && byteOffset < startOffset + partLen);
+                        ulong attrs = BitConverter.ToUInt64(layoutBuf, off + 64);
+                        if (covers && (attrs & GptReadOnlyBit) != 0)
+                        {
+                            ulong cleared = attrs & ~GptReadOnlyBit;
+                            BitConverter.GetBytes(cleared).CopyTo(layoutBuf, off + 64);
+                            layoutBuf[off + 28] = 1; // RewritePartition = TRUE
+                            anyCleared = true;
+                        }
+                    }
+
+                    if (anyCleared)
+                    {
+                        uint layoutLen = Math.Min(ret, (uint)(48 + partCount * 144));
+                        if (DeviceIoControl(hDisk, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, layoutBuf, layoutLen, null, 0, out ret, IntPtr.Zero))
+                            DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, null, 0, null, 0, out ret, IntPtr.Zero);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>
+        /// Locks, dismounts, and offlines all Windows volumes on a non-OS physical disk, clears software
+        /// read-only flags, and zeroes the leading 128 KiB (LBA 0..255: MBR, Primary GPT, and isohybrid
+        /// ISO9660 volume descriptors at +0x8000) plus the trailing 34 sectors (Backup GPT).
+        /// </summary>
+        public static void WipeDiskBootAndHybridHeaders(int diskNumber, string devicePath, long totalSizeBytes, int sectorSize)
+        {
+            if (!IsAdministrator())
+                throw new UnauthorizedAccessException("Administrator privileges are required to wipe physical disk boot sectors.");
+
+            int sec = Math.Max(512, sectorSize);
+            ClearDiskAndPartitionWriteProtection(devicePath, diskNumber, -1);
+
+            var mappings = DiscoverVolumeMappings();
+            var diskVols = mappings.Where(v => v.DiskNumber == diskNumber).ToList();
+            foreach (var v in diskVols)
+            {
+                if (!string.IsNullOrEmpty(v.DriveLetter))
+                    DeleteVolumeMountPoint(v.DriveLetter.TrimEnd('\\') + "\\");
+
+                string target = !string.IsNullOrEmpty(v.VolumeGuidPath)
+                    ? v.VolumeGuidPath.TrimEnd('\\')
+                    : (!string.IsNullOrEmpty(v.DriveLetter) ? @"\\.\" + v.DriveLetter.TrimEnd('\\') : string.Empty);
+                if (string.IsNullOrEmpty(target))
+                    continue;
+
+                using (SafeFileHandle hVol = CreateFile(target, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero))
+                {
+                    if (!hVol.IsInvalid)
+                    {
+                        uint ret;
+                        DeviceIoControl(hVol, FSCTL_ALLOW_EXTENDED_DASD_IO, null, 0, null, 0, out ret, IntPtr.Zero);
+                        DeviceIoControl(hVol, FSCTL_LOCK_VOLUME, null, 0, null, 0, out ret, IntPtr.Zero);
+                        DeviceIoControl(hVol, FSCTL_DISMOUNT_VOLUME, null, 0, null, 0, out ret, IntPtr.Zero);
+                        DeviceIoControl(hVol, IOCTL_VOLUME_OFFLINE, null, 0, null, 0, out ret, IntPtr.Zero);
+                    }
+                }
+            }
+
+            string physPath = !string.IsNullOrEmpty(devicePath) ? devicePath : (@"\\.\PhysicalDrive" + diskNumber);
+            byte[] leadZeros = new byte[131072]; // 128 KiB covers MBR, Primary GPT (LBA 1..33), and ISO9660 PVD (0x8000..0x9800)
+            WriteRawDiskSectorsInternal(physPath, diskNumber, 0, leadZeros, sec, false);
+
+            long tailLen = Math.Max(4096L, 34L * sec);
+            tailLen = ((tailLen + sec - 1) / sec) * sec;
+            if (totalSizeBytes > leadZeros.Length + tailLen)
+            {
+                long tailOff = ((totalSizeBytes - tailLen) / sec) * sec;
+                WriteRawDiskSectorsInternal(physPath, diskNumber, tailOff, new byte[(int)tailLen], sec, false);
+            }
+
+            NotifyDiskPropertiesUpdated(physPath);
+        }
+
         private static bool TryFindPartitionAtOffset(int diskNumber, long byteOffset, out int partitionNumber, out long partitionStartOffset)
         {
             partitionNumber = 0;
@@ -990,17 +1123,26 @@ namespace WinParted.Interop
         }
 
         /// <summary>
-        /// Writes sector-aligned buffers to a physical disk when running elevated: locks all mounted/covering
-        /// volumes without premounted-dismounting <c>\FileSystem\RAW</c> handles, holds those locks across
-        /// volume, partition (<c>\Device\HarddiskN\PartitionP</c>), and direct <c>\\.\PhysicalDriveN</c>
-        /// attempts, and falls back to dismount+reopen only if the locked handle is blocked by a mounted FSD.
+        /// Writes sector-aligned buffers to a physical disk when running elevated: clears disk and GPT
+        /// read-only attributes up front, locks all mounted/covering volumes without premounted-dismounting
+        /// <c>\FileSystem\RAW</c> handles, holds those locks across volume, partition (<c>\Device\HarddiskN\PartitionP</c>),
+        /// and direct <c>\\.\PhysicalDriveN</c> attempts, and falls back to dismounting, taking volumes offline,
+        /// and closing volume handles so read-only drivers (such as CDFS on isohybrid media) detach cleanly.
         /// </summary>
         public static void WriteRawDiskSectors(string devicePath, int diskNumber, long byteOffset, byte[] data, int sectorSize)
+        {
+            WriteRawDiskSectorsInternal(devicePath, diskNumber, byteOffset, data, sectorSize, true);
+        }
+
+        private static void WriteRawDiskSectorsInternal(string devicePath, int diskNumber, long byteOffset, byte[] data, int sectorSize, bool restoreOnline)
         {
             if (!IsAdministrator())
                 throw new UnauthorizedAccessException("Administrator privileges are required to write raw sectors to physical disks.");
             if (data == null || data.Length == 0)
                 return;
+
+            // Clear disk software read-only attribute and GPT Bit-60 Read-Only partition flag before attempting writes
+            ClearDiskAndPartitionWriteProtection(devicePath, diskNumber, byteOffset);
 
             int sec = Math.Max(512, sectorSize);
             int align = Math.Max(4096, sec);
@@ -1016,6 +1158,7 @@ namespace WinParted.Interop
             var heldHandles = new List<SafeFileHandle>();
             var heldLocked = new List<bool>();
             var heldTargets = new List<string>();
+            var offlinedTargets = new List<string>();
 
             try
             {
@@ -1051,34 +1194,47 @@ namespace WinParted.Interop
                     }
                 }
 
-                // 1. Try locked covering volume handle BEFORE calling FSCTL_DISMOUNT_VOLUME (required for \FileSystem\RAW)
+                int coverIdx = -1;
                 if (coveringVol != null)
                 {
                     string coverTarget = !string.IsNullOrEmpty(coveringVol.VolumeGuidPath)
                         ? coveringVol.VolumeGuidPath.TrimEnd('\\')
                         : (!string.IsNullOrEmpty(coveringVol.DriveLetter) ? @"\\.\" + coveringVol.DriveLetter.TrimEnd('\\') : string.Empty);
+                    coverIdx = heldTargets.IndexOf(coverTarget);
 
-                    int idx = heldTargets.IndexOf(coverTarget);
-                    if (idx >= 0)
+                    // 1. Try locked covering volume handle BEFORE calling FSCTL_DISMOUNT_VOLUME (required for \FileSystem\RAW)
+                    if (coverIdx >= 0)
                     {
                         long relOffset = byteOffset - coveringVol.StartOffset;
                         int err;
-                        if (TryWriteHandleAtOffset(heldHandles[idx], relOffset, data, align, out err))
+                        if (TryWriteHandleAtOffset(heldHandles[coverIdx], relOffset, data, align, out err))
                         {
                             NotifyDiskPropertiesUpdated(devicePath);
                             return;
                         }
                         lastErr = err;
-                        attemptErrors.Add("Volume(" + coverTarget + ", locked=" + heldLocked[idx] + ") err=" + err);
+                        attemptErrors.Add("Volume(" + coverTarget + ", locked=" + heldLocked[coverIdx] + ") err=" + err);
                     }
                 }
 
-                // 2. Try NT partition device handle while all volume locks remain held
+                // 2. Try NT partition device handle; temporarily unlock covering volume if locked so PartitionP open succeeds
                 int partNum;
                 long partStart;
-                if (TryFindPartitionAtOffset(diskNumber, byteOffset, out partNum, out partStart))
+                bool hasPartAtOffset = TryFindPartitionAtOffset(diskNumber, byteOffset, out partNum, out partStart);
+                if (hasPartAtOffset)
                 {
                     string partPath = @"\\.\GLOBALROOT\Device\Harddisk" + diskNumber + @"\Partition" + partNum;
+                    bool temporarilyUnlockedCover = false;
+                    if (coverIdx >= 0 && heldLocked[coverIdx] && heldHandles[coverIdx] != null && !heldHandles[coverIdx].IsInvalid)
+                    {
+                        uint uRet;
+                        if (DeviceIoControl(heldHandles[coverIdx], FSCTL_UNLOCK_VOLUME, null, 0, null, 0, out uRet, IntPtr.Zero))
+                        {
+                            heldLocked[coverIdx] = false;
+                            temporarilyUnlockedCover = true;
+                        }
+                    }
+
                     bool partLocked;
                     SafeFileHandle hPart = OpenAndLockVolumeNoDismount(partPath, out partLocked);
                     try
@@ -1107,9 +1263,16 @@ namespace WinParted.Interop
                     {
                         UnlockAndDispose(ref hPart, ref partLocked);
                     }
+
+                    if (temporarilyUnlockedCover && heldHandles[coverIdx] != null && !heldHandles[coverIdx].IsInvalid)
+                    {
+                        uint lRet;
+                        if (DeviceIoControl(heldHandles[coverIdx], FSCTL_LOCK_VOLUME, null, 0, null, 0, out lRet, IntPtr.Zero))
+                            heldLocked[coverIdx] = true;
+                    }
                 }
 
-                // 3. Try direct PhysicalDriveN handle while volume locks remain held (clears software read-only attribute first)
+                // 3. Try direct PhysicalDriveN handle while volume locks remain held
                 bool diskUnbuf;
                 using (SafeFileHandle hDisk = OpenWriteHandle(devicePath, out diskUnbuf))
                 {
@@ -1127,7 +1290,7 @@ namespace WinParted.Interop
                         lastErr = err;
                         attemptErrors.Add("Disk(" + devicePath + ") err=" + err);
 
-                        // 4. Last resort: dismount & offline held volume handles, keep handles open, and retry PhysicalDriveN
+                        // 4. Dismount & offline held volume handles while keeping handles open, then retry PhysicalDriveN
                         if (heldHandles.Count > 0)
                         {
                             for (int i = 0; i < heldHandles.Count; i++)
@@ -1135,7 +1298,11 @@ namespace WinParted.Interop
                                 if (!heldHandles[i].IsInvalid)
                                 {
                                     DeviceIoControl(heldHandles[i], FSCTL_DISMOUNT_VOLUME, null, 0, null, 0, out ret, IntPtr.Zero);
-                                    DeviceIoControl(heldHandles[i], IOCTL_VOLUME_OFFLINE, null, 0, null, 0, out ret, IntPtr.Zero);
+                                    if (DeviceIoControl(heldHandles[i], IOCTL_VOLUME_OFFLINE, null, 0, null, 0, out ret, IntPtr.Zero))
+                                    {
+                                        if (!offlinedTargets.Contains(heldTargets[i]))
+                                            offlinedTargets.Add(heldTargets[i]);
+                                    }
                                 }
                             }
                             if (TryWriteHandleAtOffset(hDisk, byteOffset, data, align, out err))
@@ -1153,14 +1320,108 @@ namespace WinParted.Interop
                         attemptErrors.Add("OpenDisk(" + devicePath + ") err=" + lastErr);
                     }
                 }
+
+                // 5. Dispose all open volume handles while leaving volumes OFFLINE so CDFS/volmgr VPB detaches,
+                // then reopen fresh PhysicalDriveN / PartitionP handles and write directly to disk sectors.
+                if (heldHandles.Count > 0)
+                {
+                    for (int i = 0; i < heldHandles.Count; i++)
+                    {
+                        if (!heldHandles[i].IsInvalid)
+                        {
+                            uint oRet;
+                            if (DeviceIoControl(heldHandles[i], IOCTL_VOLUME_OFFLINE, null, 0, null, 0, out oRet, IntPtr.Zero))
+                            {
+                                if (!offlinedTargets.Contains(heldTargets[i]))
+                                    offlinedTargets.Add(heldTargets[i]);
+                            }
+                        }
+                        SafeFileHandle hh = heldHandles[i];
+                        bool lck = heldLocked[i];
+                        UnlockAndDispose(ref hh, ref lck);
+                        heldHandles[i] = null;
+                        heldLocked[i] = false;
+                    }
+                    heldHandles.Clear();
+                    heldLocked.Clear();
+
+                    bool diskUnbuf5;
+                    using (SafeFileHandle hDisk5 = OpenWriteHandle(devicePath, out diskUnbuf5))
+                    {
+                        if (!hDisk5.IsInvalid)
+                        {
+                            ClearDiskReadOnlyAttribute(hDisk5);
+                            uint ret5;
+                            DeviceIoControl(hDisk5, FSCTL_ALLOW_EXTENDED_DASD_IO, null, 0, null, 0, out ret5, IntPtr.Zero);
+                            int err5;
+                            if (TryWriteHandleAtOffset(hDisk5, byteOffset, data, align, out err5))
+                            {
+                                DeviceIoControl(hDisk5, IOCTL_DISK_UPDATE_PROPERTIES, null, 0, null, 0, out ret5, IntPtr.Zero);
+                                return;
+                            }
+                            lastErr = err5;
+                            attemptErrors.Add("DiskAfterOfflineClosed(" + devicePath + ") err=" + err5);
+                        }
+                        else
+                        {
+                            int oErr5 = Marshal.GetLastWin32Error();
+                            if (oErr5 != 0) lastErr = oErr5;
+                            attemptErrors.Add("OpenDiskAfterOffline(" + devicePath + ") err=" + oErr5);
+                        }
+                    }
+
+                    if (hasPartAtOffset)
+                    {
+                        string partPath5 = @"\\.\GLOBALROOT\Device\Harddisk" + diskNumber + @"\Partition" + partNum;
+                        bool pUnbuf5;
+                        using (SafeFileHandle hPart5 = OpenWriteHandle(partPath5, out pUnbuf5))
+                        {
+                            if (!hPart5.IsInvalid)
+                            {
+                                uint ret5;
+                                DeviceIoControl(hPart5, FSCTL_ALLOW_EXTENDED_DASD_IO, null, 0, null, 0, out ret5, IntPtr.Zero);
+                                int errP5;
+                                if (TryWriteHandleAtOffset(hPart5, byteOffset - partStart, data, align, out errP5))
+                                {
+                                    NotifyDiskPropertiesUpdated(devicePath);
+                                    return;
+                                }
+                                lastErr = errP5;
+                                attemptErrors.Add("PartitionAfterOfflineClosed(" + partPath5 + ") err=" + errP5);
+                            }
+                        }
+                    }
+                }
             }
             finally
             {
                 for (int i = 0; i < heldHandles.Count; i++)
                 {
+                    if (heldHandles[i] == null) continue;
                     SafeFileHandle h = heldHandles[i];
                     bool lck = heldLocked[i];
                     UnlockAndDispose(ref h, ref lck);
+                }
+
+                if (restoreOnline && offlinedTargets.Count > 0)
+                {
+                    for (int i = 0; i < offlinedTargets.Count; i++)
+                    {
+                        try
+                        {
+                            using (SafeFileHandle hVolOn = CreateFile(offlinedTargets[i], GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero))
+                            {
+                                if (!hVolOn.IsInvalid)
+                                {
+                                    uint retOn;
+                                    DeviceIoControl(hVolOn, IOCTL_VOLUME_ONLINE, null, 0, null, 0, out retOn, IntPtr.Zero);
+                                }
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
                 }
             }
 

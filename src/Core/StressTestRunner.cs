@@ -40,6 +40,7 @@ namespace WinParted.Core
                 RunStress6_AppleAndMacDataSafety(tempDir, log);
                 RunStress7_PhysicalDiskScriptAndFormatType(tempDir, log);
                 RunStress8_ReadOnlyNonMicrosoftMountAndBrowse(tempDir, log);
+                RunStress9_BootUnlockFullFormatAndHybridOverlay(tempDir, log);
 
                 log("STRESS_TEST_ALL_PASSED");
                 return true;
@@ -1139,6 +1140,352 @@ namespace WinParted.Core
             }
 
             log("  -> Dev Filesystems Verified (native Btrfs B-tree, BE XFS IN-inodes, Ext2 direct blocks, ECMA-119 ISO9660, F2FS, ZFS, SquashFS, UDF + 0x28000/shadow RW overlay).");
+        }
+
+        private static void RunStress9_BootUnlockFullFormatAndHybridOverlay(string tempDir, Action<string> log)
+        {
+            log("[Stress 9] OS Boot Protection vs USB/Non-System Boot Editing, Full-Drive Reformat, and Isohybrid Overlay Selection...");
+
+            ReadOnlyFileSystemMountEngine.ShadowOverlayRootOverride = Path.Combine(tempDir, "stress9_shadow");
+            try
+            {
+                // 9a. Active running OS disk (IsVirtualImage = false, IsSystemDisk = true) MUST reject destructive edits at Enqueue time.
+                // Queue validation ONLY — never call ApplyAll on a mock non-virtual disk.
+                var mockOsDisk = new DiskInfo
+                {
+                    DiskNumber = 99,
+                    Model = "Mock Windows OS NVMe",
+                    DevicePath = @"\\.\PhysicalDrive99",
+                    IsVirtualImage = false,
+                    IsSystemDisk = true,
+                    TotalSizeBytes = 64L * 1048576L,
+                    LogicalSectorSize = 512,
+                    PhysicalSectorSize = 4096,
+                    PartitionStyle = PartitionTableStyle.GPT,
+                    GptCrcValid = true
+                };
+                mockOsDisk.Partitions.Add(new PartitionEntry
+                {
+                    PartitionNumber = 1,
+                    StartingOffset = 1048576L,
+                    PartitionLength = 16L * 1048576L,
+                    FileSystem = FileSystemType.EfiSystem,
+                    GptTypeGuid = GptPartitionTypeGuids.EfiSystem,
+                    IsSystemOrBoot = true,
+                    PartitionName = "EFI System Partition"
+                });
+
+                var qmOs = new OperationQueueManager();
+                qmOs.SetBaselineDisks(new DiskInfo[] { mockOsDisk }, new DiskInfo[0]);
+
+                ExpectRejected(() => qmOs.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.DeletePartition,
+                    TargetDiskNumber = 99,
+                    TargetDiskPath = mockOsDisk.DevicePath,
+                    TargetPartitionNumber = 1,
+                    OriginalStartOffset = 1048576L,
+                    OriginalLength = 16L * 1048576L,
+                    Summary = "Should reject OS ESP delete"
+                }), "DeletePartition on active OS boot disk");
+
+                ExpectRejected(() => qmOs.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.FormatPartition,
+                    TargetDiskNumber = 99,
+                    TargetDiskPath = mockOsDisk.DevicePath,
+                    TargetPartitionNumber = 1,
+                    OriginalStartOffset = 1048576L,
+                    OriginalLength = 16L * 1048576L,
+                    NewFileSystem = FileSystemType.FAT32,
+                    Summary = "Should reject OS ESP format"
+                }), "FormatPartition on active OS boot disk");
+
+                ExpectRejected(() => qmOs.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.WipePartition,
+                    TargetDiskNumber = 99,
+                    TargetDiskPath = mockOsDisk.DevicePath,
+                    TargetPartitionNumber = 1,
+                    OriginalStartOffset = 1048576L,
+                    OriginalLength = 16L * 1048576L,
+                    WipePattern = WipePattern.ZeroFill,
+                    Summary = "Should reject OS ESP wipe"
+                }), "WipePartition on active OS boot disk");
+
+                ExpectRejected(() => qmOs.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.ResizeMovePartition,
+                    TargetDiskNumber = 99,
+                    TargetDiskPath = mockOsDisk.DevicePath,
+                    TargetPartitionNumber = 1,
+                    OriginalStartOffset = 1048576L,
+                    OriginalLength = 16L * 1048576L,
+                    StartOffset = 1048576L,
+                    Length = 8L * 1048576L,
+                    Summary = "Should reject OS ESP resize"
+                }), "ResizeMovePartition on active OS boot disk");
+
+                ExpectRejected(() => qmOs.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.CreatePartitionTable,
+                    TargetDiskNumber = 99,
+                    TargetDiskPath = mockOsDisk.DevicePath,
+                    NewTableStyle = PartitionTableStyle.GPT,
+                    Summary = "Should reject OS GPT reinit"
+                }), "CreatePartitionTable on active OS boot disk");
+
+                // 9b. Non-system disk EFI System Partition + Active MBR boot partition can be formatted, wiped, and deleted.
+                string efiImgPath = Path.Combine(tempDir, "stress9_nonos_efi.img");
+                var efiDisk = RawDiskEngine.CreateBlankVirtualDisk(efiImgPath, 32L * 1048576L, PartitionTableStyle.GPT);
+                efiDisk.DiskNumber = 901;
+                efiDisk.IsSystemDisk = false;
+
+                var qmEfi = new OperationQueueManager();
+                qmEfi.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { efiDisk });
+                qmEfi.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.CreatePartition,
+                    TargetDiskNumber = 901,
+                    TargetDiskPath = efiDisk.DevicePath,
+                    StartOffset = 1048576L,
+                    Length = 16L * 1048576L,
+                    NewFileSystem = FileSystemType.EfiSystem,
+                    NewLabel = "USB_ESP",
+                    NewPartitionName = "EFI System Partition",
+                    NewGptTypeGuid = GptPartitionTypeGuids.EfiSystem,
+                    NewMbrType = 0xEF,
+                    Summary = "Create USB ESP"
+                });
+                qmEfi.ApplyAll(null);
+
+                efiDisk = RawDiskEngine.LoadVirtualDisk(efiImgPath, 901);
+                if (efiDisk.Partitions.Count != 1 || efiDisk.Partitions[0].FileSystem != FileSystemType.EfiSystem)
+                    throw new Exception("Expected non-system EfiSystem partition to be created cleanly.");
+
+                qmEfi.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { efiDisk });
+                qmEfi.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.FormatPartition,
+                    TargetDiskNumber = 901,
+                    TargetDiskPath = efiDisk.DevicePath,
+                    TargetPartitionNumber = efiDisk.Partitions[0].PartitionNumber,
+                    OriginalStartOffset = efiDisk.Partitions[0].StartingOffset,
+                    OriginalLength = efiDisk.Partitions[0].PartitionLength,
+                    NewFileSystem = FileSystemType.FAT32,
+                    NewLabel = "USB_FAT",
+                    NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(FileSystemType.FAT32),
+                    NewMbrType = 0x0C,
+                    Summary = "Reformat non-system ESP to FAT32"
+                });
+                qmEfi.ApplyAll(null);
+
+                efiDisk = RawDiskEngine.LoadVirtualDisk(efiImgPath, 901);
+                qmEfi.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { efiDisk });
+                qmEfi.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.WipePartition,
+                    TargetDiskNumber = 901,
+                    TargetDiskPath = efiDisk.DevicePath,
+                    TargetPartitionNumber = efiDisk.Partitions[0].PartitionNumber,
+                    OriginalStartOffset = efiDisk.Partitions[0].StartingOffset,
+                    OriginalLength = efiDisk.Partitions[0].PartitionLength,
+                    WipePattern = WipePattern.ZeroFill,
+                    Summary = "Wipe non-system ESP"
+                });
+                qmEfi.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.DeletePartition,
+                    TargetDiskNumber = 901,
+                    TargetDiskPath = efiDisk.DevicePath,
+                    TargetPartitionNumber = efiDisk.Partitions[0].PartitionNumber,
+                    OriginalStartOffset = efiDisk.Partitions[0].StartingOffset,
+                    OriginalLength = efiDisk.Partitions[0].PartitionLength,
+                    Summary = "Delete non-system ESP"
+                });
+                qmEfi.ApplyAll(null);
+
+                efiDisk = RawDiskEngine.LoadVirtualDisk(efiImgPath, 901);
+                if (efiDisk.Partitions.Count != 0)
+                    throw new Exception("Expected non-system ESP deletion to remove partition.");
+
+                string mbrImgPath = Path.Combine(tempDir, "stress9_nonos_mbrboot.img");
+                var mbrDisk = RawDiskEngine.CreateBlankVirtualDisk(mbrImgPath, 32L * 1048576L, PartitionTableStyle.MBR);
+                mbrDisk.DiskNumber = 902;
+                mbrDisk.IsSystemDisk = false;
+
+                var qmMbr = new OperationQueueManager();
+                qmMbr.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { mbrDisk });
+                qmMbr.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.CreatePartition,
+                    TargetDiskNumber = 902,
+                    TargetDiskPath = mbrDisk.DevicePath,
+                    StartOffset = 1048576L,
+                    Length = 16L * 1048576L,
+                    NewFileSystem = FileSystemType.FAT32,
+                    NewLabel = "BOOT_USB",
+                    NewMbrType = 0x0C,
+                    Summary = "Create MBR partition"
+                });
+                qmMbr.ApplyAll(null);
+
+                mbrDisk = RawDiskEngine.LoadVirtualDisk(mbrImgPath, 902);
+                qmMbr.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { mbrDisk });
+                qmMbr.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.ChangeFlags,
+                    TargetDiskNumber = 902,
+                    TargetDiskPath = mbrDisk.DevicePath,
+                    TargetPartitionNumber = mbrDisk.Partitions[0].PartitionNumber,
+                    OriginalStartOffset = mbrDisk.Partitions[0].StartingOffset,
+                    OriginalLength = mbrDisk.Partitions[0].PartitionLength,
+                    NewMbrType = 0x0C,
+                    NewMbrBoot = true,
+                    Summary = "Mark MBR bootable"
+                });
+                qmMbr.ApplyAll(null);
+
+                mbrDisk = RawDiskEngine.LoadVirtualDisk(mbrImgPath, 902);
+                if (!mbrDisk.Partitions[0].MbrBootable)
+                    throw new Exception("Expected MBR partition to be marked active bootable.");
+
+                qmMbr.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { mbrDisk });
+                qmMbr.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.DeletePartition,
+                    TargetDiskNumber = 902,
+                    TargetDiskPath = mbrDisk.DevicePath,
+                    TargetPartitionNumber = mbrDisk.Partitions[0].PartitionNumber,
+                    OriginalStartOffset = mbrDisk.Partitions[0].StartingOffset,
+                    OriginalLength = mbrDisk.Partitions[0].PartitionLength,
+                    Summary = "Delete active MBR boot partition"
+                });
+                qmMbr.ApplyAll(null);
+
+                mbrDisk = RawDiskEngine.LoadVirtualDisk(mbrImgPath, 902);
+                if (mbrDisk.Partitions.Count != 0)
+                    throw new Exception("Expected active MBR boot partition on non-system disk to be deleted.");
+
+                // 9c. Full-drive reinitialization + single-partition formatting across non-OS developer filesystems
+                string fmtImgPath = Path.Combine(tempDir, "stress9_fullfmt.img");
+                RawDiskEngine.CreateBlankVirtualDisk(fmtImgPath, 32L * 1048576L, PartitionTableStyle.MBR);
+                FileSystemType[] devFormats = new FileSystemType[]
+                {
+                    FileSystemType.Ext4,
+                    FileSystemType.Btrfs,
+                    FileSystemType.XFS,
+                    FileSystemType.HFSPlus,
+                    FileSystemType.APFS
+                };
+
+                for (int i = 0; i < devFormats.Length; i++)
+                {
+                    FileSystemType fs = devFormats[i];
+                    var fmtDisk = RawDiskEngine.LoadVirtualDisk(fmtImgPath, 904);
+                    var qmFmt = new OperationQueueManager();
+                    qmFmt.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { fmtDisk });
+                    qmFmt.Enqueue(new PendingOperation
+                    {
+                        Type = OperationType.CreatePartitionTable,
+                        TargetDiskNumber = 904,
+                        TargetDiskPath = fmtDisk.DevicePath,
+                        NewTableStyle = PartitionTableStyle.GPT,
+                        Summary = "Reinit GPT for " + fs
+                    });
+                    qmFmt.Enqueue(new PendingOperation
+                    {
+                        Type = OperationType.CreatePartition,
+                        TargetDiskNumber = 904,
+                        TargetDiskPath = fmtDisk.DevicePath,
+                        StartOffset = 1048576L,
+                        Length = 28L * 1048576L,
+                        NewFileSystem = fs,
+                        NewLabel = "DEV_" + fs.ToString().ToUpperInvariant(),
+                        NewPartitionName = fs.ToString(),
+                        NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(fs),
+                        NewMbrType = RawDiskEngine.GetDefaultMbrType(fs),
+                        Summary = "Full-drive create " + fs
+                    });
+                    qmFmt.ApplyAll(null);
+
+                    fmtDisk = RawDiskEngine.LoadVirtualDisk(fmtImgPath, 904);
+                    if (fmtDisk.PartitionStyle != PartitionTableStyle.GPT || fmtDisk.Partitions.Count != 1 || fmtDisk.Partitions[0].FileSystem != fs)
+                        throw new Exception("Full-drive reformat verification failed for " + fs);
+
+                    var part = fmtDisk.Partitions[0];
+                    var vol = ReadOnlyFileSystemMountEngine.MountReadOnly(fmtDisk, part, true);
+                    ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(vol, true);
+                    string payloadText = "rw-probe-" + fs;
+                    var node = ReadOnlyFileSystemMountEngine.WriteFileToVolume(fmtDisk, part, vol, null, "probe.txt", Encoding.UTF8.GetBytes(payloadText));
+                    byte[] gotBytes = ReadOnlyFileSystemMountEngine.ReadFileBytes(fmtDisk, part, node);
+                    if (Encoding.UTF8.GetString(gotBytes) != payloadText)
+                        throw new Exception("Experimental write roundtrip mismatch for " + fs);
+                    ReadOnlyFileSystemMountEngine.Unmount(fmtDisk.DiskNumber, part.StartingOffset);
+                }
+
+                // 9d. Simulated isohybrid disk: Partition 1 (ISO9660 at +0x8000, 24 MiB) overlaps nested Partition 2 (ESP at +0x20000, 2 MiB)
+                string hybridImgPath = Path.Combine(tempDir, "stress9_isohybrid.img");
+                var hybridDisk = RawDiskEngine.CreateBlankVirtualDisk(hybridImgPath, 32L * 1048576L, PartitionTableStyle.GPT);
+                hybridDisk.DiskNumber = 903;
+
+                var pIso = new PartitionEntry
+                {
+                    PartitionNumber = 1,
+                    StartingOffset = 0x8000L,
+                    PartitionLength = 24L * 1048576L,
+                    FileSystem = FileSystemType.ISO9660,
+                    Label = "FEDORA_LIVE",
+                    PartitionName = "FEDORA_LIVE"
+                };
+                var pEsp = new PartitionEntry
+                {
+                    PartitionNumber = 2,
+                    StartingOffset = 0x20000L,
+                    PartitionLength = 2L * 1048576L,
+                    FileSystem = FileSystemType.EfiSystem,
+                    Label = "ANACONDA",
+                    PartitionName = "ANACONDA",
+                    IsSystemOrBoot = false
+                };
+                hybridDisk.Partitions.Add(pIso);
+                RawDiskEngine.WriteFileSystemHeader(hybridDisk, pIso);
+                hybridDisk.Partitions.Add(pEsp);
+
+                long sentinelOffset = pIso.StartingOffset + 0x28000L; // 0x30000, inside nested pEsp [0x20000..0x220000)
+                byte[] sentinel = Encoding.ASCII.GetBytes("ANACONDA_ESP_SENTINEL_UNTOUCHED_0x30000");
+                RawDiskEngine.WriteBytes(hybridDisk, sentinelOffset, sentinel);
+
+                var volIso = ReadOnlyFileSystemMountEngine.MountReadOnly(hybridDisk, pIso, true);
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(volIso, true);
+                var liveOsDir = ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(hybridDisk, pIso, volIso, null, "LiveOS");
+                ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(hybridDisk, pIso, volIso, liveOsDir, "overlay");
+                const string ksText = "lang en_US.UTF-8\n";
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(hybridDisk, pIso, volIso, liveOsDir, "ks.cfg", Encoding.UTF8.GetBytes(ksText));
+
+                if (volIso.OverlayTableRelOffset == 0x20000L || volIso.OverlayTableRelOffset == 0x28000L || volIso.OverlayTableRelOffset <= pEsp.EndOffset - pIso.StartingOffset)
+                    throw new Exception(string.Format("Expected non-overlapping tail overlay offset past nested ESP, got 0x{0:X}", volIso.OverlayTableRelOffset));
+
+                byte[] sentinelAfter = RawDiskEngine.ReadBytes(hybridDisk, sentinelOffset, sentinel.Length);
+                if (Encoding.ASCII.GetString(sentinelAfter) != Encoding.ASCII.GetString(sentinel))
+                    throw new Exception("Nested isohybrid ESP sectors at 0x30000 were overwritten by ISO overlay!");
+
+                ReadOnlyFileSystemMountEngine.Unmount(hybridDisk.DiskNumber, pIso.StartingOffset);
+                var volIsoRemount = ReadOnlyFileSystemMountEngine.MountReadOnly(hybridDisk, pIso, false);
+                var ksHits = ReadOnlyFileSystemMountEngine.SearchVolume(volIsoRemount, "ks.cfg");
+                if (ksHits.Count == 0)
+                    throw new Exception("Expected /LiveOS/ks.cfg in remounted isohybrid overlay!");
+                byte[] ksGot = ReadOnlyFileSystemMountEngine.ReadFileBytes(hybridDisk, pIso, ksHits[0]);
+                if (Encoding.UTF8.GetString(ksGot) != ksText)
+                    throw new Exception("Remounted /LiveOS/ks.cfg content mismatch: " + Encoding.UTF8.GetString(ksGot));
+            }
+            finally
+            {
+                ReadOnlyFileSystemMountEngine.ShadowOverlayRootOverride = null;
+                ReadOnlyFileSystemMountEngine.UnmountAll();
+            }
+
+            log("  -> Boot protection, non-system EFI/MBR editing, full-drive formatting, and isohybrid tail overlay verified.");
         }
 
         private static void VerifyRoMountAndFile(DiskInfo disk, PartitionEntry part, string fullPath, string expectedSubstring)

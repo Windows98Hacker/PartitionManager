@@ -85,6 +85,7 @@ namespace WinParted.UI
 
         public IntegratedFileSystemExplorerControl()
         {
+            DoubleBuffered = true;
             Size = new Size(920, 520);
             Dock = DockStyle.Fill;
             Font = new Font("Segoe UI", 9.0f);
@@ -565,7 +566,23 @@ namespace WinParted.UI
                 SetSplitterDistanceSafe(_rightSplit, 240);
             };
 
+            EnableDoubleBuffering(_treeDirs);
+            EnableDoubleBuffering(_lvEntries);
             ThemeManager.ApplyTheme(this);
+        }
+
+        private static void EnableDoubleBuffering(Control ctrl)
+        {
+            if (ctrl == null) return;
+            try
+            {
+                var prop = typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (prop != null)
+                    prop.SetValue(ctrl, true, null);
+            }
+            catch
+            {
+            }
         }
 
         private Button MakeNavButton(string symbol, string tip)

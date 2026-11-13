@@ -61,7 +61,9 @@ namespace WinParted.Core
         public VirtualFsNode RootNode { get; set; }
         public bool OverlayUsingHostShadow { get; set; }
         public string OverlayShadowMessage { get; set; }
+        internal long OverlayTableRelOffset { get; set; }
         internal long OverlayNextDataRelOffset { get; set; }
+        internal bool OverlayDiskOffsetCommitted { get; set; }
         internal List<OverlayRecord> OverlayRecords { get; set; }
     }
 
@@ -166,6 +168,9 @@ namespace WinParted.Core
             string mountId = string.Format("ro_disk{0}_p{1}", disk.DiskNumber, part.PartitionNumber);
             string mountPath = string.Format("/mnt/ro/disk{0}p{1}", disk.DiskNumber, part.PartitionNumber);
 
+            long[] candidates = GetCandidateOverlayTableRelOffsets(disk, part);
+            long initialTableRel = candidates.Length > 0 ? candidates[0] : 0x20000L;
+
             var vol = new MountedReadOnlyVolume
             {
                 MountId = mountId,
@@ -178,7 +183,8 @@ namespace WinParted.Core
                 Label = part.Label ?? string.Empty,
                 UUID = part.UUID ?? string.Empty,
                 BlockSize = 4096,
-                OverlayNextDataRelOffset = 0x24000L,
+                OverlayTableRelOffset = initialTableRel,
+                OverlayNextDataRelOffset = initialTableRel + 0x4000L,
                 OverlayRecords = new List<OverlayRecord>()
             };
 
@@ -697,8 +703,10 @@ namespace WinParted.Core
             long relDataOffset = 0;
             if (data.Length > 0)
             {
-                if (vol.OverlayNextDataRelOffset < 0x24000L)
-                    vol.OverlayNextDataRelOffset = 0x24000L;
+                long tableRel = vol.OverlayTableRelOffset > 0 ? vol.OverlayTableRelOffset : 0x20000L;
+                long minDataRel = tableRel + 0x4000L;
+                if (vol.OverlayNextDataRelOffset < minDataRel)
+                    vol.OverlayNextDataRelOffset = minDataRel;
 
                 relDataOffset = ((vol.OverlayNextDataRelOffset + 4095L) / 4096L) * 4096L;
                 long alignedWriteLen = ((data.Length + 4095L) / 4096L) * 4096L;
@@ -707,7 +715,7 @@ namespace WinParted.Core
 
                 byte[] sectorBuf = new byte[(int)alignedWriteLen];
                 Array.Copy(data, sectorBuf, data.Length);
-                WriteOverlayRegionBytes(disk, part, vol, relDataOffset, sectorBuf);
+                WriteOverlayRegionBytes(disk, part, vol, ref relDataOffset, sectorBuf);
                 vol.OverlayNextDataRelOffset = relDataOffset + alignedWriteLen;
             }
 
@@ -902,26 +910,100 @@ namespace WinParted.Core
             }
         }
 
-        private static void WriteOverlayRegionBytes(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, long relOffset, byte[] data)
+        private static bool OverlapsOtherPartition(DiskInfo disk, PartitionEntry part, long relStart, long regionLength)
+        {
+            if (disk == null || disk.Partitions == null || part == null) return false;
+            long absStart = part.StartingOffset + relStart;
+            long absEnd = absStart + regionLength;
+            foreach (var other in disk.Partitions)
+            {
+                if (other == null || other.IsUnallocated || other.PartitionLength <= 0) continue;
+                if (other.StartingOffset == part.StartingOffset && other.PartitionLength == part.PartitionLength) continue;
+                if (other.StartingOffset < absEnd && other.EndOffset > absStart)
+                    return true;
+            }
+            return false;
+        }
+
+        private static long[] GetCandidateOverlayTableRelOffsets(DiskInfo disk, PartitionEntry part)
+        {
+            if (part == null) return new long[] { 0x20000L };
+            var list = new List<long>();
+            long headCand = 0x20000L;
+            long tailCand = -1;
+            if (part.PartitionLength >= 16L * 1048576L)
+                tailCand = ((part.PartitionLength - 8L * 1048576L) / 4096L) * 4096L;
+            else if (part.PartitionLength >= 2L * 1048576L)
+                tailCand = ((part.PartitionLength - 512L * 1024L) / 4096L) * 4096L;
+
+            bool headOverlaps = OverlapsOtherPartition(disk, part, headCand, 0xE0000L);
+            if (headOverlaps)
+            {
+                if (tailCand > headCand && !OverlapsOtherPartition(disk, part, tailCand, 0x40000L))
+                    list.Add(tailCand);
+                list.Add(headCand);
+                if (tailCand > headCand && !list.Contains(tailCand))
+                    list.Add(tailCand);
+            }
+            else
+            {
+                list.Add(headCand);
+                if (tailCand > headCand)
+                    list.Add(tailCand);
+            }
+            return list.ToArray();
+        }
+
+        private static void WriteOverlayRegionBytes(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol, ref long relOffset, byte[] data)
         {
             if (disk.IsVirtualImage)
             {
                 RawDiskEngine.WriteBytes(disk, part.StartingOffset + relOffset, data);
+                vol.OverlayDiskOffsetCommitted = true;
                 return;
             }
 
+            long currentTableRel = vol.OverlayTableRelOffset > 0 ? vol.OverlayTableRelOffset : 0x20000L;
             string shadowPath = GetHostShadowOverlayFilePath(disk, part);
             if (!vol.OverlayUsingHostShadow)
             {
                 try
                 {
                     RawDiskEngine.WriteBytes(disk, part.StartingOffset + relOffset, data);
+                    vol.OverlayDiskOffsetCommitted = true;
                     return;
                 }
                 catch (Exception ex)
                 {
                     if (!(ex is Win32Exception) && !(ex is UnauthorizedAccessException) && !(ex is IOException))
                         throw;
+
+                    // Before falling back to a local host shadow file, try alternate non-overlapping on-disk offsets
+                    // when no previous on-disk overlay write has been committed yet (critical on isohybrid partitions).
+                    if (!vol.OverlayDiskOffsetCommitted)
+                    {
+                        long[] candidates = GetCandidateOverlayTableRelOffsets(disk, part);
+                        long delta = relOffset - currentTableRel;
+                        for (int i = 0; i < candidates.Length; i++)
+                        {
+                            long altTableRel = candidates[i];
+                            if (altTableRel == currentTableRel) continue;
+                            long altRelOffset = altTableRel + delta;
+                            if (altRelOffset < 0 || part.StartingOffset + altRelOffset + data.Length > part.EndOffset)
+                                continue;
+                            try
+                            {
+                                RawDiskEngine.WriteBytes(disk, part.StartingOffset + altRelOffset, data);
+                                vol.OverlayTableRelOffset = altTableRel;
+                                vol.OverlayDiskOffsetCommitted = true;
+                                relOffset = altRelOffset;
+                                return;
+                            }
+                            catch
+                            {
+                            }
+                        }
+                    }
 
                     vol.OverlayUsingHostShadow = true;
                     vol.OverlayShadowMessage = "Host shadow overlay active (physical medium blocked raw write; stored locally on host).";
@@ -932,15 +1014,17 @@ namespace WinParted.Core
         }
 
         /// <summary>
-        /// Serializes up to 16 KiB of <c>WPRWOVL1</c> overlay directory/file/tombstone records at partition <c>+0x20000</c>
-        /// (falling back to the host shadow overlay file on physical disks when raw sector writes are rejected).
+        /// Serializes up to 16 KiB of <c>WPRWOVL1</c> overlay directory/file/tombstone records at the volume's
+        /// selected <c>OverlayTableRelOffset</c> (default <c>+0x20000</c> or non-overlapping tail region),
+        /// falling back to the host shadow overlay file on physical disks only if all on-disk offsets fail.
         /// </summary>
         private static void SaveExperimentalOverlay(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
-            const int tableSize = 16384; // 0x20000..0x23FFF
+            long tableRel = vol.OverlayTableRelOffset > 0 ? vol.OverlayTableRelOffset : 0x20000L;
+            const int tableSize = 16384; // 16 KiB table header
             byte[] buf = new byte[tableSize];
             Encoding.ASCII.GetBytes("WPRWOVL1").CopyTo(buf, 0);
-            BitConverter.GetBytes((ulong)Math.Max(0x24000L, vol.OverlayNextDataRelOffset)).CopyTo(buf, 8);
+            BitConverter.GetBytes((ulong)Math.Max(tableRel + 0x4000L, vol.OverlayNextDataRelOffset)).CopyTo(buf, 8);
 
             var records = vol.OverlayRecords ?? new List<OverlayRecord>();
             int cursor = 20;
@@ -964,12 +1048,13 @@ namespace WinParted.Core
             }
 
             BitConverter.GetBytes(writtenCount).CopyTo(buf, 16);
-            WriteOverlayRegionBytes(disk, part, vol, 0x20000L, buf);
+            WriteOverlayRegionBytes(disk, part, vol, ref tableRel, buf);
         }
 
         /// <summary>
-        /// Loads any persisted <c>WPRWOVL1</c> experimental write overlay from partition <c>+0x20000</c>
-        /// (or from a physical partition's host shadow file if present) and merges it onto the volume tree.
+        /// Loads any persisted <c>WPRWOVL1</c> experimental write overlay from the partition on disk
+        /// (checking candidate table offsets, or from a physical partition's host shadow file if present)
+        /// and merges it onto the volume tree.
         /// </summary>
         internal static void LoadAndMergeExperimentalOverlay(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
         {
@@ -979,25 +1064,60 @@ namespace WinParted.Core
                 byte[] table = null;
                 string activeShadowPath = null;
 
-                if (!disk.IsVirtualImage)
+                // 1. Prefer direct on-disk WPRWOVL1 table if present at any candidate offset
+                long[] candidates = GetCandidateOverlayTableRelOffsets(disk, part);
+                for (int c = 0; c < candidates.Length; c++)
+                {
+                    long cand = candidates[c];
+                    if (cand < 0 || part.StartingOffset + cand + 4096L > part.EndOffset)
+                        continue;
+                    try
+                    {
+                        byte[] probe = RawDiskEngine.ReadBytes(disk, part.StartingOffset + cand, 4096);
+                        if (probe.Length >= 20 && MatchesAscii(probe, 0, "WPRWOVL1"))
+                        {
+                            byte[] fullTable = RawDiskEngine.ReadBytes(disk, part.StartingOffset + cand, 16384);
+                            if (fullTable.Length >= 20 && MatchesAscii(fullTable, 0, "WPRWOVL1"))
+                            {
+                                table = fullTable;
+                                vol.OverlayTableRelOffset = cand;
+                                vol.OverlayDiskOffsetCommitted = true;
+                                break;
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                // 2. Fall back to local host shadow overlay if no direct on-disk WPRWOVL1 table exists
+                if (table == null && !disk.IsVirtualImage)
                 {
                     string shadowPath = GetHostShadowOverlayFilePath(disk, part);
                     if (File.Exists(shadowPath))
                     {
                         using (var sfs = new FileStream(shadowPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                         {
-                            if (sfs.Length >= 0x20000L + 20)
+                            long[] shadowCandidates = candidates.Length > 0 ? candidates : new long[] { 0x20000L };
+                            for (int c = 0; c < shadowCandidates.Length; c++)
                             {
-                                int toRead = (int)Math.Min(16384L, sfs.Length - 0x20000L);
-                                byte[] sTable = new byte[toRead];
-                                sfs.Seek(0x20000L, SeekOrigin.Begin);
-                                int n = sfs.Read(sTable, 0, toRead);
-                                if (n >= 20 && MatchesAscii(sTable, 0, "WPRWOVL1"))
+                                long sCand = shadowCandidates[c];
+                                if (sfs.Length >= sCand + 20)
                                 {
-                                    table = sTable;
-                                    activeShadowPath = shadowPath;
-                                    vol.OverlayUsingHostShadow = true;
-                                    vol.OverlayShadowMessage = "Host shadow overlay active (loaded local host overlay for physical partition).";
+                                    int toRead = (int)Math.Min(16384L, sfs.Length - sCand);
+                                    byte[] sTable = new byte[toRead];
+                                    sfs.Seek(sCand, SeekOrigin.Begin);
+                                    int n = sfs.Read(sTable, 0, toRead);
+                                    if (n >= 20 && MatchesAscii(sTable, 0, "WPRWOVL1"))
+                                    {
+                                        table = sTable;
+                                        activeShadowPath = shadowPath;
+                                        vol.OverlayTableRelOffset = sCand;
+                                        vol.OverlayUsingHostShadow = true;
+                                        vol.OverlayShadowMessage = "Host shadow overlay active (loaded local host overlay for physical partition).";
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1005,18 +1125,11 @@ namespace WinParted.Core
                 }
 
                 if (table == null)
-                {
-                    byte[] probe = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x20000L, 4096);
-                    if (probe.Length < 20 || !MatchesAscii(probe, 0, "WPRWOVL1"))
-                        return;
-
-                    table = RawDiskEngine.ReadBytes(disk, part.StartingOffset + 0x20000L, 16384);
-                    if (table.Length < 20 || !MatchesAscii(table, 0, "WPRWOVL1"))
-                        return;
-                }
+                    return;
 
                 ulong nextData = BitConverter.ToUInt64(table, 8);
-                vol.OverlayNextDataRelOffset = (long)Math.Max(0x24000UL, nextData);
+                long minDataRel = (vol.OverlayTableRelOffset > 0 ? vol.OverlayTableRelOffset : 0x20000L) + 0x4000L;
+                vol.OverlayNextDataRelOffset = (long)Math.Max((ulong)minDataRel, nextData);
                 uint recCount = BitConverter.ToUInt32(table, 16);
 
                 int cursor = 20;

@@ -85,8 +85,27 @@ namespace WinParted.Core
             if (string.IsNullOrEmpty(op.TargetDiskPath))
                 op.TargetDiskPath = baseline.DevicePath;
 
-            // Validate the resulting layout on a simulated preview before accepting into queue
+            // Validate against the simulated pre-operation layout first (for active Windows OS boot protection)
             var simulated = GetPreviewDisk(op.TargetDiskNumber);
+            var targetPart = simulated.Partitions.FirstOrDefault(p => Math.Abs(p.StartingOffset - op.OriginalStartOffset) < 2L * 1048576L)
+                             ?? simulated.Partitions.FirstOrDefault(p => p.PartitionNumber == op.TargetPartitionNumber);
+
+            if (!baseline.IsVirtualImage && baseline.IsSystemDisk)
+            {
+                if (op.Type == OperationType.CreatePartitionTable || op.Type == OperationType.RestorePartitionTable)
+                    throw new InvalidOperationException("Safety Guardrail: Cannot erase or replace the partition table on the active Windows OS boot disk.");
+
+                if (targetPart != null && targetPart.IsSystemOrBoot &&
+                    (op.Type == OperationType.DeletePartition ||
+                     op.Type == OperationType.FormatPartition ||
+                     op.Type == OperationType.WipePartition ||
+                     op.Type == OperationType.ResizeMovePartition))
+                {
+                    throw new InvalidOperationException("Safety Guardrail: Cannot delete, format, wipe, or resize an active Windows OS/boot partition while Windows is running on it.");
+                }
+            }
+
+            // Validate the resulting layout on a simulated preview before accepting into queue
             ApplyOperationToModel(simulated, op);
             RenumberPartitions(simulated);
 
@@ -98,7 +117,7 @@ namespace WinParted.Core
             }
 
             if (string.IsNullOrEmpty(op.DiskPartScript))
-                op.DiskPartScript = BuildDiskPartScript(op);
+                op.DiskPartScript = BuildDiskPartScript(op, simulated.PartitionStyle);
             _queue.Add(op);
         }
 
@@ -486,11 +505,15 @@ namespace WinParted.Core
             if (targetPart != null)
                 op.TargetPartitionNumber = targetPart.PartitionNumber;
 
-            // Protect active system boot partition
-            if (targetPart != null && targetPart.IsSystemOrBoot &&
-                (op.Type == OperationType.DeletePartition || op.Type == OperationType.FormatPartition || op.Type == OperationType.WipePartition || op.Type == OperationType.CreatePartitionTable))
+            // Protect ONLY partitions belonging to the active running Windows OS boot disk.
+            // Partitions on USB drives or secondary disks (including ESP, MSR, Recovery, active MBR boot) remain editable.
+            if (disk.IsSystemDisk && (op.Type == OperationType.CreatePartitionTable || op.Type == OperationType.RestorePartitionTable))
+                throw new InvalidOperationException("Safety Guardrail: Cannot erase or replace the partition table on the active Windows boot/system disk.");
+
+            if (disk.IsSystemDisk && targetPart != null && targetPart.IsSystemOrBoot &&
+                (op.Type == OperationType.DeletePartition || op.Type == OperationType.FormatPartition || op.Type == OperationType.WipePartition || op.Type == OperationType.ResizeMovePartition))
             {
-                throw new InvalidOperationException("Safety Guardrail: Cannot delete, format, or wipe the active Windows boot/system partition while Windows is running on it.");
+                throw new InvalidOperationException("Safety Guardrail: Cannot delete, format, wipe, or resize the active Windows boot/system partition while Windows is running on it.");
             }
 
             if (op.Type == OperationType.ChangeLabel)
@@ -521,6 +544,84 @@ namespace WinParted.Core
                 return;
             }
 
+            if (op.Type == OperationType.RestorePartitionTable)
+            {
+                Win32DiskInterop.WipeDiskBootAndHybridHeaders(disk.DiskNumber, disk.DevicePath, disk.TotalSizeBytes, disk.LogicalSectorSize);
+                RawDiskEngine.RestorePartitionTable(disk, op.BackupFilePath);
+                return;
+            }
+
+            string script = BuildDiskPartScript(op, disk.PartitionStyle);
+
+            if (op.Type == OperationType.CreatePartitionTable)
+            {
+                // Always wipe LBA 0..255 (+0x8000 isohybrid descriptors, MBR, Primary GPT) and Backup GPT first
+                Win32DiskInterop.WipeDiskBootAndHybridHeaders(disk.DiskNumber, disk.DevicePath, disk.TotalSizeBytes, disk.LogicalSectorSize);
+                try
+                {
+                    RunDiskPartScript("rescan\r\n" + script);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Fallback: write clean GPT or MBR table directly when DiskPart refuses removable hybrid media
+                    ApplyOperationToModel(disk, op);
+                    RawDiskEngine.WritePartitionTable(disk);
+                }
+                return;
+            }
+
+            if (op.Type == OperationType.DeletePartition)
+            {
+                if (targetPart != null && targetPart.StartingOffset >= 65536L && targetPart.PartitionLength >= 4096L)
+                {
+                    try
+                    {
+                        Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
+                        int wipeLen = (int)Math.Min(65536L, (targetPart.PartitionLength / 4096L) * 4096L);
+                        if (wipeLen > 0)
+                            RawDiskEngine.WriteBytes(disk, targetPart.StartingOffset, new byte[wipeLen]);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                try
+                {
+                    RunDiskPartScript("rescan\r\n" + script);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Fallback for stubborn EFI / MSR / Recovery / isohybrid overlapping partitions
+                    if (targetPart != null)
+                    {
+                        try
+                        {
+                            Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
+                            if (targetPart.StartingOffset <= 0x8000L && targetPart.EndOffset > 0x20000L)
+                            {
+                                // Wipe ISO9660 volume descriptors (+0x8000..+0x20000) without prematurely clobbering LBA 0
+                                RawDiskEngine.WriteBytes(disk, 0x8000L, new byte[0x18000]);
+                            }
+                            else
+                            {
+                                int wipeLen = (int)Math.Min(65536L, Math.Max(4096L, (targetPart.PartitionLength / 4096L) * 4096L));
+                                if (targetPart.StartingOffset + wipeLen <= disk.TotalSizeBytes)
+                                    RawDiskEngine.WriteBytes(disk, targetPart.StartingOffset, new byte[wipeLen]);
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+
+                    ApplyOperationToModel(disk, op);
+                    RenumberPartitions(disk);
+                    RawDiskEngine.WritePartitionTable(disk);
+                }
+                return;
+            }
+
             string mappedFs = MapDiskPartFs(op.NewFileSystem);
             bool isNonWindowsCreateOrFormat =
                 (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition) &&
@@ -537,38 +638,38 @@ namespace WinParted.Core
                 RawDiskEngine.WriteFileSystemHeader(disk, targetPart);
             }
 
-            string script = string.IsNullOrEmpty(op.DiskPartScript) ? BuildDiskPartScript(op, disk.PartitionStyle) : op.DiskPartScript;
-            string tempScript = Path.Combine(Path.GetTempPath(), "winparted_" + Guid.NewGuid().ToString("N") + ".txt");
+            bool diskPartSucceeded = false;
             try
             {
-                File.WriteAllText(tempScript, script, Encoding.ASCII);
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "diskpart.exe",
-                    Arguments = "/s \"" + tempScript + "\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                using (var proc = Process.Start(psi))
-                {
-                    string stdout = proc.StandardOutput.ReadToEnd();
-                    string stderr = proc.StandardError.ReadToEnd();
-                    proc.WaitForExit();
-                    if (proc.ExitCode != 0)
-                        throw new InvalidOperationException("DiskPart failed (exit " + proc.ExitCode + "): " + stdout + " " + stderr);
-                }
+                RunDiskPartScript("rescan\r\n" + script);
+                diskPartSucceeded = true;
             }
-            finally
+            catch (InvalidOperationException)
             {
-                if (File.Exists(tempScript))
-                {
-                    try { File.Delete(tempScript); } catch { }
-                }
+                if (!isNonWindowsCreateOrFormat || (op.Type != OperationType.CreatePartition && op.Type != OperationType.FormatPartition))
+                    throw;
+
+                // Fallback for non-Windows filesystems when DiskPart cannot update layout directly
+                ApplyOperationToModel(disk, op);
+                RenumberPartitions(disk);
+                RawDiskEngine.WritePartitionTable(disk);
+                var rawTarget = disk.Partitions
+                    .Where(p => !p.IsUnallocated)
+                    .OrderBy(p => Math.Abs(p.StartingOffset - (op.Type == OperationType.CreatePartition ? op.StartOffset : op.OriginalStartOffset)))
+                    .FirstOrDefault();
+                if (rawTarget == null)
+                    throw;
+
+                Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, rawTarget.StartingOffset, true);
+                rawTarget.FileSystem = op.NewFileSystem;
+                rawTarget.Label = op.NewLabel ?? string.Empty;
+                rawTarget.UsedBytes = 0;
+                rawTarget.FreeBytes = rawTarget.PartitionLength;
+                RawDiskEngine.WriteFileSystemHeader(disk, rawTarget);
+                RawDiskEngine.InspectPartitionSuperblock(disk, rawTarget);
             }
 
-            if (isNonWindowsCreateOrFormat)
+            if (isNonWindowsCreateOrFormat && diskPartSucceeded)
             {
                 var liveDisks = Win32DiskInterop.EnumeratePhysicalDisks();
                 var liveDisk = liveDisks.FirstOrDefault(d => d.DiskNumber == disk.DiskNumber) ?? disk;
@@ -604,6 +705,39 @@ namespace WinParted.Core
                     throw new InvalidDataException(string.Format(
                         "Post-format verification failed on Disk {0} Part #{1}: expected {2}, read back {3}.",
                         liveDisk.DiskNumber, livePart.PartitionNumber, op.NewFileSystem, livePart.FileSystem));
+                }
+            }
+        }
+
+        private static void RunDiskPartScript(string script)
+        {
+            string tempScript = Path.Combine(Path.GetTempPath(), "winparted_" + Guid.NewGuid().ToString("N") + ".txt");
+            try
+            {
+                File.WriteAllText(tempScript, script, Encoding.ASCII);
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "diskpart.exe",
+                    Arguments = "/s \"" + tempScript + "\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using (var proc = Process.Start(psi))
+                {
+                    string stdout = proc.StandardOutput.ReadToEnd();
+                    string stderr = proc.StandardError.ReadToEnd();
+                    proc.WaitForExit();
+                    if (proc.ExitCode != 0)
+                        throw new InvalidOperationException("DiskPart failed (exit " + proc.ExitCode + "): " + stdout + " " + stderr);
+                }
+            }
+            finally
+            {
+                if (File.Exists(tempScript))
+                {
+                    try { File.Delete(tempScript); } catch { }
                 }
             }
         }
