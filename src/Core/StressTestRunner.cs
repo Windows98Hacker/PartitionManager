@@ -1016,7 +1016,129 @@ namespace WinParted.Core
             if (disk.Partitions[5].FileSystem != FileSystemType.ZFS || disk.Partitions[5].Label != "tank-pool")
                 throw new Exception("ZFS relabel failed.");
 
-            log("  -> Dev Filesystems Verified (native Btrfs B-tree, BE XFS IN-inodes, Ext2 direct blocks, ECMA-119 ISO9660, F2FS, ZFS, SquashFS, UDF).");
+            // Verify Fedora isohybrid-style ISO9660 partition at +0x8000 (where overlay hits offset 0x28000)
+            string isoImg = Path.Combine(tempDir, "stress8_isohybrid_0x8000.img");
+            var isoDisk = RawDiskEngine.CreateBlankVirtualDisk(isoImg, 32 * MiB, PartitionTableStyle.MBR);
+            isoDisk.DiskNumber = 94;
+            var isoPart = new PartitionEntry
+            {
+                DiskNumber = 94,
+                PartitionNumber = 1,
+                StartingOffset = 0x8000L,
+                PartitionLength = 24 * MiB,
+                MbrPartitionType = 0x17,
+                FileSystem = FileSystemType.ISO9660,
+                Label = "FEDORA-WS-LIVE",
+                LogicalSectorSize = 512,
+                PhysicalSectorSize = 4096
+            };
+            isoDisk.Partitions.Add(isoPart);
+            RawDiskEngine.WritePartitionTable(isoDisk);
+            RawDiskEngine.WriteFileSystemHeader(isoDisk, isoPart);
+
+            isoDisk = RawDiskEngine.LoadVirtualDisk(isoImg, 94);
+            AssertIntegrity(isoDisk);
+            if (isoDisk.Partitions.Count != 1 || isoDisk.Partitions[0].FileSystem != FileSystemType.ISO9660 || isoDisk.Partitions[0].StartingOffset != 0x8000L)
+                throw new Exception("isohybrid ISO9660 +0x8000 partition layout detection failed.");
+
+            try
+            {
+                var isoVol = ReadOnlyFileSystemMountEngine.MountReadOnly(isoDisk, isoDisk.Partitions[0], true);
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(isoVol, true);
+                var dir = ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(isoDisk, isoDisk.Partitions[0], isoVol, isoVol.RootNode, "fedora_ovl");
+                byte[] expectedIsoBytes = Encoding.UTF8.GetBytes("Fedora isohybrid overlay payload @ 0x28000 check\n");
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(isoDisk, isoDisk.Partitions[0], isoVol, dir, "kickstart.cfg", expectedIsoBytes);
+                var tmpDel = ReadOnlyFileSystemMountEngine.WriteFileToVolume(isoDisk, isoDisk.Partitions[0], isoVol, dir, "temp.txt", Encoding.UTF8.GetBytes("del"));
+                ReadOnlyFileSystemMountEngine.DeleteNodeFromVolume(isoDisk, isoDisk.Partitions[0], isoVol, tmpDel);
+
+                ReadOnlyFileSystemMountEngine.Unmount(isoDisk.DiskNumber, isoDisk.Partitions[0].StartingOffset);
+                var remountedIso = ReadOnlyFileSystemMountEngine.MountReadOnly(isoDisk, isoDisk.Partitions[0], true);
+                var ksNode = FindFsNodeByPath(remountedIso.RootNode, "/fedora_ovl/kickstart.cfg");
+                if (ksNode == null || FindFsNodeByPath(remountedIso.RootNode, "/fedora_ovl/temp.txt") != null)
+                    throw new Exception("ISO9660 +0x8000 experimental overlay persistence failed after remount.");
+                byte[] gotIsoBytes = ReadOnlyFileSystemMountEngine.ReadFileBytes(isoDisk, isoDisk.Partitions[0], ksNode);
+                if (Encoding.UTF8.GetString(gotIsoBytes) != Encoding.UTF8.GetString(expectedIsoBytes))
+                    throw new Exception("ISO9660 +0x8000 experimental overlay file payload mismatch.");
+
+                // Verify Host Shadow Overlay fallback when a physical drive rejects raw sector writes
+                ReadOnlyFileSystemMountEngine.ShadowOverlayRootOverride = Path.Combine(tempDir, "host_shadow_ovl");
+                var fakePhysDisk = new DiskInfo
+                {
+                    DiskNumber = 999,
+                    DevicePath = @"\\.\PhysicalDrive999",
+                    IsVirtualImage = false,
+                    Model = "TestFedoraUSB",
+                    SerialNumber = "FEDORA-TEST-USB",
+                    TotalSizeBytes = 32 * MiB,
+                    LogicalSectorSize = 512,
+                    PhysicalSectorSize = 4096
+                };
+                var fakePhysPart = new PartitionEntry
+                {
+                    DiskNumber = 999,
+                    PartitionNumber = 1,
+                    StartingOffset = 0x8000L,
+                    PartitionLength = 24 * MiB,
+                    FileSystem = FileSystemType.ISO9660,
+                    Label = "FEDORA-LIVE",
+                    UUID = "2026-11-13-00"
+                };
+                var shadowVol = new MountedReadOnlyVolume
+                {
+                    MountId = "ro_disk999_p1",
+                    MountPath = "/mnt/ro/disk999p1",
+                    DiskNumber = 999,
+                    PartitionNumber = 1,
+                    StartingOffset = fakePhysPart.StartingOffset,
+                    PartitionLength = fakePhysPart.PartitionLength,
+                    FileSystem = FileSystemType.ISO9660,
+                    Label = fakePhysPart.Label,
+                    UUID = fakePhysPart.UUID,
+                    BlockSize = 2048,
+                    OverlayNextDataRelOffset = 0x24000L,
+                    OverlayRecords = new List<OverlayRecord>(),
+                    RootNode = new VirtualFsNode { Name = "/", FullPath = "/", IsDirectory = true, PermissionsString = "dr-xr-xr-x" }
+                };
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(shadowVol, true);
+                var sDir = ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(fakePhysDisk, fakePhysPart, shadowVol, shadowVol.RootNode, "shadow_dir");
+                byte[] shadowPayload = Encoding.UTF8.GetBytes("Host shadow fallback verified for locked physical USB!");
+                var sFile = ReadOnlyFileSystemMountEngine.WriteFileToVolume(fakePhysDisk, fakePhysPart, shadowVol, sDir, "ks.cfg", shadowPayload);
+                if (!shadowVol.OverlayUsingHostShadow)
+                    throw new Exception("Physical write rejection did not activate host shadow overlay.");
+
+                byte[] gotShadowImmediate = ReadOnlyFileSystemMountEngine.ReadFileBytes(fakePhysDisk, fakePhysPart, sFile);
+                if (Encoding.UTF8.GetString(gotShadowImmediate) != Encoding.UTF8.GetString(shadowPayload))
+                    throw new Exception("Host shadow overlay immediate read mismatch.");
+
+                var reloadShadowVol = new MountedReadOnlyVolume
+                {
+                    MountId = "ro_disk999_p1",
+                    MountPath = "/mnt/ro/disk999p1",
+                    DiskNumber = 999,
+                    PartitionNumber = 1,
+                    StartingOffset = fakePhysPart.StartingOffset,
+                    PartitionLength = fakePhysPart.PartitionLength,
+                    FileSystem = FileSystemType.ISO9660,
+                    BlockSize = 2048,
+                    OverlayNextDataRelOffset = 0x24000L,
+                    OverlayRecords = new List<OverlayRecord>(),
+                    RootNode = new VirtualFsNode { Name = "/", FullPath = "/", IsDirectory = true, PermissionsString = "dr-xr-xr-x" }
+                };
+                ReadOnlyFileSystemMountEngine.LoadAndMergeExperimentalOverlay(fakePhysDisk, fakePhysPart, reloadShadowVol);
+                var reloadedNode = FindFsNodeByPath(reloadShadowVol.RootNode, "/shadow_dir/ks.cfg");
+                if (!reloadShadowVol.OverlayUsingHostShadow || reloadedNode == null)
+                    throw new Exception("Host shadow overlay reload failed to restore /shadow_dir/ks.cfg.");
+                byte[] gotShadowReload = ReadOnlyFileSystemMountEngine.ReadFileBytes(fakePhysDisk, fakePhysPart, reloadedNode);
+                if (Encoding.UTF8.GetString(gotShadowReload) != Encoding.UTF8.GetString(shadowPayload))
+                    throw new Exception("Host shadow overlay reloaded payload mismatch.");
+            }
+            finally
+            {
+                ReadOnlyFileSystemMountEngine.ShadowOverlayRootOverride = null;
+                ReadOnlyFileSystemMountEngine.UnmountAll();
+            }
+
+            log("  -> Dev Filesystems Verified (native Btrfs B-tree, BE XFS IN-inodes, Ext2 direct blocks, ECMA-119 ISO9660, F2FS, ZFS, SquashFS, UDF + 0x28000/shadow RW overlay).");
         }
 
         private static void VerifyRoMountAndFile(DiskInfo disk, PartitionEntry part, string fullPath, string expectedSubstring)
