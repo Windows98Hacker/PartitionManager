@@ -250,12 +250,13 @@ namespace WinParted.UI
 
             var mainSplit = new SplitContainer
             {
+                Size = new Size(1000, 600),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
-                Panel1MinSize = 110,
-                Panel2MinSize = 180,
-                SplitterDistance = 250
+                Panel1MinSize = 25,
+                Panel2MinSize = 25
             };
+            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 260);
 
             _gridPartitions = new DataGridView
             {
@@ -307,12 +308,13 @@ namespace WinParted.UI
             // Bottom Split: Left = Pending Operations Queue | Right = Integrated Foreign Filesystem Explorer
             var bottomSplit = new SplitContainer
             {
+                Size = new Size(1000, 320),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Vertical,
-                Panel1MinSize = 200,
-                Panel2MinSize = 360,
-                SplitterDistance = 300
+                Panel1MinSize = 25,
+                Panel2MinSize = 25
             };
+            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 300);
 
             var opsHeader = new Panel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(8, 6, 8, 4), Tag = "ElevatedPanel" };
             opsHeader.Controls.Add(new Label { Text = "Pending Operations Queue (Safe Until 'Apply All')", Dock = DockStyle.Left, AutoSize = true, Font = new Font("Segoe UI", 8.8f, FontStyle.Bold) });
@@ -383,6 +385,11 @@ namespace WinParted.UI
             Controls.Add(statusPanel);
 
             ThemeManager.ThemeChanged += OnThemeChangedHandler;
+            Load += (s, e) =>
+            {
+                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 260);
+                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 320);
+            };
             FormClosed += (s, e) => ThemeManager.ThemeChanged -= OnThemeChangedHandler;
             ApplyMainFormTheme();
         }

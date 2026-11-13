@@ -833,7 +833,34 @@ namespace WinParted.Core
                 ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, p.StartingOffset);
             }
 
-            log("  -> Stress 8 PASSED (6 foreign FSs mounted RO, searched, recursive host copied, & experimental RW verified on virtual test disk).");
+            // 6. GUI Instantiation & Layout Smoke Test (MainForm, FileSystemBrowserDialog, HexInspectorDialog)
+            using (var mainForm = new MainForm())
+            {
+                mainForm.CreateControl();
+                mainForm.PerformLayout();
+            }
+
+            var uiPart = disk.Partitions[4];
+            var uiVol = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, uiPart, true);
+            try
+            {
+                using (var browserDlg = new WinParted.UI.Dialogs.FileSystemBrowserDialog(disk, uiPart, uiVol))
+                {
+                    browserDlg.CreateControl();
+                    browserDlg.PerformLayout();
+                }
+                using (var hexDlg = new WinParted.UI.Dialogs.HexSectorInspectorDialog(disk, uiPart.StartLba))
+                {
+                    hexDlg.CreateControl();
+                    hexDlg.PerformLayout();
+                }
+            }
+            finally
+            {
+                ReadOnlyFileSystemMountEngine.UnmountAll();
+            }
+
+            log("  -> Stress 8 PASSED (6 foreign FSs mounted RO, searched, recursive host copied, experimental RW & GUI layout verified).");
         }
 
         private static void VerifyRoMountAndFile(DiskInfo disk, PartitionEntry part, string fullPath, string expectedSubstring)

@@ -46,6 +46,7 @@ namespace WinParted.UI
 
         public IntegratedFileSystemExplorerControl()
         {
+            Size = new Size(920, 520);
             Dock = DockStyle.Fill;
             Font = new Font("Segoe UI", 8.8f);
 
@@ -245,12 +246,13 @@ namespace WinParted.UI
             // 3. Center Tree + Entries List + File Preview
             var mainSplit = new SplitContainer
             {
+                Size = new Size(700, 420),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Vertical,
-                Panel1MinSize = 40,
-                Panel2MinSize = 40,
-                SplitterDistance = 155
+                Panel1MinSize = 25,
+                Panel2MinSize = 25
             };
+            SetSplitterDistanceSafe(mainSplit, 165);
 
             _treeDirs = new TreeView
             {
@@ -263,12 +265,13 @@ namespace WinParted.UI
 
             var rightSplit = new SplitContainer
             {
+                Size = new Size(700, 420),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
-                Panel1MinSize = 35,
-                Panel2MinSize = 35,
-                SplitterDistance = 115
+                Panel1MinSize = 25,
+                Panel2MinSize = 25
             };
+            SetSplitterDistanceSafe(rightSplit, 115);
             mainSplit.Panel2.Controls.Add(rightSplit);
 
             _lvEntries = new ListView
@@ -339,7 +342,23 @@ namespace WinParted.UI
             Controls.Add(_experimentalPanel);
             Controls.Add(_topBar);
 
+            Load += (s, e) =>
+            {
+                SetSplitterDistanceSafe(mainSplit, 165);
+                SetSplitterDistanceSafe(rightSplit, 115);
+            };
+
             ThemeManager.ApplyTheme(this);
+        }
+
+        internal static void SetSplitterDistanceSafe(SplitContainer sc, int desired)
+        {
+            if (sc == null || sc.IsDisposed) return;
+            int total = (sc.Orientation == Orientation.Vertical) ? sc.Width : sc.Height;
+            int min = sc.Panel1MinSize;
+            int max = total - sc.Panel2MinSize - sc.SplitterWidth;
+            if (max < min) return;
+            sc.SplitterDistance = Math.Max(min, Math.Min(max, desired));
         }
 
         private Button MakeExperimentalButton(string text)
