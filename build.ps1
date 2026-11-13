@@ -19,28 +19,28 @@ $refs = @(
     "System.Windows.Forms.dll"
 )
 
-function Build-Target($compiler, $platform, $outName) {
+function Invoke-TargetBuild($compiler, $platform, $outName) {
     $outPath = Join-Path $binDir $outName
     Write-Host "Building $outName (/platform:$platform)..." -ForegroundColor Cyan
-    $args = @(
+    $compilerArgs = @(
         "/nologo",
         "/target:winexe",
         "/optimize+",
         "/platform:$platform",
         "/out:$outPath"
     )
-    foreach ($r in $refs) { $args += "/reference:$r" }
-    $args += $sources
+    foreach ($r in $refs) { $compilerArgs += "/reference:$r" }
+    $compilerArgs += $sources
 
-    & $compiler @args
+    & $compiler @compilerArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Compilation failed for $outName (exit $LASTEXITCODE)"
     }
     Write-Host "  -> Built $outPath" -ForegroundColor Green
 }
 
-Build-Target $csc32 "x86" "WinParted-x86.exe"
-Build-Target $csc64 "x64" "WinParted-x64.exe"
-Build-Target $csc64 "anycpu" "WinParted.exe"
+Invoke-TargetBuild $csc32 "x86" "WinParted-x86.exe"
+Invoke-TargetBuild $csc64 "x64" "WinParted-x64.exe"
+Invoke-TargetBuild $csc64 "anycpu" "WinParted.exe"
 
 Write-Host "`nAll 32-bit (x86), 64-bit (x64), and Universal (AnyCPU) builds succeeded!" -ForegroundColor Green
