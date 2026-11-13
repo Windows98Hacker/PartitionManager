@@ -699,6 +699,17 @@ namespace WinParted.Core
             if (disk.Partitions.Count != 6)
                 throw new Exception("Expected 6 non-Microsoft partitions in Stress 8 image, got " + disk.Partitions.Count);
 
+            // Strip WinParted synthetic hints (WPL: and WPROFS01) from HFS+ partition so label + catalog tree are proven to come purely from Big-Endian HFS+ B-Tree
+            var hfsPartRaw = disk.Partitions[4];
+            hfsPartRaw.Label = string.Empty;
+            byte[] zeroSlot = new byte[32];
+            RawDiskEngine.WriteBytes(disk, hfsPartRaw.StartingOffset + 0x1A0, zeroSlot);
+            RawDiskEngine.WriteBytes(disk, hfsPartRaw.StartingOffset + 0x3000, new byte[4096]);
+
+            disk = RawDiskEngine.LoadVirtualDisk(imgPath, 98);
+            if (disk.Partitions[4].Label != "ro-hfsplus")
+                throw new Exception("HFS+ Catalog B-Tree volume label extraction failed: got '" + disk.Partitions[4].Label + "'");
+
             byte[] beforeBytes = File.ReadAllBytes(imgPath);
             uint crcBeforeMount = Crc32.Compute(beforeBytes, 0, beforeBytes.Length);
 
@@ -712,8 +723,10 @@ namespace WinParted.Core
                 VerifyRoMountAndFile(disk, disk.Partitions[1], "/etc/filesystems", "btrfs");
                 VerifyRoMountAndFile(disk, disk.Partitions[2], "/home/ReadMe.txt", "XFS");
 
-                // 3. Apple APFS, HFS+, Classic HFS
+                // 3. Apple APFS, pure Big-Endian HFS+ Catalog B-Tree, Classic HFS
                 VerifyRoMountAndFile(disk, disk.Partitions[3], "/System/Library/CoreServices/SystemVersion.plist", "<string>apfs</string>");
+                VerifyRoMountAndFile(disk, disk.Partitions[4], "/.hfsplus_volume_info.txt", "Catalog B-Tree Summary");
+                VerifyRoMountAndFile(disk, disk.Partitions[4], "/System/Library/CoreServices/SystemVersion.plist", "<string>hfs+</string>");
                 VerifyRoMountAndFile(disk, disk.Partitions[4], "/Users/Shared/ReadMe.txt", "hfs+");
                 VerifyRoMountAndFile(disk, disk.Partitions[5], "/.VolumeLabel", "ro-hfs");
             }

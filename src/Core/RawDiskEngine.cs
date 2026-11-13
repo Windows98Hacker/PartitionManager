@@ -59,7 +59,7 @@ namespace WinParted.Core
                 }
             }
 
-            return Win32DiskInterop.ReadRawDiskSectors(disk.DevicePath, offset, length);
+            return Win32DiskInterop.ReadRawDiskSectors(disk.DevicePath, disk.DiskNumber, offset, length);
         }
 
         public static void WriteBytes(DiskInfo disk, long offset, byte[] data)
@@ -994,6 +994,12 @@ namespace WinParted.Core
                     string hfsLbl = ReadCustomLabelHint(data, 0x1A0);
                     if (!string.IsNullOrEmpty(hfsLbl))
                         part.Label = hfsLbl;
+                    else
+                    {
+                        string btreeLbl = TryReadHfsPlusVolumeLabel(disk, part, data);
+                        if (!string.IsNullOrEmpty(btreeLbl))
+                            part.Label = btreeLbl;
+                    }
                     if (totalBlocks > 0 && freeBlocks <= totalBlocks)
                     {
                         part.FreeBytes = Math.Min(part.PartitionLength, (long)freeBlocks * blockSize);
@@ -1979,6 +1985,11 @@ namespace WinParted.Core
                 specs.Add(new RoCatalogSpec { Id = 7, ParentId = 6, IsDir = false, Mode = 0x81A4, DataOffset = 0x4000UL, Data = macReadme, Name = "ReadMe.txt", FullPath = "/Users/Shared/ReadMe.txt" });
                 specs.Add(new RoCatalogSpec { Id = 8, ParentId = 4, IsDir = false, Mode = 0x81A4, DataOffset = 0x5000UL, Data = plistBytes, Name = "SystemVersion.plist", FullPath = "/System/Library/CoreServices/SystemVersion.plist" });
                 specs.Add(new RoCatalogSpec { Id = 9, ParentId = 1, IsDir = false, Mode = 0x81A4, DataOffset = 0x6000UL, Data = labelFile, Name = ".VolumeLabel", FullPath = "/.VolumeLabel" });
+
+                if (part.FileSystem == FileSystemType.HFSPlus && buf.Length >= 0xA000)
+                {
+                    PopulateHfsPlusCatalogBTree(buf, part, macReadme, plistBytes, labelFile);
+                }
             }
             else
             {
@@ -2039,6 +2050,176 @@ namespace WinParted.Core
             }
         }
 
+        private static string TryReadHfsPlusVolumeLabel(DiskInfo disk, PartitionEntry part, byte[] vhData)
+        {
+            try
+            {
+                if (vhData == null || vhData.Length < 0x560) return string.Empty;
+                uint blockSize = ReadUInt32BE(vhData, 0x428);
+                if (blockSize < 512) blockSize = 4096;
+
+                uint catStart0 = ReadUInt32BE(vhData, 0x520);
+                uint catCount0 = ReadUInt32BE(vhData, 0x524);
+                if (catStart0 == 0 || catCount0 == 0) return string.Empty;
+
+                long node0Off = part.StartingOffset + (long)catStart0 * blockSize;
+                if (node0Off < part.StartingOffset || node0Off + 512 > part.EndOffset) return string.Empty;
+
+                byte[] node0 = ReadBytes(disk, node0Off, 512);
+                if (node0.Length < 44 || (sbyte)node0[8] != 1) return string.Empty;
+
+                uint firstLeaf = ReadUInt32BE(node0, 24);
+                ushort nodeSize = ReadUInt16BE(node0, 32);
+                if (firstLeaf == 0 || nodeSize < 512 || (nodeSize & (nodeSize - 1)) != 0)
+                    return string.Empty;
+
+                long logicalTarget = (long)firstLeaf * nodeSize;
+                long extLogicalStart = 0;
+                long leafPhysOff = -1;
+                for (int i = 0; i < 8; i++)
+                {
+                    uint st = ReadUInt32BE(vhData, 0x520 + i * 8);
+                    uint cnt = ReadUInt32BE(vhData, 0x520 + i * 8 + 4);
+                    if (cnt == 0) break;
+                    long extBytes = (long)cnt * blockSize;
+                    if (logicalTarget >= extLogicalStart && logicalTarget + nodeSize <= extLogicalStart + extBytes)
+                    {
+                        leafPhysOff = part.StartingOffset + (long)st * blockSize + (logicalTarget - extLogicalStart);
+                        break;
+                    }
+                    extLogicalStart += extBytes;
+                }
+
+                if (leafPhysOff < part.StartingOffset || leafPhysOff + nodeSize > part.EndOffset)
+                    return string.Empty;
+
+                byte[] leaf = ReadBytes(disk, leafPhysOff, nodeSize);
+                if (leaf.Length < nodeSize || (sbyte)leaf[8] != -1) return string.Empty;
+
+                ushort recCount = ReadUInt16BE(leaf, 10);
+                if (recCount == 0) return string.Empty;
+
+                int recOff = ReadUInt16BE(leaf, nodeSize - 2);
+                if (recOff < 14 || recOff + 10 > nodeSize) return string.Empty;
+
+                ushort keyLen = ReadUInt16BE(leaf, recOff);
+                uint parentId = ReadUInt32BE(leaf, recOff + 2);
+                ushort nameChars = ReadUInt16BE(leaf, recOff + 6);
+                if (parentId != 1 || keyLen < 6 || 6 + nameChars * 2 > keyLen || recOff + 8 + nameChars * 2 > nodeSize)
+                    return string.Empty;
+
+                int dataOff = recOff + 2 + keyLen;
+                if ((dataOff & 1) != 0) dataOff++;
+                if (dataOff + 12 > nodeSize) return string.Empty;
+
+                ushort recType = ReadUInt16BE(leaf, dataOff);
+                uint folderId = ReadUInt32BE(leaf, dataOff + 8);
+                if (recType == 1 && folderId == 2 && nameChars > 0)
+                    return Encoding.BigEndianUnicode.GetString(leaf, recOff + 8, nameChars * 2).TrimEnd('\0');
+            }
+            catch
+            {
+            }
+            return string.Empty;
+        }
+
+        private static void PopulateHfsPlusCatalogBTree(byte[] buf, PartitionEntry part, byte[] macReadme, byte[] plistBytes, byte[] labelFile)
+        {
+            const int nodeSize = 4096;
+            const int node0Off = 0x8000;
+            const int node1Off = 0x9000;
+            if (buf.Length < node1Off + nodeSize) return;
+
+            // Volume Header catalogFile fork (offset 0x510 in unwrapped VH at 0x400)
+            WriteUInt64BE(buf, 0x510, (ulong)(2 * nodeSize)); // logicalSize = 8192
+            WriteUInt32BE(buf, 0x518, nodeSize);              // clumpSize
+            WriteUInt32BE(buf, 0x51C, 2);                     // totalBlocks
+            WriteUInt32BE(buf, 0x520, 8);                     // extents[0].startBlock (8 * 4096 = 0x8000)
+            WriteUInt32BE(buf, 0x524, 2);                     // extents[0].blockCount
+
+            // Node 0: B-Tree Header Node
+            buf[node0Off + 8] = 1;                            // kind = kBTHeaderNode
+            WriteUInt16BE(buf, node0Off + 10, 3);             // numRecords = 3
+            WriteUInt16BE(buf, node0Off + 14, 1);             // treeDepth = 1
+            WriteUInt32BE(buf, node0Off + 16, 1);             // rootNode = 1
+            WriteUInt32BE(buf, node0Off + 20, 9);             // leafRecords = 9
+            WriteUInt32BE(buf, node0Off + 24, 1);             // firstLeafNode = 1
+            WriteUInt32BE(buf, node0Off + 28, 1);             // lastLeafNode = 1
+            WriteUInt16BE(buf, node0Off + 32, nodeSize);      // nodeSize = 4096
+            WriteUInt16BE(buf, node0Off + 34, 516);           // maxKeyLength
+            WriteUInt32BE(buf, node0Off + 36, 2);             // totalNodes = 2
+            WriteUInt32BE(buf, node0Off + 40, 0);             // freeNodes = 0
+            WriteUInt16BE(buf, node0Off + nodeSize - 2, 14);
+            WriteUInt16BE(buf, node0Off + nodeSize - 4, 120);
+            WriteUInt16BE(buf, node0Off + nodeSize - 6, 248);
+            WriteUInt16BE(buf, node0Off + nodeSize - 8, 512);
+
+            // Node 1: B-Tree Leaf Node
+            buf[node1Off + 8] = 0xFF;                         // kind = kBTLeafNode (-1)
+            buf[node1Off + 9] = 1;                            // height = 1
+
+            string volLabel = string.IsNullOrEmpty(part.Label) ? "Macintosh HD" : part.Label;
+            int cursor = 14;
+            var recOffsets = new List<int>();
+
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 1, 2, volLabel);
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 2, 16, "System");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 16, 17, "Library");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 17, 18, "CoreServices");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 2, 19, "Users");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 19, 20, "Shared");
+            cursor = WriteHfsFileRecord(buf, node1Off, cursor, recOffsets, 2, 21, ".VolumeLabel", (ulong)labelFile.Length, 6, 1);
+            cursor = WriteHfsFileRecord(buf, node1Off, cursor, recOffsets, 18, 22, "SystemVersion.plist", (ulong)plistBytes.Length, 5, 1);
+            cursor = WriteHfsFileRecord(buf, node1Off, cursor, recOffsets, 20, 23, "ReadMe.txt", (ulong)macReadme.Length, 4, 1);
+
+            WriteUInt16BE(buf, node1Off + 10, (ushort)recOffsets.Count);
+            for (int i = 0; i < recOffsets.Count; i++)
+                WriteUInt16BE(buf, node1Off + nodeSize - 2 * (i + 1), (ushort)recOffsets[i]);
+            WriteUInt16BE(buf, node1Off + nodeSize - 2 * (recOffsets.Count + 1), (ushort)cursor);
+        }
+
+        private static int WriteHfsCatalogKey(byte[] buf, int nodeOff, int cursor, uint parentId, string name)
+        {
+            byte[] utf16 = Encoding.BigEndianUnicode.GetBytes(name);
+            ushort nameChars = (ushort)(utf16.Length / 2);
+            ushort keyLen = (ushort)(6 + utf16.Length);
+            int p = nodeOff + cursor;
+            WriteUInt16BE(buf, p, keyLen);
+            WriteUInt32BE(buf, p + 2, parentId);
+            WriteUInt16BE(buf, p + 6, nameChars);
+            Array.Copy(utf16, 0, buf, p + 8, utf16.Length);
+            int next = cursor + 2 + keyLen;
+            if ((next & 1) != 0) next++;
+            return next;
+        }
+
+        private static int WriteHfsFolderRecord(byte[] buf, int nodeOff, int cursor, List<int> recOffsets, uint parentId, uint folderId, string name)
+        {
+            recOffsets.Add(cursor);
+            int dataRel = WriteHfsCatalogKey(buf, nodeOff, cursor, parentId, name);
+            int d = nodeOff + dataRel;
+            WriteUInt16BE(buf, d, 1);              // kHFSPlusFolderRecord
+            WriteUInt32BE(buf, d + 4, 1);          // valence
+            WriteUInt32BE(buf, d + 8, folderId);
+            WriteUInt16BE(buf, d + 42, 0x41ED);    // drwxr-xr-x
+            return dataRel + 88;
+        }
+
+        private static int WriteHfsFileRecord(byte[] buf, int nodeOff, int cursor, List<int> recOffsets, uint parentId, uint fileId, string name, ulong logicalSize, uint startBlock, uint blockCount)
+        {
+            recOffsets.Add(cursor);
+            int dataRel = WriteHfsCatalogKey(buf, nodeOff, cursor, parentId, name);
+            int d = nodeOff + dataRel;
+            WriteUInt16BE(buf, d, 2);              // kHFSPlusFileRecord
+            WriteUInt32BE(buf, d + 8, fileId);
+            WriteUInt16BE(buf, d + 42, 0x81A4);    // -rw-r--r--
+            WriteUInt64BE(buf, d + 88, logicalSize);
+            WriteUInt32BE(buf, d + 100, blockCount);
+            WriteUInt32BE(buf, d + 104, startBlock);
+            WriteUInt32BE(buf, d + 108, blockCount);
+            return dataRel + 248;
+        }
+
         private static ushort ReadUInt16BE(byte[] data, int offset)
         {
             return (ushort)((data[offset] << 8) | data[offset + 1]);
@@ -2061,6 +2242,12 @@ namespace WinParted.Core
             data[offset + 1] = (byte)((val >> 16) & 0xFF);
             data[offset + 2] = (byte)((val >> 8) & 0xFF);
             data[offset + 3] = (byte)(val & 0xFF);
+        }
+
+        private static void WriteUInt64BE(byte[] data, int offset, ulong val)
+        {
+            WriteUInt32BE(data, offset, (uint)(val >> 32));
+            WriteUInt32BE(data, offset + 4, (uint)(val & 0xFFFFFFFFUL));
         }
 
         private static bool MatchesAscii(byte[] data, int offset, string text)
