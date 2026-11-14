@@ -305,12 +305,13 @@ namespace WinParted.UI
             _topBar.Controls.Add(row2);
             _topBar.Controls.Add(row1);
 
-            // 2. Right Side Panel — Vivid Red Experimental Write Mode
+            // 2. Right Side Panel — Vivid Red Experimental Write Mode (only visible when mounted on an unsupported FS)
             _experimentalPanel = new Panel
             {
                 Dock = DockStyle.Right,
                 Width = 216,
                 Padding = new Padding(10),
+                Visible = false,
                 Tag = "ExperimentalPanel"
             };
             _experimentalPanel.Paint += OnExperimentalPanelPaint;
@@ -566,23 +567,43 @@ namespace WinParted.UI
                 SetSplitterDistanceSafe(_rightSplit, 240);
             };
 
-            EnableDoubleBuffering(_treeDirs);
-            EnableDoubleBuffering(_lvEntries);
+            EnableSmoothRepaint(this);
+            EnableSmoothRepaint(_experimentalPanel);
+            EnableSmoothRepaint(expHeader);
+            EnableSmoothRepaint(lblExpWarn);
+            EnableSmoothRepaint(expButtonsStack);
+            EnableSmoothRepaint(_topBar);
+            EnableSmoothRepaint(_statusBar);
+            EnableSmoothRepaint(_mainSplit);
+            EnableSmoothRepaint(_mainSplit.Panel1);
+            EnableSmoothRepaint(_mainSplit.Panel2);
+            EnableSmoothRepaint(_rightSplit);
+            EnableSmoothRepaint(_rightSplit.Panel1);
+            EnableSmoothRepaint(_rightSplit.Panel2);
+            EnableSmoothRepaint(_treeDirs);
+            EnableSmoothRepaint(_lvEntries);
+            EnableSmoothRepaint(previewContainer);
+            EnableSmoothRepaint(previewBar);
             ThemeManager.ApplyTheme(this);
         }
 
-        private static void EnableDoubleBuffering(Control ctrl)
+        private static void EnableSmoothRepaint(Control ctrl)
         {
             if (ctrl == null) return;
             try
             {
-                var prop = typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                if (prop != null)
-                    prop.SetValue(ctrl, true, null);
+                var dbProp = typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (dbProp != null)
+                    dbProp.SetValue(ctrl, true, null);
+                var rrProp = typeof(Control).GetProperty("ResizeRedraw", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (rrProp != null)
+                    rrProp.SetValue(ctrl, true, null);
             }
             catch
             {
             }
+            ctrl.Resize += (s, e) => { if (!ctrl.IsDisposed) ctrl.Invalidate(true); };
+            ctrl.SizeChanged += (s, e) => { if (!ctrl.IsDisposed) ctrl.Invalidate(true); };
         }
 
         private Button MakeNavButton(string symbol, string tip)
@@ -759,9 +780,14 @@ namespace WinParted.UI
         private void OnExperimentalPanelPaint(object sender, PaintEventArgs e)
         {
             var r = _experimentalPanel.ClientRectangle;
+            using (var bg = new SolidBrush(_experimentalPanel.BackColor))
+            {
+                e.Graphics.FillRectangle(bg, r);
+            }
             using (var pen = new Pen(ThemeManager.AccentRed, 2))
             {
-                e.Graphics.DrawRectangle(pen, 1, 1, Math.Max(1, r.Width - 2), Math.Max(1, r.Height - 2));
+                pen.Alignment = PenAlignment.Inset;
+                e.Graphics.DrawRectangle(pen, 0, 0, Math.Max(1, r.Width - 1), Math.Max(1, r.Height - 1));
             }
         }
 
@@ -828,6 +854,7 @@ namespace WinParted.UI
             _btnUp.Enabled = false;
             _btnCopySelectedToHost.Enabled = false;
             _btnCopyFolderToHost.Enabled = false;
+            _experimentalPanel.Visible = false;
             _chkExperimentalWrite.Enabled = false;
             SetExperimentalWriteUiChecked(false);
 
@@ -865,6 +892,7 @@ namespace WinParted.UI
             _btnUp.Enabled = false;
             _btnCopySelectedToHost.Enabled = false;
             _btnCopyFolderToHost.Enabled = false;
+            _experimentalPanel.Visible = false;
             _chkExperimentalWrite.Enabled = false;
             SetExperimentalWriteUiChecked(false);
 
@@ -880,6 +908,9 @@ namespace WinParted.UI
 
         private void RenderMountedVolume()
         {
+            bool showExperimental = (_volume != null && _partition != null && !_partition.IsUnallocated &&
+                ReadOnlyFileSystemMountEngine.IsSupportedNonMicrosoftFs(_partition.FileSystem));
+
             _btnMountNow.Visible = true;
             _btnMountNow.Text = "Refresh";
             _txtSearch.Enabled = true;
@@ -887,12 +918,15 @@ namespace WinParted.UI
             _btnSearch.Enabled = true;
             _btnClearSearch.Enabled = _isSearchActive;
             _btnCopyFolderToHost.Enabled = (_volume != null && _volume.RootNode != null && !_copyInProgress);
-            _chkExperimentalWrite.Enabled = (_volume != null);
+            _experimentalPanel.Visible = showExperimental;
+            _chkExperimentalWrite.Enabled = (_volume != null && showExperimental);
 
             SetExperimentalWriteUiChecked(_volume != null && _volume.ExperimentalWriteEnabled);
             UpdateBannerText();
             PopulateDirectoryTree();
             UpdateExperimentalActionStates();
+            if (showExperimental)
+                _experimentalPanel.Invalidate(true);
         }
 
         private void UpdateBannerText()

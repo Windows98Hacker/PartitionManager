@@ -31,23 +31,18 @@ namespace WinParted.UI
         private ComboBox _cmbDrives;
         private Label _lblArchBadge;
         private Button _btnElevate;
-        private CheckBox _chkSmartScale;
-        private CheckBox _chkDarkMode;
         private ToolStripMenuItem _miDarkMode;
         private PartitionRibbonControl _ribbon;
+        private SplitContainer _mainSplit;
         private Panel _deviceInfoPanel;
         private Label _lblDeviceInfo;
         private DataGridView _gridPartitions;
         private ListView _lvOperations;
-        private IntegratedFileSystemExplorerControl _integratedExplorer;
-        private int _boundExplorerDisk = -1;
-        private long _boundExplorerOffset = -1;
-        private MountedReadOnlyVolume _boundExplorerVolume;
         private Label _lblStatus;
         private ContextMenuStrip _partContextMenu;
-        private Button _btnFormatDrive;
 
-        private ToolStripButton _tbNew, _tbDelete, _tbResize, _tbCopy, _tbPaste, _tbFormat, _tbFlags, _tbWipe, _tbMountRo, _tbBrowseFs, _tbFormatDrive, _tbUndo, _tbApply;
+        private ToolStripButton _tbNew, _tbDelete, _tbResize, _tbCopy, _tbPaste, _tbFlags, _tbWipe, _tbMountRo, _tbBrowseFs, _tbUndo, _tbApply;
+        private ToolStripSplitButton _tbFormat;
 
         public MainForm()
         {
@@ -58,6 +53,7 @@ namespace WinParted.UI
             Font = new Font("Segoe UI", 9f);
             BackColor = ThemeManager.BackPrimary;
             DoubleBuffered = true;
+            ResizeRedraw = true;
 
             BuildUi();
             LoadInitialDisks();
@@ -68,22 +64,29 @@ namespace WinParted.UI
             if (control == null) return;
             try
             {
-                var prop = typeof(Control).GetProperty(
+                var dbProp = typeof(Control).GetProperty(
                     "DoubleBuffered",
                     System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                if (prop != null) prop.SetValue(control, true, null);
+                if (dbProp != null) dbProp.SetValue(control, true, null);
+
+                var rrProp = typeof(Control).GetProperty(
+                    "ResizeRedraw",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (rrProp != null) rrProp.SetValue(control, true, null);
             }
             catch { }
+            control.Resize += (s, e) => { if (!control.IsDisposed) control.Invalidate(true); };
+            control.SizeChanged += (s, e) => { if (!control.IsDisposed) control.Invalidate(true); };
         }
 
         private void BuildUi()
         {
-            // 1. MenuStrip
+            // 1. GParted-Style MenuStrip
             var menu = new MenuStrip();
 
-            var mApp = new ToolStripMenuItem("WinParted");
+            var mApp = new ToolStripMenuItem("GParted");
             mApp.DropDownItems.Add("Refresh Devices (F5)", null, (s, e) => RefreshAllDisks());
-            mApp.DropDownItems.Add("Create / Load Demo Virtual Disk (.img)", null, (s, e) => CreateAndMountDemoDisk());
+            mApp.DropDownItems.Add("Create / Reset Demo Virtual Disk (.img)", null, (s, e) => CreateAndMountDemoDisk());
             mApp.DropDownItems.Add("Open Virtual Disk Image (.img / .vhd)...", null, (s, e) => OpenVirtualDiskDialog());
             mApp.DropDownItems.Add("New Blank Virtual Disk...", null, (s, e) => CreateBlankVirtualDiskDialog());
             mApp.DropDownItems.Add(new ToolStripSeparator());
@@ -91,15 +94,21 @@ namespace WinParted.UI
 
             var mEdit = new ToolStripMenuItem("Edit");
             mEdit.DropDownItems.Add("Undo Last Operation", null, (s, e) => UndoOperation());
-            mEdit.DropDownItems.Add("Clear All Pending Operations", null, (s, e) => ClearOperations());
+            mEdit.DropDownItems.Add("Clear All Operations", null, (s, e) => ClearOperations());
             mEdit.DropDownItems.Add(new ToolStripSeparator());
             mEdit.DropDownItems.Add("Apply All Operations", null, (s, e) => ApplyOperations());
 
             var mView = new ToolStripMenuItem("View");
             var miDeviceInfo = new ToolStripMenuItem("Device Information") { Checked = true, CheckOnClick = true };
             miDeviceInfo.CheckedChanged += (s, e) => _deviceInfoPanel.Visible = miDeviceInfo.Checked;
+            var miPendingOps = new ToolStripMenuItem("Pending Operations") { Checked = true, CheckOnClick = true };
+            miPendingOps.CheckedChanged += (s, e) =>
+            {
+                if (_mainSplit != null)
+                    _mainSplit.Panel2Collapsed = !miPendingOps.Checked;
+            };
             var miSmartScale = new ToolStripMenuItem("Smart Partition Scale") { Checked = true, CheckOnClick = true };
-            miSmartScale.CheckedChanged += (s, e) => { _chkSmartScale.Checked = miSmartScale.Checked; _ribbon.SmartScale = miSmartScale.Checked; };
+            miSmartScale.CheckedChanged += (s, e) => { if (_ribbon != null) _ribbon.SmartScale = miSmartScale.Checked; };
             _miDarkMode = new ToolStripMenuItem("Dark Mode (Easy on Eyes)") { Checked = ThemeManager.IsDarkMode, CheckOnClick = true };
             _miDarkMode.CheckedChanged += (s, e) =>
             {
@@ -107,6 +116,7 @@ namespace WinParted.UI
                     ThemeManager.ToggleTheme();
             };
             mView.DropDownItems.Add(miDeviceInfo);
+            mView.DropDownItems.Add(miPendingOps);
             mView.DropDownItems.Add(miSmartScale);
             mView.DropDownItems.Add(new ToolStripSeparator());
             mView.DropDownItems.Add(_miDarkMode);
@@ -114,9 +124,6 @@ namespace WinParted.UI
             var mDevice = new ToolStripMenuItem("Device");
             mDevice.DropDownItems.Add("Create Partition Table (GPT)...", null, (s, e) => QueueCreatePartitionTable(PartitionTableStyle.GPT));
             mDevice.DropDownItems.Add("Create Partition Table (MBR)...", null, (s, e) => QueueCreatePartitionTable(PartitionTableStyle.MBR));
-            mDevice.DropDownItems.Add(new ToolStripSeparator());
-            mDevice.DropDownItems.Add("Format Entire Drive...", null, (s, e) => QueueFormatEntireDrive());
-            mDevice.DropDownItems.Add("Wipe Boot Sector & Hybrid ISO Headers...", null, (s, e) => WipeBootSectorInteractive());
             mDevice.DropDownItems.Add(new ToolStripSeparator());
             mDevice.DropDownItems.Add("Backup Partition Table (.gptbak)...", null, (s, e) => BackupPartitionTable());
             mDevice.DropDownItems.Add("Restore Partition Table (.gptbak)...", null, (s, e) => RestorePartitionTable());
@@ -129,13 +136,17 @@ namespace WinParted.UI
             mPart.DropDownItems.Add("Copy", null, (s, e) => CopySelectedPartition());
             mPart.DropDownItems.Add("Paste", null, (s, e) => PastePartitionToUnallocated());
             mPart.DropDownItems.Add(new ToolStripSeparator());
-            mPart.DropDownItems.Add("Format To...", null, (s, e) => QueueFormatPartition());
+            var mPartFormatTo = new ToolStripMenuItem("Format to");
+            mPartFormatTo.DropDownItems.AddRange(BuildFormatToMenuItems());
+            mPart.DropDownItems.Add(mPartFormatTo);
             mPart.DropDownItems.Add("Label / Name...", null, (s, e) => QueueLabelPartition());
             mPart.DropDownItems.Add("Manage Flags...", null, (s, e) => QueueManageFlags());
             mPart.DropDownItems.Add("Secure Wipe...", null, (s, e) => QueueWipePartition());
             mPart.DropDownItems.Add(new ToolStripSeparator());
             mPart.DropDownItems.Add("Mount / Unmount Read-Only", null, (s, e) => ToggleReadOnlyMount());
-            mPart.DropDownItems.Add("Browse Filesystem (Read-Only)...", null, (s, e) => BrowseNonMicrosoftFileSystem());
+            mPart.DropDownItems.Add("Browse Filesystem (File Explorer)...", null, (s, e) => BrowseNonMicrosoftFileSystem());
+            mPart.DropDownItems.Add(new ToolStripSeparator());
+            mPart.DropDownItems.Add("Information / Hex Sector Inspector...", null, (s, e) => OpenHexInspectorAtSelected());
 
             var mTools = new ToolStripMenuItem("Tools");
             mTools.DropDownItems.Add("Hex & Sector Inspector...", null, (s, e) => OpenHexInspector());
@@ -156,54 +167,127 @@ namespace WinParted.UI
             menu.Items.AddRange(new ToolStripItem[] { mApp, mEdit, mView, mDevice, mPart, mTools, mHelp });
             MainMenuStrip = menu;
 
-            // 2. Top Drive Bar
-            var topPanel = new Panel { Dock = DockStyle.Top, Height = 48, Tag = "SurfacePanel" };
-            var topFlow = new FlowLayoutPanel
+            // 2. Unified Single-Row GParted Toolbar + Right-Aligned Drive Selector
+            var toolbarBar = new Panel { Dock = DockStyle.Top, Height = 38, Tag = "ElevatedPanel" };
+            EnableDoubleBuffering(toolbarBar);
+
+            var ts = new ToolStrip
             {
                 Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = false,
-                Padding = new Padding(8, 7, 8, 5)
+                GripStyle = ToolStripGripStyle.Hidden,
+                ImageScalingSize = new Size(18, 18),
+                Padding = new Padding(6, 3, 6, 3)
             };
-            topPanel.Controls.Add(topFlow);
+            _tbNew = new ToolStripButton("New", DrawGPartedToolbarIcon("new"), (s, e) => QueueNewPartition())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Create a new partition in the selected unallocated space"
+            };
+            _tbDelete = new ToolStripButton("Delete", DrawGPartedToolbarIcon("delete"), (s, e) => QueueDeletePartition())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Delete the selected partition"
+            };
+            _tbResize = new ToolStripButton("Resize/Move", DrawGPartedToolbarIcon("resize"), (s, e) => QueueResizeMovePartition())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Resize or move the selected partition"
+            };
+            _tbCopy = new ToolStripButton("Copy", DrawGPartedToolbarIcon("copy"), (s, e) => CopySelectedPartition())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Copy the selected partition to the clipboard"
+            };
+            _tbPaste = new ToolStripButton("Paste", DrawGPartedToolbarIcon("paste"), (s, e) => PastePartitionToUnallocated())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Paste copied partition into unallocated space"
+            };
+            _tbFormat = new ToolStripSplitButton("Format to", DrawGPartedToolbarIcon("format"))
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Format the selected partition to a chosen filesystem"
+            };
+            _tbFormat.ButtonClick += (s, e) => QueueFormatPartition();
+            _tbFormat.DropDownItems.AddRange(BuildFormatToMenuItems());
 
-            topFlow.Controls.Add(new Label { Text = "Drive:", AutoSize = true, Margin = new Padding(2, 7, 6, 0), Font = new Font("Segoe UI", 9.5f, FontStyle.Bold) });
+            _tbUndo = new ToolStripButton("Undo", DrawGPartedToolbarIcon("undo"), (s, e) => UndoOperation())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Undo Last Operation"
+            };
+            _tbApply = new ToolStripButton("Apply", DrawGPartedToolbarIcon("apply"), (s, e) => ApplyOperations())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                ForeColor = ThemeManager.AccentGreen,
+                Tag = "ApplyHighlight",
+                ToolTipText = "Apply All Operations"
+            };
+            _tbFlags = new ToolStripButton("Flags", null, (s, e) => QueueManageFlags())
+            {
+                ToolTipText = "Manage partition flags and GPT/MBR type IDs"
+            };
+            _tbWipe = new ToolStripButton("Wipe", null, (s, e) => QueueWipePartition())
+            {
+                ToolTipText = "Securely wipe the selected partition"
+            };
+            _tbMountRo = new ToolStripButton("Mount (RO)", null, (s, e) => ToggleReadOnlyMount())
+            {
+                ToolTipText = "Mount/unmount unsupported filesystem in read-only mode"
+            };
+            _tbBrowseFs = new ToolStripButton("Explore Files", DrawGPartedToolbarIcon("explore"), (s, e) => BrowseNonMicrosoftFileSystem())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Open File Explorer for unsupported filesystem partitions (ext, Btrfs, XFS, APFS, HFS+, ISO9660, etc.)"
+            };
+            var tbRefresh = new ToolStripButton("Refresh", DrawGPartedToolbarIcon("refresh"), (s, e) => RefreshAllDisks())
+            {
+                DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
+                ToolTipText = "Rescan all physical and virtual drives"
+            };
 
-            _cmbDrives = new ComboBox { Width = 305, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 4, 10, 0) };
+            ts.Items.AddRange(new ToolStripItem[]
+            {
+                _tbNew, _tbDelete, new ToolStripSeparator(),
+                _tbResize, _tbCopy, _tbPaste, new ToolStripSeparator(),
+                _tbFormat, _tbFlags, _tbWipe, new ToolStripSeparator(),
+                _tbMountRo, _tbBrowseFs, new ToolStripSeparator(),
+                _tbUndo, _tbApply, new ToolStripSeparator(), tbRefresh
+            });
+
+            var driveRightPanel = new Panel
+            {
+                Dock = DockStyle.Right,
+                Width = Win32DiskInterop.IsAdministrator() ? 330 : 430,
+                Padding = new Padding(6, 6, 8, 5),
+                Tag = "ElevatedPanel"
+            };
+            EnableDoubleBuffering(driveRightPanel);
+
+            var lblDrive = new Label
+            {
+                Text = "Drive:",
+                Dock = DockStyle.Left,
+                Width = 44,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Segoe UI", 9.0f, FontStyle.Bold)
+            };
+
+            _cmbDrives = new ComboBox
+            {
+                Dock = DockStyle.Fill,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
             _cmbDrives.SelectedIndexChanged += (s, e) => OnDriveSelected();
-            topFlow.Controls.Add(_cmbDrives);
-
-            _chkSmartScale = new CheckBox { Text = "Smart Scale", AutoSize = true, Checked = true, Margin = new Padding(0, 6, 10, 0) };
-            _chkSmartScale.CheckedChanged += (s, e) => { if (_ribbon != null) _ribbon.SmartScale = _chkSmartScale.Checked; };
-            topFlow.Controls.Add(_chkSmartScale);
-
-            _chkDarkMode = new CheckBox { Text = "Dark Mode", AutoSize = true, Checked = ThemeManager.IsDarkMode, Margin = new Padding(0, 6, 10, 0) };
-            _chkDarkMode.CheckedChanged += (s, e) =>
-            {
-                if (_chkDarkMode.Checked != ThemeManager.IsDarkMode)
-                    ThemeManager.ToggleTheme();
-            };
-            topFlow.Controls.Add(_chkDarkMode);
-
-            _lblArchBadge = new Label
-            {
-                Text = Win32DiskInterop.GetArchitectureBadge(),
-                AutoSize = true,
-                Margin = new Padding(0, 7, 10, 0),
-                ForeColor = Win32DiskInterop.IsAdministrator() ? ThemeManager.AccentGreen : ThemeManager.AccentAmber,
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                Tag = "KeepForeColor"
-            };
-            topFlow.Controls.Add(_lblArchBadge);
 
             _btnElevate = new Button
             {
                 Text = "Run as Admin",
-                AutoSize = true,
-                MinimumSize = new Size(102, 28),
-                Padding = new Padding(6, 2, 6, 2),
-                Margin = new Padding(0, 2, 8, 0),
+                Dock = DockStyle.Right,
+                Width = 104,
                 Visible = !Win32DiskInterop.IsAdministrator(),
+                Margin = new Padding(6, 0, 0, 0),
                 Tag = "ElevateButton"
             };
             _btnElevate.Click += (s, e) =>
@@ -211,63 +295,20 @@ namespace WinParted.UI
                 if (Win32DiskInterop.RelaunchAsAdministrator())
                     Close();
             };
-            topFlow.Controls.Add(_btnElevate);
 
-            var btnNewDemo = new Button
+            driveRightPanel.Controls.Add(_cmbDrives);
+            driveRightPanel.Controls.Add(lblDrive);
+            if (!Win32DiskInterop.IsAdministrator())
             {
-                Text = "Reset Demo Disk",
-                AutoSize = true,
-                MinimumSize = new Size(118, 28),
-                Padding = new Padding(6, 2, 6, 2),
-                Margin = new Padding(0, 2, 8, 0),
-                Tag = "TonalButton"
-            };
-            btnNewDemo.Click += (s, e) => CreateAndMountDemoDisk();
-            topFlow.Controls.Add(btnNewDemo);
+                driveRightPanel.Controls.Add(new Panel { Dock = DockStyle.Right, Width = 6, Tag = "ElevatedPanel" });
+                driveRightPanel.Controls.Add(_btnElevate);
+            }
 
-            _btnFormatDrive = new Button
-            {
-                Text = "Format Drive...",
-                AutoSize = true,
-                MinimumSize = new Size(114, 28),
-                Padding = new Padding(8, 2, 8, 2),
-                Margin = new Padding(0, 2, 0, 0),
-                Tag = "DangerButton"
-            };
-            _btnFormatDrive.Click += (s, e) => QueueFormatEntireDrive();
-            topFlow.Controls.Add(_btnFormatDrive);
+            toolbarBar.Controls.Add(ts);
+            toolbarBar.Controls.Add(driveRightPanel);
 
-            // 3. Action ToolStrip
-            var ts = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(6, 4, 6, 4) };
-            _tbNew = new ToolStripButton("New", null, (s, e) => QueueNewPartition()) { ToolTipText = "Create new partition in unallocated space" };
-            _tbDelete = new ToolStripButton("Delete", null, (s, e) => QueueDeletePartition()) { ToolTipText = "Delete selected partition" };
-            _tbResize = new ToolStripButton("Resize/Move", null, (s, e) => QueueResizeMovePartition()) { ToolTipText = "Resize or move selected partition" };
-            _tbCopy = new ToolStripButton("Copy", null, (s, e) => CopySelectedPartition());
-            _tbPaste = new ToolStripButton("Paste", null, (s, e) => PastePartitionToUnallocated());
-            _tbFormat = new ToolStripButton("Format", null, (s, e) => QueueFormatPartition());
-            _tbFlags = new ToolStripButton("Flags", null, (s, e) => QueueManageFlags());
-            _tbWipe = new ToolStripButton("Wipe", null, (s, e) => QueueWipePartition());
-            _tbFormatDrive = new ToolStripButton("Format Drive", null, (s, e) => QueueFormatEntireDrive()) { ToolTipText = "Wipe boot sectors / hybrid ISO headers & format entire drive (non-OS disks only)" };
-            _tbMountRo = new ToolStripButton("Mount (RO)", null, (s, e) => ToggleReadOnlyMount()) { ToolTipText = "Mount/unmount non-Microsoft partition in read-only mode" };
-            _tbBrowseFs = new ToolStripButton("Browse FS", null, (s, e) => BrowseNonMicrosoftFileSystem()) { ToolTipText = "Browse files inside non-Microsoft partition (read-only)" };
-            _tbUndo = new ToolStripButton("Undo", null, (s, e) => UndoOperation());
-            _tbApply = new ToolStripButton("Apply All", null, (s, e) => ApplyOperations()) { Font = new Font("Segoe UI", 9f, FontStyle.Bold), ForeColor = ThemeManager.AccentGreen, Tag = "ApplyHighlight" };
-            var tbHex = new ToolStripButton("Hex/LBA", null, (s, e) => OpenHexInspector());
-            var tbAlign = new ToolStripButton("4K Audit", null, (s, e) => OpenAlignmentAudit());
-            var tbRefresh = new ToolStripButton("Refresh", null, (s, e) => RefreshAllDisks());
-
-            ts.Items.AddRange(new ToolStripItem[]
-            {
-                _tbNew, _tbDelete, new ToolStripSeparator(),
-                _tbResize, _tbCopy, _tbPaste, new ToolStripSeparator(),
-                _tbFormat, _tbFlags, _tbWipe, _tbFormatDrive, new ToolStripSeparator(),
-                _tbMountRo, _tbBrowseFs, new ToolStripSeparator(),
-                tbHex, tbAlign, new ToolStripSeparator(),
-                _tbUndo, _tbApply, new ToolStripSeparator(), tbRefresh
-            });
-
-            // 4. Visual Ribbon
-            _ribbon = new PartitionRibbonControl { Dock = DockStyle.Top, Height = 128 };
+            // 3. Full-Width Visual Partition Ribbon (directly below toolbar)
+            _ribbon = new PartitionRibbonControl { Dock = DockStyle.Top, Height = 124 };
             _ribbon.SelectedPartitionChanged += (s, part) => OnRibbonSelectionChanged(part);
             _ribbon.PartitionDoubleClicked += (s, part) => OnPartitionDoubleClicked(part);
             _ribbon.PartitionContextMenuRequested += (part, pt) =>
@@ -277,24 +318,39 @@ namespace WinParted.UI
                 _partContextMenu.Show(_ribbon, pt);
             };
 
-            // 5. Device Info Side Panel + Main Split
-            var centerContainer = new Panel { Dock = DockStyle.Fill };
-
-            _deviceInfoPanel = new Panel { Dock = DockStyle.Left, Width = 248, AutoScroll = true, Padding = new Padding(12), BorderStyle = BorderStyle.None, Tag = "SurfacePanel" };
-            EnableDoubleBuffering(_deviceInfoPanel);
-            _lblDeviceInfo = new Label { Location = new Point(12, 12), AutoSize = true, MaximumSize = new Size(220, 0), Font = new Font("Segoe UI", 8.8f) };
-            _deviceInfoPanel.Controls.Add(_lblDeviceInfo);
-
-            var mainSplit = new SplitContainer
+            // 4. Main Horizontal Split: Top (Device Info Left + Partition Table Fill) | Bottom (Full-Width Pending Operations Queue)
+            _mainSplit = new SplitContainer
             {
                 Size = new Size(1060, 620),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
-                Panel1MinSize = 25,
-                Panel2MinSize = 25,
+                Panel1MinSize = 120,
+                Panel2MinSize = 64,
                 SplitterWidth = 5
             };
-            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 235);
+            EnableDoubleBuffering(_mainSplit);
+            EnableDoubleBuffering(_mainSplit.Panel1);
+            EnableDoubleBuffering(_mainSplit.Panel2);
+            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(_mainSplit, 340);
+
+            _deviceInfoPanel = new Panel
+            {
+                Dock = DockStyle.Left,
+                Width = 240,
+                AutoScroll = true,
+                Padding = new Padding(12),
+                BorderStyle = BorderStyle.None,
+                Tag = "SurfacePanel"
+            };
+            EnableDoubleBuffering(_deviceInfoPanel);
+            _lblDeviceInfo = new Label
+            {
+                Location = new Point(12, 12),
+                AutoSize = true,
+                MaximumSize = new Size(212, 0),
+                Font = new Font("Segoe UI", 8.8f)
+            };
+            _deviceInfoPanel.Controls.Add(_lblDeviceInfo);
 
             _gridPartitions = new DataGridView
             {
@@ -309,13 +365,13 @@ namespace WinParted.UI
                 RowHeadersVisible = false,
                 BorderStyle = BorderStyle.None,
                 ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
-                ColumnHeadersHeight = 40
+                ColumnHeadersHeight = 36
             };
-            _gridPartitions.RowTemplate.Height = 36;
+            _gridPartitions.RowTemplate.Height = 34;
             _gridPartitions.DefaultCellStyle.Padding = new Padding(6, 4, 6, 4);
             _gridPartitions.DefaultCellStyle.WrapMode = DataGridViewTriState.False;
             _gridPartitions.Columns.Add("Partition", "Partition");
-            _gridPartitions.Columns.Add("Name", "Name / Letter");
+            _gridPartitions.Columns.Add("Name", "Name / Mount");
             _gridPartitions.Columns.Add("FS", "File System");
             _gridPartitions.Columns.Add("Label", "Label");
             _gridPartitions.Columns.Add("Size", "Size");
@@ -325,16 +381,16 @@ namespace WinParted.UI
             _gridPartitions.Columns.Add("Align", "Alignment");
             _gridPartitions.Columns.Add("LBA", "LBA Range");
 
-            SetGridColumnSizing("Partition", 105, 95);
-            SetGridColumnSizing("Name", 125, 115);
+            SetGridColumnSizing("Partition", 100, 95);
+            SetGridColumnSizing("Name", 120, 115);
             SetGridColumnSizing("FS", 120, 105);
-            SetGridColumnSizing("Label", 115, 110);
+            SetGridColumnSizing("Label", 110, 110);
             SetGridColumnSizing("Size", 85, 80);
             SetGridColumnSizing("Used", 85, 80);
             SetGridColumnSizing("Unused", 85, 80);
             SetGridColumnSizing("Flags", 110, 100);
             SetGridColumnSizing("Align", 95, 90);
-            SetGridColumnSizing("LBA", 135, 125);
+            SetGridColumnSizing("LBA", 130, 125);
 
             _gridPartitions.SelectionChanged += (s, e) => OnGridSelectionChanged();
             _gridPartitions.CellDoubleClick += OnGridCellDoubleClick;
@@ -342,22 +398,18 @@ namespace WinParted.UI
             _gridPartitions.MouseDown += OnGridMouseDown;
             EnableDoubleBuffering(_gridPartitions);
 
-            mainSplit.Panel1.Controls.Add(_gridPartitions);
+            _mainSplit.Panel1.Controls.Add(_gridPartitions);
+            _mainSplit.Panel1.Controls.Add(_deviceInfoPanel);
 
-            // Bottom Split: Left = Pending Operations Queue | Right = Integrated Foreign Filesystem Explorer
-            var bottomSplit = new SplitContainer
+            var opsHeader = new Panel { Dock = DockStyle.Top, Height = 28, Padding = new Padding(10, 5, 10, 4), Tag = "ElevatedPanel" };
+            EnableDoubleBuffering(opsHeader);
+            opsHeader.Controls.Add(new Label
             {
-                Size = new Size(1060, 360),
-                Dock = DockStyle.Fill,
-                Orientation = Orientation.Vertical,
-                Panel1MinSize = 25,
-                Panel2MinSize = 25,
-                SplitterWidth = 5
-            };
-            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 275);
-
-            var opsHeader = new Panel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(10, 6, 10, 4), Tag = "ElevatedPanel" };
-            opsHeader.Controls.Add(new Label { Text = "Pending Operations Queue (Safe Until 'Apply All')", Dock = DockStyle.Left, AutoSize = true, Font = new Font("Segoe UI", 8.8f, FontStyle.Bold) });
+                Text = "Pending Operations",
+                Dock = DockStyle.Left,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold)
+            });
 
             _lvOperations = new ListView
             {
@@ -367,11 +419,11 @@ namespace WinParted.UI
                 GridLines = false,
                 BorderStyle = BorderStyle.None
             };
-            _lvOperations.Columns.Add("#", 38);
-            _lvOperations.Columns.Add("Disk", 90);
-            _lvOperations.Columns.Add("Operation Summary", 240);
-            _lvOperations.Columns.Add("Details", 260);
-            _lvOperations.Columns.Add("Risk", 75);
+            _lvOperations.Columns.Add("#", 42);
+            _lvOperations.Columns.Add("Disk", 110);
+            _lvOperations.Columns.Add("Operation Summary", 340);
+            _lvOperations.Columns.Add("Details", 420);
+            _lvOperations.Columns.Add("Risk", 90);
             _lvOperations.DoubleClick += (s, e) =>
             {
                 if (_lvOperations.SelectedItems.Count > 0 && _lvOperations.SelectedItems[0].Tag is PendingOperation)
@@ -382,58 +434,208 @@ namespace WinParted.UI
             };
             EnableDoubleBuffering(_lvOperations);
 
-            bottomSplit.Panel1.Controls.Add(_lvOperations);
-            bottomSplit.Panel1.Controls.Add(opsHeader);
+            _mainSplit.Panel2.Controls.Add(_lvOperations);
+            _mainSplit.Panel2.Controls.Add(opsHeader);
 
-            _integratedExplorer = new IntegratedFileSystemExplorerControl { Dock = DockStyle.Fill };
-            _integratedExplorer.VolumeStateChanged += (s, e) => RefreshMountBadgesAndActions();
-            bottomSplit.Panel2.Controls.Add(_integratedExplorer);
-
-            mainSplit.Panel2.Controls.Add(bottomSplit);
-
-            centerContainer.Controls.Add(mainSplit);
-            centerContainer.Controls.Add(_deviceInfoPanel);
-
-            // 6. Status Bar
-            var statusPanel = new Panel { Dock = DockStyle.Bottom, Height = 28, Padding = new Padding(8, 4, 8, 4), Tag = "StatusBar" };
-            _lblStatus = new Label { Dock = DockStyle.Fill, Text = "Ready", Font = new Font("Segoe UI", 8.8f), TextAlign = ContentAlignment.MiddleLeft };
+            // 5. Status Bar (left status message + right architecture/privilege badge)
+            var statusPanel = new Panel { Dock = DockStyle.Bottom, Height = 26, Padding = new Padding(8, 3, 10, 3), Tag = "StatusBar" };
+            EnableDoubleBuffering(statusPanel);
+            _lblStatus = new Label { Dock = DockStyle.Fill, Text = "0 operations pending", Font = new Font("Segoe UI", 8.8f), TextAlign = ContentAlignment.MiddleLeft };
+            _lblArchBadge = new Label
+            {
+                Text = Win32DiskInterop.GetArchitectureBadge(),
+                Dock = DockStyle.Right,
+                AutoSize = true,
+                TextAlign = ContentAlignment.MiddleRight,
+                ForeColor = Win32DiskInterop.IsAdministrator() ? ThemeManager.AccentGreen : ThemeManager.AccentAmber,
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                Tag = "KeepForeColor"
+            };
             statusPanel.Controls.Add(_lblStatus);
+            statusPanel.Controls.Add(_lblArchBadge);
 
             // Context Menu
             _partContextMenu = new ContextMenuStrip();
-            _partContextMenu.Items.Add("New Partition...", null, (s, e) => QueueNewPartition());
+            _partContextMenu.Items.Add("New...", null, (s, e) => QueueNewPartition());
             _partContextMenu.Items.Add("Resize / Move...", null, (s, e) => QueueResizeMovePartition());
             _partContextMenu.Items.Add("Delete", null, (s, e) => QueueDeletePartition());
             _partContextMenu.Items.Add(new ToolStripSeparator());
             _partContextMenu.Items.Add("Copy", null, (s, e) => CopySelectedPartition());
             _partContextMenu.Items.Add("Paste", null, (s, e) => PastePartitionToUnallocated());
             _partContextMenu.Items.Add(new ToolStripSeparator());
-            _partContextMenu.Items.Add("Format To...", null, (s, e) => QueueFormatPartition());
+            var ctxFormatTo = new ToolStripMenuItem("Format to");
+            ctxFormatTo.DropDownItems.AddRange(BuildFormatToMenuItems());
+            _partContextMenu.Items.Add(ctxFormatTo);
             _partContextMenu.Items.Add("Label / Name...", null, (s, e) => QueueLabelPartition());
             _partContextMenu.Items.Add("Manage Flags...", null, (s, e) => QueueManageFlags());
             _partContextMenu.Items.Add("Secure Wipe...", null, (s, e) => QueueWipePartition());
             _partContextMenu.Items.Add(new ToolStripSeparator());
             _partContextMenu.Items.Add("Mount / Unmount Read-Only", null, (s, e) => ToggleReadOnlyMount());
-            _partContextMenu.Items.Add("Browse Filesystem (Read-Only)...", null, (s, e) => BrowseNonMicrosoftFileSystem());
+            _partContextMenu.Items.Add("Browse Filesystem (File Explorer)...", null, (s, e) => BrowseNonMicrosoftFileSystem());
             _partContextMenu.Items.Add(new ToolStripSeparator());
-            _partContextMenu.Items.Add("Inspect Boot Sector / LBA in Hex...", null, (s, e) => OpenHexInspectorAtSelected());
+            _partContextMenu.Items.Add("Information / Hex Sector Inspector...", null, (s, e) => OpenHexInspectorAtSelected());
 
-            // Assemble form docking order carefully
-            Controls.Add(centerContainer);
+            // Assemble form docking order carefully (last added docks outermost)
+            Controls.Add(_mainSplit);
             Controls.Add(_ribbon);
-            Controls.Add(ts);
-            Controls.Add(topPanel);
+            Controls.Add(toolbarBar);
             Controls.Add(menu);
             Controls.Add(statusPanel);
+            EnableDoubleBuffering(this);
 
             ThemeManager.ThemeChanged += OnThemeChangedHandler;
             Load += (s, e) =>
             {
-                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(mainSplit, 235);
-                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(bottomSplit, 275);
+                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(_mainSplit, 340);
             };
             FormClosed += (s, e) => ThemeManager.ThemeChanged -= OnThemeChangedHandler;
             ApplyMainFormTheme();
+        }
+
+        private ToolStripItem[] BuildFormatToMenuItems()
+        {
+            FileSystemType[] formats = new FileSystemType[]
+            {
+                FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
+                FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
+                FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
+                FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS
+            };
+
+            var items = new List<ToolStripItem>();
+            for (int i = 0; i < formats.Length; i++)
+            {
+                FileSystemType targetFs = formats[i];
+                var mi = new ToolStripMenuItem(FileSystemColors.GetDisplayName(targetFs));
+                mi.Click += (s, e) => QueueFormatPartitionTo(targetFs);
+                items.Add(mi);
+                if (targetFs == FileSystemType.ReFS || targetFs == FileSystemType.LinuxSwap)
+                    items.Add(new ToolStripSeparator());
+            }
+            items.Add(new ToolStripSeparator());
+            var customItem = new ToolStripMenuItem("Custom Format Dialog (with Label)...");
+            customItem.Click += (s, e) => QueueFormatPartition();
+            items.Add(customItem);
+            return items.ToArray();
+        }
+
+        private static Bitmap DrawGPartedToolbarIcon(string kind)
+        {
+            var bmp = new Bitmap(18, 18);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
+
+                if (kind == "new")
+                {
+                    using (var fill = new SolidBrush(Color.FromArgb(22, 163, 74)))
+                    using (var pen = new Pen(Color.White, 2.2f))
+                    {
+                        g.FillEllipse(fill, 2, 2, 14, 14);
+                        g.DrawLine(pen, 9, 5, 9, 13);
+                        g.DrawLine(pen, 5, 9, 13, 9);
+                    }
+                }
+                else if (kind == "delete")
+                {
+                    using (var fill = new SolidBrush(Color.FromArgb(220, 38, 38)))
+                    using (var pen = new Pen(Color.White, 2.2f))
+                    {
+                        g.FillEllipse(fill, 2, 2, 14, 14);
+                        g.DrawLine(pen, 6, 6, 12, 12);
+                        g.DrawLine(pen, 12, 6, 6, 12);
+                    }
+                }
+                else if (kind == "resize")
+                {
+                    using (var box = new Pen(Color.FromArgb(37, 99, 235), 1.8f))
+                    using (var arrow = new Pen(Color.FromArgb(59, 130, 246), 1.8f))
+                    {
+                        g.DrawRectangle(box, 3, 4, 12, 10);
+                        g.DrawLine(arrow, 5, 9, 13, 9);
+                        g.DrawLine(arrow, 7, 7, 5, 9);
+                        g.DrawLine(arrow, 7, 11, 5, 9);
+                        g.DrawLine(arrow, 11, 7, 13, 9);
+                        g.DrawLine(arrow, 11, 11, 13, 9);
+                    }
+                }
+                else if (kind == "copy")
+                {
+                    using (var fill = new SolidBrush(Color.FromArgb(226, 232, 240)))
+                    using (var pen = new Pen(Color.FromArgb(71, 85, 105), 1.5f))
+                    {
+                        g.FillRectangle(fill, 2, 2, 9, 11);
+                        g.DrawRectangle(pen, 2, 2, 9, 11);
+                        g.FillRectangle(fill, 6, 5, 9, 11);
+                        g.DrawRectangle(pen, 6, 5, 9, 11);
+                    }
+                }
+                else if (kind == "paste")
+                {
+                    using (var clip = new SolidBrush(Color.FromArgb(148, 163, 184)))
+                    using (var page = new SolidBrush(Color.FromArgb(241, 245, 249)))
+                    using (var pen = new Pen(Color.FromArgb(71, 85, 105), 1.5f))
+                    {
+                        g.FillRectangle(clip, 6, 1, 6, 3);
+                        g.FillRectangle(page, 3, 3, 12, 13);
+                        g.DrawRectangle(pen, 3, 3, 12, 13);
+                    }
+                }
+                else if (kind == "format")
+                {
+                    using (var fill = new SolidBrush(Color.FromArgb(245, 158, 11)))
+                    using (var pen = new Pen(Color.FromArgb(180, 83, 9), 1.5f))
+                    {
+                        g.FillRectangle(fill, 2, 6, 14, 7);
+                        g.DrawRectangle(pen, 2, 6, 14, 7);
+                        g.DrawLine(pen, 6, 6, 6, 13);
+                        g.DrawLine(pen, 11, 6, 11, 13);
+                    }
+                }
+                else if (kind == "undo")
+                {
+                    using (var pen = new Pen(Color.FromArgb(217, 119, 6), 2.2f))
+                    {
+                        g.DrawArc(pen, 4, 5, 10, 9, 210, 180);
+                        g.DrawLine(pen, 3, 7, 7, 4);
+                        g.DrawLine(pen, 3, 7, 7, 9);
+                    }
+                }
+                else if (kind == "apply")
+                {
+                    using (var fill = new SolidBrush(Color.FromArgb(22, 163, 74)))
+                    using (var pen = new Pen(Color.White, 2.2f))
+                    {
+                        g.FillEllipse(fill, 2, 2, 14, 14);
+                        g.DrawLine(pen, 5, 9, 8, 12);
+                        g.DrawLine(pen, 8, 12, 13, 6);
+                    }
+                }
+                else if (kind == "explore")
+                {
+                    using (var folder = new SolidBrush(Color.FromArgb(245, 158, 11)))
+                    using (var edge = new Pen(Color.FromArgb(180, 108, 0), 1.3f))
+                    using (var lens = new Pen(Color.FromArgb(37, 99, 235), 1.8f))
+                    {
+                        g.FillRectangle(folder, 2, 4, 6, 3);
+                        g.FillRectangle(folder, 2, 6, 12, 9);
+                        g.DrawRectangle(edge, 2, 6, 12, 9);
+                        g.DrawEllipse(lens, 8, 8, 6, 6);
+                        g.DrawLine(lens, 13, 13, 16, 16);
+                    }
+                }
+                else if (kind == "refresh")
+                {
+                    using (var pen = new Pen(Color.FromArgb(37, 99, 235), 2.0f))
+                    {
+                        g.DrawArc(pen, 3, 3, 12, 12, 30, 290);
+                        g.DrawLine(pen, 11, 3, 15, 5);
+                        g.DrawLine(pen, 15, 5, 11, 7);
+                    }
+                }
+            }
+            return bmp;
         }
 
         private void OnThemeChangedHandler(object sender, EventArgs e)
@@ -457,8 +659,6 @@ namespace WinParted.UI
             ThemeManager.ApplyContextMenu(_partContextMenu);
             if (_miDarkMode != null && _miDarkMode.Checked != ThemeManager.IsDarkMode)
                 _miDarkMode.Checked = ThemeManager.IsDarkMode;
-            if (_chkDarkMode != null && _chkDarkMode.Checked != ThemeManager.IsDarkMode)
-                _chkDarkMode.Checked = ThemeManager.IsDarkMode;
             if (_lblArchBadge != null)
                 _lblArchBadge.ForeColor = Win32DiskInterop.IsAdministrator() ? ThemeManager.AccentGreen : ThemeManager.AccentAmber;
             if (_tbApply != null)
@@ -712,9 +912,12 @@ namespace WinParted.UI
                 _selectedOffsetByDisk[_currentPreviewDisk.DiskNumber] = remembered.StartingOffset;
 
             UpdateActionStates();
-            UpdateIntegratedExplorerSelection();
             int diskPending = _queueManager.Queue.Count(o => o.TargetDiskNumber == _currentPreviewDisk.DiskNumber);
-            _lblStatus.Text = string.Format("{0} | {1} pending on this disk ({2} total)", _currentPreviewDisk.DisplayName, diskPending, _queueManager.PendingCount);
+            _lblStatus.Text = string.Format("{0} operation{1} pending ({2} on {3})",
+                _queueManager.PendingCount,
+                _queueManager.PendingCount == 1 ? "" : "s",
+                diskPending,
+                _currentPreviewDisk.DisplayName);
         }
 
         private void OnGridCellPainting(object sender, DataGridViewCellPaintingEventArgs e)
@@ -779,7 +982,6 @@ namespace WinParted.UI
             if (_currentPreviewDisk != null && part != null)
                 _selectedOffsetByDisk[_currentPreviewDisk.DiskNumber] = part.StartingOffset;
             UpdateActionStates();
-            UpdateIntegratedExplorerSelection();
         }
 
         private void SyncGridSelectionToPartition(PartitionEntry part)
@@ -819,7 +1021,6 @@ namespace WinParted.UI
                         }
                     }
                     UpdateActionStates();
-                    UpdateIntegratedExplorerSelection();
                 }
             }
         }
@@ -841,32 +1042,6 @@ namespace WinParted.UI
             UpdateActionStates();
         }
 
-        /// <summary>
-        /// Refreshes the integrated M3 file explorer when selection moves to a different disk/partition
-        /// or mount state changes; auto-mounts supported virtual disk partitions when clicked.
-        /// </summary>
-        private void UpdateIntegratedExplorerSelection()
-        {
-            if (_integratedExplorer == null) return;
-            var sel = GetSelectedPartition();
-            int dNum = _currentPreviewDisk != null ? _currentPreviewDisk.DiskNumber : -1;
-            long off = sel != null ? sel.StartingOffset : -1;
-            var existingVol = (_currentPreviewDisk != null && sel != null && !sel.IsUnallocated)
-                ? ReadOnlyFileSystemMountEngine.GetMount(dNum, off)
-                : null;
-
-            if (_boundExplorerDisk == dNum && _boundExplorerOffset == off && ReferenceEquals(_boundExplorerVolume, existingVol))
-                return;
-
-            _boundExplorerDisk = dNum;
-            _boundExplorerOffset = off;
-            bool autoMount = _currentPreviewDisk != null && _currentPreviewDisk.IsVirtualImage;
-            _integratedExplorer.BindPartition(_currentPreviewDisk, sel, existingVol, autoMount);
-            _boundExplorerVolume = (_currentPreviewDisk != null && sel != null && !sel.IsUnallocated)
-                ? ReadOnlyFileSystemMountEngine.GetMount(dNum, off)
-                : null;
-        }
-
         private void UpdateActionStates()
         {
             var sel = GetSelectedPartition();
@@ -878,8 +1053,6 @@ namespace WinParted.UI
                 !_currentPreviewDisk.IsVirtualImage &&
                 _currentPreviewDisk.IsSystemDisk &&
                 sel.IsSystemOrBoot;
-            bool canEditWholeDisk = _currentPreviewDisk != null &&
-                (!_currentPreviewDisk.IsSystemDisk || _currentPreviewDisk.IsVirtualImage);
 
             _tbNew.Enabled = isUnalloc;
             _tbDelete.Enabled = isPart && !isOsProtectedPart;
@@ -889,12 +1062,6 @@ namespace WinParted.UI
             _tbFormat.Enabled = isPart && !isOsProtectedPart;
             _tbFlags.Enabled = isPart;
             _tbWipe.Enabled = isPart && !isOsProtectedPart;
-            if (_tbFormatDrive != null) _tbFormatDrive.Enabled = canEditWholeDisk;
-            if (_btnFormatDrive != null)
-            {
-                _btnFormatDrive.Enabled = canEditWholeDisk;
-                _btnFormatDrive.BackColor = canEditWholeDisk ? Color.FromArgb(185, 28, 28) : Color.FromArgb(95, 25, 28);
-            }
 
             bool canRoMount = isPart && ReadOnlyFileSystemMountEngine.IsSupportedNonMicrosoftFs(sel.FileSystem);
             bool isRoMounted = canRoMount && _currentPreviewDisk != null &&
@@ -959,7 +1126,6 @@ namespace WinParted.UI
                     sel.ShortDeviceName, vol.MountPath, FileSystemColors.GetDisplayName(vol.FileSystem));
                 using (var dlg = new FileSystemBrowserDialog(_currentPreviewDisk, sel, vol))
                     dlg.ShowDialog(this);
-                _boundExplorerDisk = -1;
                 RenderCurrentDisk();
             }
             catch (Exception ex)
@@ -980,7 +1146,6 @@ namespace WinParted.UI
                 RenderCurrentDisk();
                 using (var dlg = new FileSystemBrowserDialog(_currentPreviewDisk, sel, vol))
                     dlg.ShowDialog(this);
-                _boundExplorerDisk = -1;
                 RenderCurrentDisk();
             }
             catch (Exception ex)
@@ -1234,6 +1399,35 @@ namespace WinParted.UI
             }
         }
 
+        private void QueueFormatPartitionTo(FileSystemType fs)
+        {
+            var sel = GetSelectedPartition();
+            if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
+            if (sel.IsSystemOrBoot && _currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
+            {
+                MessageBox.Show(this, "Safety Guardrail: Cannot format an active Windows OS boot partition.", "Safety Guardrail", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string label = sel.Label ?? string.Empty;
+            TryEnqueue(new PendingOperation
+            {
+                Type = OperationType.FormatPartition,
+                TargetDiskNumber = _currentPreviewDisk.DiskNumber,
+                TargetDiskPath = _currentPreviewDisk.DevicePath,
+                TargetPartitionNumber = sel.PartitionNumber,
+                OriginalStartOffset = sel.StartingOffset,
+                OriginalLength = sel.PartitionLength,
+                NewFileSystem = fs,
+                NewLabel = label,
+                NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(fs),
+                NewMbrType = RawDiskEngine.GetDefaultMbrType(fs),
+                Summary = string.Format("Format {0} as {1}", sel.ShortDeviceName, FileSystemColors.GetDisplayName(fs)),
+                DetailDescription = string.Format("Label: '{0}'", label),
+                RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "High"
+            });
+        }
+
         private void QueueLabelPartition()
         {
             var sel = GetSelectedPartition();
@@ -1421,124 +1615,6 @@ namespace WinParted.UI
                     RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "Critical"
                 });
             }
-        }
-
-        private void QueueFormatEntireDrive()
-        {
-            if (_currentPreviewDisk == null) return;
-            if (_currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
-            {
-                MessageBox.Show(this, "Safety Guardrail: Cannot wipe or format the active Windows OS boot disk.", "Blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            using (var dlg = new FormatEntireDriveDialog(_currentPreviewDisk))
-            {
-                if (dlg.ShowDialog(this) != DialogResult.OK)
-                    return;
-
-                int diskNum = _currentPreviewDisk.DiskNumber;
-                string diskPath = _currentPreviewDisk.DevicePath;
-                bool isVirtual = _currentPreviewDisk.IsVirtualImage;
-                string risk = isVirtual ? "Safe (Img)" : "Critical";
-
-                if (!TryEnqueue(new PendingOperation
-                {
-                    Type = OperationType.CreatePartitionTable,
-                    TargetDiskNumber = diskNum,
-                    TargetDiskPath = diskPath,
-                    NewTableStyle = dlg.ResultTableStyle,
-                    Summary = string.Format("Wipe & Reinitialize {0} ({1})",
-                        isVirtual ? "Virtual Disk" : "Disk " + diskNum,
-                        dlg.ResultTableStyle),
-                    DetailDescription = dlg.ResultWipeBootSectors
-                        ? "Wipes LBA 0..255 + hybrid ISO/boot headers & backup GPT, writes clean " + dlg.ResultTableStyle
-                        : "Initializes clean " + dlg.ResultTableStyle + " partition table",
-                    RiskLevel = risk
-                }))
-                {
-                    return;
-                }
-
-                var simDisk = _queueManager.GetPreviewDisk(diskNum) ?? _currentPreviewDisk;
-                var unalloc = simDisk.GetFullLayoutWithUnallocated().FirstOrDefault(p => p.IsUnallocated);
-                if (unalloc == null || unalloc.PartitionLength <= 0)
-                    return;
-
-                long sectorSize = simDisk.LogicalSectorSize > 0 ? simDisk.LogicalSectorSize : 512L;
-                long alignUnit = unalloc.PartitionLength >= 4L * 1048576L ? 1048576L : sectorSize;
-                long startOffset = ByteFormatter.AlignUp(Math.Max(unalloc.StartingOffset, alignUnit), alignUnit);
-                if (startOffset < unalloc.StartingOffset || startOffset >= unalloc.EndOffset)
-                    startOffset = ByteFormatter.AlignUp(unalloc.StartingOffset, sectorSize);
-
-                long endOffset = (unalloc.EndOffset / alignUnit) * alignUnit;
-                if (endOffset <= startOffset)
-                    endOffset = (unalloc.EndOffset / sectorSize) * sectorSize;
-
-                long length = endOffset - startOffset;
-                if (length <= 0)
-                    return;
-
-                TryEnqueue(new PendingOperation
-                {
-                    Type = OperationType.CreatePartition,
-                    TargetDiskNumber = diskNum,
-                    TargetDiskPath = diskPath,
-                    StartOffset = startOffset,
-                    Length = length,
-                    NewFileSystem = dlg.ResultFileSystem,
-                    NewLabel = dlg.ResultLabel,
-                    NewPartitionName = string.IsNullOrEmpty(dlg.ResultLabel) ? "Data" : dlg.ResultLabel,
-                    NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(dlg.ResultFileSystem),
-                    NewMbrType = RawDiskEngine.GetDefaultMbrType(dlg.ResultFileSystem),
-                    Summary = string.Format("Format Full Drive Partition ({0}, {1})",
-                        FileSystemColors.GetDisplayName(dlg.ResultFileSystem),
-                        ByteFormatter.FormatBytes(length)),
-                    DetailDescription = string.Format("Start 0x{0:X}, Length {1}, Label '{2}'",
-                        startOffset, ByteFormatter.FormatBytes(length), dlg.ResultLabel),
-                    RiskLevel = risk
-                });
-            }
-        }
-
-        private void WipeBootSectorInteractive()
-        {
-            if (_currentPreviewDisk == null) return;
-            if (_currentPreviewDisk.IsSystemDisk && !_currentPreviewDisk.IsVirtualImage)
-            {
-                MessageBox.Show(this, "Safety Guardrail: Cannot wipe boot sectors on the active Windows OS boot disk.", "Blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            PartitionTableStyle targetStyle = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.MBR
-                ? PartitionTableStyle.MBR
-                : PartitionTableStyle.GPT;
-
-            if (MessageBox.Show(this,
-                string.Format(
-                    "Wipe the active boot sector, hybrid ISO headers (LBA 0..255), and backup GPT on {0}, then initialize a clean {1} partition table?\n\n" +
-                    "This queues erasing all existing partitions and bootloaders on this drive.",
-                    _currentPreviewDisk.DisplayName,
-                    targetStyle),
-                "Wipe Boot Sector & Hybrid ISO Headers",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning) != DialogResult.Yes)
-            {
-                return;
-            }
-
-            TryEnqueue(new PendingOperation
-            {
-                Type = OperationType.CreatePartitionTable,
-                TargetDiskNumber = _currentPreviewDisk.DiskNumber,
-                TargetDiskPath = _currentPreviewDisk.DevicePath,
-                NewTableStyle = targetStyle,
-                Summary = string.Format("Wipe Boot Sectors & Reset {0} ({1})",
-                    _currentPreviewDisk.IsVirtualImage ? "Virtual Disk" : "Disk " + _currentPreviewDisk.DiskNumber,
-                    targetStyle),
-                DetailDescription = "Wipes LBA 0..255, hybrid ISO9660 descriptors, and backup GPT before rebuilding clean partition table",
-                RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "Critical"
-            });
         }
 
         private void BackupPartitionTable()
