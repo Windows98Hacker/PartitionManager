@@ -3,3 +3,8 @@ bin/*.img
 *.user
 .vs/
 obj/
+bin/
+*.exe
+*.dll
+*.pdb
+*.gptbak
