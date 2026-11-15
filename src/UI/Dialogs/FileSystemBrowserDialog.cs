@@ -32,8 +32,8 @@ namespace WinParted.UI.Dialogs
             var bottomBar = new Panel
             {
                 Dock = DockStyle.Bottom,
-                Height = 54,
-                Padding = new Padding(12, 8, 12, 8),
+                Height = 56,
+                Padding = new Padding(12, 10, 12, 10),
                 Tag = "ElevatedPanel"
             };
             var lblHint = new Label
@@ -54,8 +54,8 @@ namespace WinParted.UI.Dialogs
                 Dock = DockStyle.Right,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(100, 32),
-                Padding = new Padding(12, 0, 12, 0),
+                MinimumSize = new Size(100, 34),
+                Padding = new Padding(12, 2, 12, 2),
                 Text = "Close",
                 Tag = "TonalButton",
                 DialogResult = DialogResult.Cancel

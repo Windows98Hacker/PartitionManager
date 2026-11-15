@@ -142,12 +142,265 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Unmounts and evicts all cached read-only volumes belonging to the specified disk number.
+        /// </summary>
+        public static int UnmountDisk(int diskNumber)
+        {
+            string prefix = diskNumber + ":";
+            lock (SyncLock)
+            {
+                var keys = new List<string>();
+                foreach (var k in ActiveMounts.Keys)
+                {
+                    if (k.StartsWith(prefix, StringComparison.Ordinal))
+                        keys.Add(k);
+                }
+                for (int i = 0; i < keys.Count; i++)
+                    ActiveMounts.Remove(keys[i]);
+                return keys.Count;
+            }
+        }
+
         public static void UnmountAll()
         {
             lock (SyncLock)
             {
                 ActiveMounts.Clear();
             }
+        }
+
+        private static bool IsSameFsFamily(FileSystemType a, FileSystemType b)
+        {
+            if (a == b) return true;
+            bool aExt = (a == FileSystemType.Ext2 || a == FileSystemType.Ext3 || a == FileSystemType.Ext4);
+            bool bExt = (b == FileSystemType.Ext2 || b == FileSystemType.Ext3 || b == FileSystemType.Ext4);
+            if (aExt && bExt) return true;
+            bool aHfs = (a == FileSystemType.HFS || a == FileSystemType.HFSPlus);
+            bool bHfs = (b == FileSystemType.HFS || b == FileSystemType.HFSPlus);
+            if (aHfs && bHfs) return true;
+            bool aOpt = (a == FileSystemType.ISO9660 || a == FileSystemType.UDF);
+            bool bOpt = (b == FileSystemType.ISO9660 || b == FileSystemType.UDF);
+            if (aOpt && bOpt) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Verifies that the partition currently holds a valid on-disk superblock signature matching its metadata
+        /// (preventing wiped or reformatted volumes from falling back to permissive directory trees or overlays).
+        /// </summary>
+        public static bool HasValidSuperblockSignature(DiskInfo disk, PartitionEntry part)
+        {
+            if (disk == null || part == null || part.IsUnallocated || part.PartitionLength < 1024)
+                return false;
+
+            int headLen = (int)Math.Min(16384, part.PartitionLength);
+            byte[] head = RawDiskEngine.ReadBytes(disk, part.StartingOffset, headLen);
+            if (head == null || head.Length < headLen)
+                return false;
+
+            if ((head.Length >= 8 && Encoding.ASCII.GetString(head, 0, 8) == "WPROFS01") ||
+                (head.Length >= 0x3008 && Encoding.ASCII.GetString(head, 0x3000, 8) == "WPROFS01"))
+                return true;
+
+            var probe = new PartitionEntry
+            {
+                PartitionNumber = part.PartitionNumber,
+                StartingOffset = part.StartingOffset,
+                PartitionLength = part.PartitionLength,
+                FileSystem = FileSystemType.RAW
+            };
+            bool prevCanRaw = disk.CanRawRead;
+            disk.CanRawRead = true;
+            try
+            {
+                RawDiskEngine.InspectPartitionSuperblock(disk, probe);
+            }
+            finally
+            {
+                disk.CanRawRead = prevCanRaw;
+            }
+            if (probe.FileSystem == FileSystemType.RAW || probe.FileSystem == FileSystemType.Unallocated)
+                return false;
+
+            return IsSameFsFamily(probe.FileSystem, part.FileSystem);
+        }
+
+        private static string GetDefaultShadowOverlayDirectory()
+        {
+            if (!string.IsNullOrEmpty(ShadowOverlayRootOverride))
+                return ShadowOverlayRootOverride;
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "WinParted",
+                "ExperimentalOverlays");
+        }
+
+        private static void DeleteShadowOverlayFilesInRange(int diskNumber, long rangeStart, long rangeEnd)
+        {
+            string prefix = "ovl_d" + diskNumber + "_";
+            var dirs = new List<string>();
+            if (!string.IsNullOrEmpty(ShadowOverlayRootOverride))
+                dirs.Add(ShadowOverlayRootOverride);
+            string appDataDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "WinParted",
+                "ExperimentalOverlays");
+            if (!dirs.Contains(appDataDir))
+                dirs.Add(appDataDir);
+
+            for (int d = 0; d < dirs.Count; d++)
+            {
+                string dir = dirs[d];
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+                string[] files = Directory.GetFiles(dir, prefix + "*.bin");
+                for (int i = 0; i < files.Length; i++)
+                {
+                    string name = Path.GetFileName(files[i]);
+                    if (rangeEnd == long.MaxValue)
+                    {
+                        File.Delete(files[i]);
+                        continue;
+                    }
+                    int startIdx = prefix.Length;
+                    int underIdx = name.IndexOf('_', startIdx);
+                    if (underIdx <= startIdx) continue;
+                    long fileOff;
+                    if (long.TryParse(name.Substring(startIdx, underIdx - startIdx), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out fileOff))
+                    {
+                        if (fileOff >= rangeStart && fileOff < rangeEnd)
+                            File.Delete(files[i]);
+                    }
+                }
+            }
+        }
+
+        private static bool RangeOverlapsOtherPartition(DiskInfo disk, long targetStart, long absStart, long absEnd)
+        {
+            if (disk == null || disk.Partitions == null) return false;
+            for (int i = 0; i < disk.Partitions.Count; i++)
+            {
+                var other = disk.Partitions[i];
+                if (other == null || other.IsUnallocated || other.PartitionLength <= 0) continue;
+                if (other.StartingOffset == targetStart) continue;
+                long oStart = other.StartingOffset;
+                long oEnd = other.StartingOffset + other.PartitionLength;
+                if (absStart < oEnd && absEnd > oStart)
+                    return true;
+            }
+            return false;
+        }
+
+        private static void ZeroDiskRangeChunked(DiskInfo disk, long offset, long length)
+        {
+            if (disk == null || length <= 0) return;
+            const int chunkSize = 1048576;
+            byte[] zeros = new byte[(int)Math.Min(chunkSize, length)];
+            long written = 0;
+            while (written < length)
+            {
+                int n = (int)Math.Min(zeros.Length, length - written);
+                if (n == zeros.Length)
+                    RawDiskEngine.WriteBytes(disk, offset + written, zeros);
+                else
+                {
+                    byte[] tail = new byte[n];
+                    RawDiskEngine.WriteBytes(disk, offset + written, tail);
+                }
+                written += n;
+            }
+        }
+
+        /// <summary>
+        /// Evicts in-memory mount cache entries, removes persistent host shadow overlay files,
+        /// and optionally zeros on-disk <c>WPRWOVL1</c> overlay tables and data for a partition range.
+        /// </summary>
+        public static void PurgePartitionOverlaysAndCache(DiskInfo disk, long startingOffset, long partitionLength, bool wipeOnDiskOverlays)
+        {
+            if (disk == null) return;
+
+            Unmount(disk.DiskNumber, startingOffset);
+
+            // Also evict any cached mounts falling inside a wiped or replaced range.
+            if (partitionLength > 0)
+            {
+                string prefix = disk.DiskNumber + ":";
+                long rangeEnd = startingOffset + partitionLength;
+                lock (SyncLock)
+                {
+                    var toRemove = new List<string>();
+                    foreach (var k in ActiveMounts.Keys)
+                    {
+                        if (!k.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                        long keyOff;
+                        if (long.TryParse(k.Substring(prefix.Length), out keyOff))
+                        {
+                            if (keyOff >= startingOffset && keyOff < rangeEnd)
+                                toRemove.Add(k);
+                        }
+                    }
+                    for (int i = 0; i < toRemove.Count; i++)
+                        ActiveMounts.Remove(toRemove[i]);
+                }
+            }
+
+            DeleteShadowOverlayFilesInRange(disk.DiskNumber, startingOffset, startingOffset + Math.Max(1L, partitionLength));
+
+            if (!wipeOnDiskOverlays || partitionLength < 65536) return;
+
+            var candidates = new List<long>();
+            if (partitionLength >= 0x24000L)
+                candidates.Add(0x20000L);
+            if (partitionLength > 8388608L + 0x4000L)
+                candidates.Add(((partitionLength - 8388608L) / 4096L) * 4096L);
+            if (partitionLength > 524288L + 0x4000L)
+                candidates.Add(((partitionLength - 524288L) / 4096L) * 4096L);
+
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                long cand = candidates[i];
+                if (cand < 0 || cand + 0x4000L > partitionLength) continue;
+                long absStart = startingOffset + cand;
+                if (RangeOverlapsOtherPartition(disk, startingOffset, absStart, absStart + 0x4000L))
+                    continue;
+
+                byte[] hdr = RawDiskEngine.ReadBytes(disk, absStart, 24);
+                long zeroLen = 0;
+                if (hdr != null && hdr.Length >= 20 && Encoding.ASCII.GetString(hdr, 0, 8) == "WPRWOVL1")
+                {
+                    ulong nextData = BitConverter.ToUInt64(hdr, 8);
+                    long minClear = Math.Min(partitionLength - cand, 0x10000L);
+                    zeroLen = minClear;
+                    if (nextData > (ulong)(cand + 0x4000L) && nextData <= (ulong)partitionLength)
+                    {
+                        long dataSpan = (long)nextData - cand;
+                        if (dataSpan > zeroLen)
+                            zeroLen = Math.Min(dataSpan, 64L * 1048576L);
+                    }
+                }
+                else if (cand == 0x20000L)
+                {
+                    // Always clear the primary WPRWOVL1 slot during format even if header was partially overwritten.
+                    zeroLen = Math.Min(partitionLength - cand, 0x4000L);
+                }
+
+                if (zeroLen > 0)
+                {
+                    if (RangeOverlapsOtherPartition(disk, startingOffset, absStart, absStart + zeroLen))
+                        zeroLen = Math.Min(zeroLen, 0x4000L);
+                    if (!RangeOverlapsOtherPartition(disk, startingOffset, absStart, absStart + zeroLen))
+                        ZeroDiskRangeChunked(disk, absStart, zeroLen);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Evicts all cached mounts and deletes all host shadow overlay files associated with a disk number.
+        /// </summary>
+        public static void PurgeDiskOverlaysAndCache(int diskNumber)
+        {
+            UnmountDisk(diskNumber);
+            DeleteShadowOverlayFilesInRange(diskNumber, 0, long.MaxValue);
         }
 
         /// <summary>
@@ -164,6 +417,13 @@ namespace WinParted.Core
                 throw new InvalidOperationException("Test safety restriction: Read-only mount tests are restricted to virtual disk images.");
             if (!IsSupportedNonMicrosoftFs(part.FileSystem))
                 throw new NotSupportedException("Read-only explorer mount is intended for supported volumes (ext2/3/4, Btrfs, XFS, F2FS, ZFS, SquashFS, ISO9660, UDF, APFS, HFS+, HFS, ReFS, Swap/LVM2). Selected: " + FileSystemColors.GetDisplayName(part.FileSystem));
+            if (!HasValidSuperblockSignature(disk, part))
+            {
+                Unmount(disk.DiskNumber, part.StartingOffset);
+                throw new InvalidOperationException(
+                    "No valid " + FileSystemColors.GetDisplayName(part.FileSystem) +
+                    " superblock signature was found on disk (the volume may have been wiped, reformatted, or corrupted).");
+            }
 
             string mountId = string.Format("ro_disk{0}_p{1}", disk.DiskNumber, part.PartitionNumber);
             string mountPath = string.Format("/mnt/ro/disk{0}p{1}", disk.DiskNumber, part.PartitionNumber);

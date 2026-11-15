@@ -172,6 +172,7 @@ namespace WinParted.Core
             switch (op.Type)
             {
                 case OperationType.CreatePartitionTable:
+                    ReadOnlyFileSystemMountEngine.UnmountDisk(disk.DiskNumber);
                     disk.PartitionStyle = op.NewTableStyle;
                     disk.Partitions.Clear();
                     if (op.NewTableStyle == PartitionTableStyle.GPT)
@@ -211,10 +212,13 @@ namespace WinParted.Core
                     break;
 
                 case OperationType.DeletePartition:
+                    ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.OriginalStartOffset);
                     disk.Partitions.RemoveAll(p => p.StartingOffset == op.OriginalStartOffset && p.PartitionLength == op.OriginalLength);
                     break;
 
                 case OperationType.ResizeMovePartition:
+                    ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.OriginalStartOffset);
+                    ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.StartOffset);
                     var targetResize = disk.Partitions.FirstOrDefault(p => p.StartingOffset == op.OriginalStartOffset);
                     if (targetResize == null)
                         throw new InvalidOperationException("Target partition at 0x" + op.OriginalStartOffset.ToString("X") + " was not found for Resize/Move.");
@@ -229,6 +233,7 @@ namespace WinParted.Core
                     break;
 
                 case OperationType.FormatPartition:
+                    ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.OriginalStartOffset);
                     var targetFmt = disk.Partitions.FirstOrDefault(p => p.StartingOffset == op.OriginalStartOffset);
                     if (targetFmt != null)
                     {
@@ -303,14 +308,19 @@ namespace WinParted.Core
                     break;
 
                 case OperationType.WipePartition:
+                    ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.OriginalStartOffset);
                     var targetWipe = disk.Partitions.FirstOrDefault(p => p.StartingOffset == op.OriginalStartOffset);
                     if (targetWipe != null)
                     {
                         targetWipe.FileSystem = FileSystemType.RAW;
                         targetWipe.Label = string.Empty;
+                        targetWipe.PartitionName = string.Empty;
                         targetWipe.UUID = string.Empty;
-                        targetWipe.UsedBytes = null;
-                        targetWipe.FreeBytes = null;
+                        targetWipe.GptTypeGuid = Guid.Empty;
+                        targetWipe.MbrPartitionType = 0;
+                        targetWipe.IsMounted = false;
+                        targetWipe.UsedBytes = 0;
+                        targetWipe.FreeBytes = targetWipe.PartitionLength;
                     }
                     break;
             }
@@ -322,6 +332,38 @@ namespace WinParted.Core
             for (int i = 0; i < sorted.Count; i++)
                 sorted[i].PartitionNumber = i + 1;
             disk.Partitions = sorted;
+        }
+
+        private static void ZeroVacatedPartitionHeader(DiskInfo disk, long startOffset, long length)
+        {
+            if (disk == null || length <= 0) return;
+            long minSafeStart = disk.PartitionStyle == PartitionTableStyle.GPT ? 0x4400L : 512L;
+            long safeStart = Math.Max(startOffset, minSafeStart);
+            long requestedEnd = Math.Min(startOffset + length, safeStart + 0x30000L);
+            if (disk.TotalSizeBytes > 0)
+            {
+                long maxSafeEnd = disk.PartitionStyle == PartitionTableStyle.GPT
+                    ? Math.Max(minSafeStart, disk.TotalSizeBytes - 0x4400L)
+                    : disk.TotalSizeBytes;
+                requestedEnd = Math.Min(requestedEnd, maxSafeEnd);
+            }
+            if (disk.Partitions != null)
+            {
+                for (int i = 0; i < disk.Partitions.Count; i++)
+                {
+                    var p = disk.Partitions[i];
+                    if (p == null || p.IsUnallocated || p.PartitionLength <= 0) continue;
+                    long pStart = p.StartingOffset;
+                    long pEnd = p.StartingOffset + p.PartitionLength;
+                    if (safeStart >= pStart && safeStart < pEnd)
+                        return;
+                    if (pStart > safeStart && pStart < requestedEnd)
+                        requestedEnd = pStart;
+                }
+            }
+            long clearLen = requestedEnd - safeStart;
+            if (clearLen <= 0) return;
+            RawDiskEngine.WriteBytes(disk, safeStart, new byte[(int)clearLen]);
         }
 
         /// <summary>
@@ -388,6 +430,7 @@ namespace WinParted.Core
                 switch (op.Type)
                 {
                     case OperationType.CreatePartitionTable:
+                        ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
                         ApplyOperationToModel(disk, op);
                         RawDiskEngine.WritePartitionTable(disk);
                         break;
@@ -397,13 +440,16 @@ namespace WinParted.Core
                         RenumberPartitions(disk);
                         var created = disk.Partitions.First(p => p.StartingOffset == op.StartOffset);
                         RawDiskEngine.WritePartitionTable(disk);
+                        ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, created.StartingOffset, created.PartitionLength, true);
                         RawDiskEngine.WriteFileSystemHeader(disk, created);
                         break;
 
                     case OperationType.DeletePartition:
+                        ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, true);
                         ApplyOperationToModel(disk, op);
                         RenumberPartitions(disk);
                         RawDiskEngine.WritePartitionTable(disk);
+                        ZeroVacatedPartitionHeader(disk, op.OriginalStartOffset, op.OriginalLength);
                         break;
 
                     case OperationType.ResizeMovePartition:
@@ -411,7 +457,10 @@ namespace WinParted.Core
                         {
                             long bytesToMove = Math.Min(op.OriginalLength, op.Length);
                             RawDiskEngine.MovePartitionBytes(disk, op.OriginalStartOffset, op.StartOffset, bytesToMove);
+                            ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, false);
                         }
+                        ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.OriginalStartOffset);
+                        ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.StartOffset);
                         ApplyOperationToModel(disk, op);
                         RenumberPartitions(disk);
                         var resizedPart = disk.Partitions.First(p => p.StartingOffset == op.StartOffset);
@@ -420,6 +469,7 @@ namespace WinParted.Core
                         break;
 
                     case OperationType.FormatPartition:
+                        ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, true);
                         ApplyOperationToModel(disk, op);
                         var fmtPart = disk.Partitions.First(p => p.StartingOffset == op.OriginalStartOffset);
                         RawDiskEngine.WritePartitionTable(disk);
@@ -445,6 +495,7 @@ namespace WinParted.Core
                         if (srcDisk == null)
                             srcDisk = GetBaselineDisk(op.SourceDiskNumber) ?? disk;
 
+                        ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.StartOffset, op.Length, false);
                         RawDiskEngine.CopyPartitionBytes(srcDisk, op.SourceStartOffset, disk, op.StartOffset, op.SourceLength);
                         ApplyOperationToModel(disk, op);
                         RenumberPartitions(disk);
@@ -456,11 +507,13 @@ namespace WinParted.Core
 
                     case OperationType.WipePartition:
                         RawDiskEngine.WipeRange(disk, op.OriginalStartOffset, op.OriginalLength, op.WipePattern);
+                        ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, false);
                         ApplyOperationToModel(disk, op);
                         RawDiskEngine.WritePartitionTable(disk);
                         break;
 
                     case OperationType.RestorePartitionTable:
+                        ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
                         RawDiskEngine.RestorePartitionTable(disk, op.BackupFilePath);
                         break;
                 }
@@ -541,12 +594,14 @@ namespace WinParted.Core
                     throw new InvalidOperationException("Target partition was not found for wiping.");
                 Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
                 RawDiskEngine.WipeRange(disk, targetPart.StartingOffset, targetPart.PartitionLength, op.WipePattern);
+                ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, targetPart.StartingOffset, targetPart.PartitionLength, false);
                 return;
             }
 
             if (op.Type == OperationType.RestorePartitionTable)
             {
                 Win32DiskInterop.WipeDiskBootAndHybridHeaders(disk.DiskNumber, disk.DevicePath, disk.TotalSizeBytes, disk.LogicalSectorSize);
+                ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
                 RawDiskEngine.RestorePartitionTable(disk, op.BackupFilePath);
                 return;
             }
@@ -557,6 +612,7 @@ namespace WinParted.Core
             {
                 // Always wipe LBA 0..255 (+0x8000 isohybrid descriptors, MBR, Primary GPT) and Backup GPT first
                 Win32DiskInterop.WipeDiskBootAndHybridHeaders(disk.DiskNumber, disk.DevicePath, disk.TotalSizeBytes, disk.LogicalSectorSize);
+                ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
                 try
                 {
                     RunDiskPartScript("rescan\r\n" + script);
@@ -577,6 +633,7 @@ namespace WinParted.Core
                     try
                     {
                         Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
+                        ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, targetPart.StartingOffset, targetPart.PartitionLength, true);
                         int wipeLen = (int)Math.Min(65536L, (targetPart.PartitionLength / 4096L) * 4096L);
                         if (wipeLen > 0)
                             RawDiskEngine.WriteBytes(disk, targetPart.StartingOffset, new byte[wipeLen]);
@@ -585,6 +642,8 @@ namespace WinParted.Core
                     {
                     }
                 }
+
+                ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, false);
 
                 try
                 {
@@ -598,6 +657,7 @@ namespace WinParted.Core
                         try
                         {
                             Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
+                            ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, targetPart.StartingOffset, targetPart.PartitionLength, true);
                             if (targetPart.StartingOffset <= 0x8000L && targetPart.EndOffset > 0x20000L)
                             {
                                 // Wipe ISO9660 volume descriptors (+0x8000..+0x20000) without prematurely clobbering LBA 0
@@ -643,6 +703,13 @@ namespace WinParted.Core
             {
                 RunDiskPartScript("rescan\r\n" + script);
                 diskPartSucceeded = true;
+                long purgeStart = op.Type == OperationType.CreatePartition
+                    ? op.StartOffset
+                    : (targetPart != null ? targetPart.StartingOffset : op.OriginalStartOffset);
+                long purgeLen = op.Type == OperationType.CreatePartition
+                    ? op.Length
+                    : (targetPart != null ? targetPart.PartitionLength : op.OriginalLength);
+                ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, purgeStart, purgeLen, false);
             }
             catch (InvalidOperationException)
             {

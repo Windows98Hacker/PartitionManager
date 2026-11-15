@@ -1813,18 +1813,62 @@ namespace WinParted.UI
             using (var dlg = new Form
             {
                 Text = title,
-                Size = new Size(360, 150),
+                Size = new Size(400, 190),
+                MinimumSize = new Size(360, 180),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterParent,
                 MaximizeBox = false,
-                MinimizeBox = false
+                MinimizeBox = false,
+                Font = new Font("Segoe UI", 9f)
             })
             {
-                var lbl = new Label { Left = 12, Top = 12, Width = 320, Text = prompt };
-                var txt = new TextBox { Left = 12, Top = 36, Width = 320 };
-                var btnOk = new Button { Text = "Create", Left = 172, Top = 72, Width = 75, DialogResult = DialogResult.OK, Tag = "DangerButton" };
-                var btnCancel = new Button { Text = "Cancel", Left = 257, Top = 72, Width = 75, DialogResult = DialogResult.Cancel };
-                dlg.Controls.AddRange(new Control[] { lbl, txt, btnOk, btnCancel });
+                var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+                dlg.Controls.Add(root);
+
+                var btnFlow = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Bottom,
+                    Height = 56,
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Padding = new Padding(0, 8, 0, 8)
+                };
+                var btnCancel = new Button
+                {
+                    Text = "Cancel",
+                    DialogResult = DialogResult.Cancel,
+                    AutoSize = true,
+                    AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                    MinimumSize = new Size(96, 34),
+                    Padding = new Padding(12, 2, 12, 2),
+                    Margin = new Padding(8, 2, 0, 2)
+                };
+                var btnOk = new Button
+                {
+                    Text = "Create",
+                    DialogResult = DialogResult.OK,
+                    AutoSize = true,
+                    AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                    MinimumSize = new Size(104, 34),
+                    Padding = new Padding(14, 2, 14, 2),
+                    Margin = new Padding(0, 2, 0, 2),
+                    Tag = "DangerButton"
+                };
+                btnFlow.Controls.Add(btnCancel);
+                btnFlow.Controls.Add(btnOk);
+
+                var content = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    FlowDirection = FlowDirection.TopDown,
+                    WrapContents = false
+                };
+                var lbl = new Label { Text = prompt, AutoSize = true, MaximumSize = new Size(350, 0), Margin = new Padding(0, 0, 0, 8) };
+                var txt = new TextBox { Width = 350, Margin = new Padding(0, 0, 0, 6) };
+                content.Controls.Add(lbl);
+                content.Controls.Add(txt);
+
+                root.Controls.Add(content);
+                root.Controls.Add(btnFlow);
                 dlg.AcceptButton = btnOk;
                 dlg.CancelButton = btnCancel;
                 ThemeManager.ApplyTheme(dlg);
