@@ -1168,6 +1168,11 @@ namespace WinParted.Core
             log("  -> Dev Filesystems Verified (native Btrfs B-tree, BE XFS IN-inodes, Ext2 direct blocks, ECMA-119 ISO9660, F2FS, ZFS, SquashFS, UDF + 0x28000/shadow RW overlay).");
         }
 
+        /// <summary>
+        /// Stress 9: Verifies that active OS boot disks reject destructive edits at queue time while
+        /// non-system/USB boot sectors remain editable, validates full-drive reformatting, and tests
+        /// isohybrid tail <c>WPRWOVL1</c> overlay offset selection.
+        /// </summary>
         private static void RunStress9_BootUnlockFullFormatAndHybridOverlay(string tempDir, Action<string> log)
         {
             log("[Stress 9] OS Boot Protection vs USB/Non-System Boot Editing, Full-Drive Reformat, and Isohybrid Overlay Selection...");
@@ -2217,6 +2222,11 @@ namespace WinParted.Core
                     context, distinct, maxFreq));
         }
 
+        /// <summary>
+        /// Stress 10: Verifies that Secure Wipe (Zero, Ones, CryptoRandom with entropy checks),
+        /// partition Reformat, and Demo Disk Reset completely purge on-disk data, <c>WPRWOVL1</c>
+        /// overlays, host shadow files, and in-memory cached mounts.
+        /// </summary>
         private static void RunStress10_SecureWipeFormatAndDemoResetOverlayPurge(string tempDir, Action<string> log)
         {
             log("[Stress 10] Secure Wipe (Zero/Ones/CryptoRandom), Reformat Overlay Purge, and Demo Disk Reset Completeness...");

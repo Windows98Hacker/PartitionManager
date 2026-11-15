@@ -1207,6 +1207,11 @@ namespace WinParted.Core
             return false;
         }
 
+        /// <summary>
+        /// Returns ordered candidate relative offsets for the <c>WPRWOVL1</c> experimental overlay table,
+        /// preferring a non-overlapping tail region behind ISO9660/isohybrid images when <c>+0x20000</c>
+        /// would overlap an embedded sub-partition (e.g., ESP).
+        /// </summary>
         private static long[] GetCandidateOverlayTableRelOffsets(DiskInfo disk, PartitionEntry part)
         {
             if (part == null) return new long[] { 0x20000L };
@@ -3207,6 +3212,10 @@ namespace WinParted.Core
             public VirtualFsNode RootNode;
         }
 
+        /// <summary>
+        /// Navigates multi-level APFS Object Map (<c>OMAP</c>) B-trees to translate virtual object IDs
+        /// (at or below a checkpoint transaction <c>xid</c>) into physical block addresses.
+        /// </summary>
         private sealed class ApfsOmapReader
         {
             private readonly DiskInfo _disk;
@@ -3615,6 +3624,10 @@ namespace WinParted.Core
             return candidates;
         }
 
+        /// <summary>
+        /// Inspects an APFS container (<c>NXSB</c>) or volume (<c>APSB</c>) to extract the preferred
+        /// non-System-internal volume label, UUID, and allocated container used bytes for UI display.
+        /// </summary>
         internal static bool TryReadApfsVolumeMetadata(
             DiskInfo disk, PartitionEntry part, byte[] header0,
             out string volLabel, out string volUuid, out long volUsedBytes)

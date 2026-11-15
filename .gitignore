@@ -1,8 +1,12 @@
 *.img
 *.vhd
 *.bin
-bin/*.img
+bin/
+*.exe
+*.dll
+*.pdb
 *.ptbak
+*.gptbak
 *.user
 .vs/
 obj/

@@ -819,6 +819,11 @@ namespace WinParted.UI
                 sc.Panel1.BackColor = BackPrimary;
                 sc.Panel2.BackColor = BackPrimary;
             }
+            else if (c is Splitter)
+            {
+                c.BackColor = BorderColor;
+                c.Invalidate();
+            }
             else if (c is PartitionRibbonControl)
             {
                 c.BackColor = BackPrimary;
