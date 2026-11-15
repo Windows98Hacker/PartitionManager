@@ -59,8 +59,8 @@ namespace WinParted.UI.Dialogs
             if (_minSizeBytes > _regionTotalBytes) _minSizeBytes = _regionTotalBytes;
 
             Text = isCreateMode ? "Create New Partition" : "Resize / Move Partition — " + targetSlice.ShortDeviceName;
-            Size = new Size(700, 612);
-            MinimumSize = new Size(660, 572);
+            Size = new Size(890, 560);
+            MinimumSize = new Size(760, 480);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -72,35 +72,29 @@ namespace WinParted.UI.Dialogs
             if (initialBefore + initialSize > _regionTotalBytes)
                 initialSize = _regionTotalBytes - initialBefore;
 
-            var rootPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+            var rootPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F21) };
             Controls.Add(rootPanel);
 
             var bottomButtons = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 56,
+                Height = ThemeManager.F55,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 8)
+                Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
             };
             var btnCancel = new Button
             {
                 Text = "Cancel",
                 DialogResult = DialogResult.Cancel,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(104, 34),
-                Padding = new Padding(12, 2, 12, 2),
-                Margin = new Padding(8, 2, 0, 2)
+                Size = new Size(ThemeManager.F89, ThemeManager.F34),
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0)
             };
             var btnOk = new Button
             {
                 Text = isCreateMode ? "Add Partition" : "Resize / Move",
                 DialogResult = DialogResult.OK,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(124, 34),
-                Padding = new Padding(14, 2, 14, 2),
-                Margin = new Padding(0, 2, 0, 2),
+                Size = new Size(ThemeManager.F144, ThemeManager.F34),
+                Margin = new Padding(0),
                 Tag = "PrimaryButton"
             };
             btnOk.Click += (s, e) => CommitValues();
@@ -197,7 +191,7 @@ namespace WinParted.UI.Dialogs
             _sliderBar = new SliderPreviewPanel(_regionTotalBytes, _minSizeBytes, initialBefore, initialSize,
                 isCreateMode ? FileSystemType.NTFS : targetSlice.FileSystem, usedBytes);
             _sliderBar.Dock = DockStyle.Top;
-            _sliderBar.Height = 72;
+            _sliderBar.Height = ThemeManager.F89;
             _sliderBar.Tag = "SliderPanel";
             _sliderBar.RangeChanged += (s, e) => SyncFromBytes(_sliderBar.BeforeBytes, _sliderBar.SizeBytes);
             rootPanel.Controls.Add(_sliderBar);
@@ -484,43 +478,37 @@ namespace WinParted.UI.Dialogs
         {
             _disk = disk;
             Text = "Manage Partition Flags — " + part.ShortDeviceName;
-            Size = new Size(580, 484);
-            MinimumSize = new Size(540, 454);
+            Size = new Size(744, 460);
+            MinimumSize = new Size(640, 430);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Segoe UI", 9f);
 
-            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F21) };
             Controls.Add(root);
 
             var btnPanel = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 56,
+                Height = ThemeManager.F55,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 8)
+                Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
             };
             var btnCancel = new Button
             {
                 Text = "Cancel",
                 DialogResult = DialogResult.Cancel,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(100, 34),
-                Padding = new Padding(12, 2, 12, 2),
-                Margin = new Padding(8, 2, 0, 2)
+                Size = new Size(ThemeManager.F89, ThemeManager.F34),
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0)
             };
             var btnOk = new Button
             {
                 Text = "Apply Flags",
                 DialogResult = DialogResult.OK,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(118, 34),
-                Padding = new Padding(14, 2, 14, 2),
-                Margin = new Padding(0, 2, 0, 2),
+                Size = new Size(ThemeManager.F144, ThemeManager.F34),
+                Margin = new Padding(0),
                 Tag = "PrimaryButton"
             };
             btnPanel.Controls.Add(btnCancel);
@@ -547,8 +535,8 @@ namespace WinParted.UI.Dialogs
 
             _cmbType = new ComboBox
             {
-                Width = 520,
-                DropDownWidth = 560,
+                Width = ThemeManager.F610,
+                DropDownWidth = 650,
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Margin = new Padding(0, 0, 0, 12)
             };
@@ -660,43 +648,37 @@ namespace WinParted.UI.Dialogs
         public WipePartitionDialog(PartitionEntry part)
         {
             Text = "Secure Wipe Partition — " + part.ShortDeviceName;
-            Size = new Size(560, 330);
-            MinimumSize = new Size(520, 310);
+            Size = new Size(550, 340);
+            MinimumSize = new Size(518, 320);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Segoe UI", 9f);
 
-            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F21) };
             Controls.Add(root);
 
             var btnPanel = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 56,
+                Height = ThemeManager.F55,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 8)
+                Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
             };
             var btnCancel = new Button
             {
                 Text = "Cancel",
                 DialogResult = DialogResult.Cancel,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(96, 34),
-                Padding = new Padding(12, 2, 12, 2),
-                Margin = new Padding(8, 2, 0, 2)
+                Size = new Size(ThemeManager.F89, ThemeManager.F34),
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0)
             };
             var btnOk = new Button
             {
                 Text = "Queue Wipe",
                 DialogResult = DialogResult.OK,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(116, 34),
-                Padding = new Padding(12, 2, 12, 2),
-                Margin = new Padding(8, 2, 0, 2),
+                Size = new Size(110, ThemeManager.F34),
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0),
                 Tag = "TonalButton"
             };
             btnOk.Click += delegate { ExecuteImmediately = false; };
@@ -704,11 +686,8 @@ namespace WinParted.UI.Dialogs
             {
                 Text = "Wipe Now",
                 DialogResult = DialogResult.OK,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(116, 34),
-                Padding = new Padding(14, 2, 14, 2),
-                Margin = new Padding(0, 2, 0, 2),
+                Size = new Size(110, ThemeManager.F34),
+                Margin = new Padding(0),
                 Tag = "DangerButton"
             };
             btnWipeNow.Click += delegate { ExecuteImmediately = true; };
@@ -759,16 +738,16 @@ namespace WinParted.UI.Dialogs
         {
             _disk = disk;
             Text = "Low-Level Sector & Hex Inspector — " + disk.DisplayName;
-            Size = new Size(980, 660);
-            MinimumSize = new Size(820, 540);
+            Size = new Size(1068, 660);
+            MinimumSize = new Size(890, 550);
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Segoe UI", 9f);
 
             var topBar = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 88,
-                Padding = new Padding(12, 8, 12, 8),
+                Height = ThemeManager.F89,
+                Padding = new Padding(ThemeManager.F13, ThemeManager.F8, ThemeManager.F13, ThemeManager.F8),
                 Tag = "ElevatedPanel"
             };
 
@@ -777,39 +756,36 @@ namespace WinParted.UI.Dialogs
                 Dock = DockStyle.Fill,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = true,
-                Padding = new Padding(0, 4, 0, 0)
+                Padding = new Padding(0, ThemeManager.F5, 0, 0)
             };
             topBar.Controls.Add(row2);
 
             var row1 = new FlowLayoutPanel
             {
                 Dock = DockStyle.Top,
-                Height = 36,
+                Height = ThemeManager.F34,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = false
             };
             topBar.Controls.Add(row1);
 
-            row1.Controls.Add(new Label { Text = "LBA Sector:", AutoSize = true, Margin = new Padding(0, 6, 8, 0) });
+            row1.Controls.Add(new Label { Text = "LBA Sector:", AutoSize = true, Margin = new Padding(0, ThemeManager.F5, ThemeManager.F8, 0) });
             long maxLba = Math.Max(0, disk.TotalSizeBytes / Math.Max(512, disk.LogicalSectorSize) - 1);
             _numLba = new NumericUpDown
             {
-                Width = 150,
+                Width = ThemeManager.F144,
                 Minimum = 0,
                 Maximum = maxLba,
                 Value = Math.Min(maxLba, Math.Max(0, initialLba)),
                 ThousandsSeparator = true,
-                Margin = new Padding(0, 2, 8, 0)
+                Margin = new Padding(0, 2, ThemeManager.F8, 0)
             };
             row1.Controls.Add(_numLba);
 
             var btnGo = new Button
             {
                 Text = "Read Sector",
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(108, 28),
-                Padding = new Padding(10, 3, 10, 3),
+                Size = new Size(110, 26),
                 Margin = new Padding(0, 1, 0, 0),
                 Tag = "PrimaryButton"
             };
@@ -827,10 +803,10 @@ namespace WinParted.UI.Dialogs
             Action syncTopBar = () =>
             {
                 if (topBar.IsDisposed || row2.IsDisposed) return;
-                int availW = Math.Max(200, topBar.ClientSize.Width - topBar.Padding.Horizontal);
+                int availW = Math.Max(ThemeManager.F233, topBar.ClientSize.Width - topBar.Padding.Horizontal);
                 int rows = 1;
                 int curX = row2.Padding.Left;
-                int rowH = 32;
+                int rowH = ThemeManager.F34;
                 foreach (Control c in row2.Controls)
                 {
                     if (!c.Visible) continue;
@@ -844,7 +820,7 @@ namespace WinParted.UI.Dialogs
                     }
                     curX += span;
                 }
-                int desiredH = topBar.Padding.Vertical + row1.Height + row2.Padding.Vertical + Math.Max(34, rows * rowH + 4);
+                int desiredH = Math.Max(ThemeManager.F89, topBar.Padding.Vertical + row1.Height + row2.Padding.Vertical + Math.Max(ThemeManager.F34, rows * rowH + ThemeManager.F5));
                 if (topBar.Height != desiredH)
                     topBar.Height = desiredH;
             };
@@ -852,19 +828,42 @@ namespace WinParted.UI.Dialogs
 
             var split = new SplitContainer
             {
-                Size = new Size(760, 500),
+                Size = new Size(890, 550),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
-                Panel1MinSize = 25,
-                Panel2MinSize = 25
+                Panel1MinSize = ThemeManager.F144,
+                Panel2MinSize = ThemeManager.F89,
+                SplitterWidth = ThemeManager.F8
             };
-            IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(split, 300);
+            ThemeManager.ApplyGoldenSplitter(split, true, ThemeManager.F144, ThemeManager.F89);
+            split.Resize += (s, e) => ThemeManager.ApplyGoldenSplitter(split, true, ThemeManager.F144, ThemeManager.F89);
+
+            var bottomBar = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = ThemeManager.F55,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(ThemeManager.F21, ThemeManager.F8, ThemeManager.F21, ThemeManager.F8),
+                Tag = "ElevatedPanel"
+            };
+            var btnCloseHex = new Button
+            {
+                Text = "Close",
+                DialogResult = DialogResult.OK,
+                Size = new Size(ThemeManager.F89, ThemeManager.F34),
+                Margin = new Padding(0),
+                Tag = "TonalButton"
+            };
+            bottomBar.Controls.Add(btnCloseHex);
+            CancelButton = btnCloseHex;
+
             Controls.Add(split);
             Controls.Add(topBar);
+            Controls.Add(bottomBar);
             Load += (s, e) =>
             {
                 syncTopBar();
-                IntegratedFileSystemExplorerControl.SetSplitterDistanceSafe(split, 300);
+                ThemeManager.ApplyGoldenSplitter(split, true, ThemeManager.F144, ThemeManager.F89);
             };
 
             _txtHex = new TextBox
@@ -904,14 +903,12 @@ namespace WinParted.UI.Dialogs
 
         private void AddQuickBtn(Control parent, string text, long lba)
         {
+            Size phi = ThemeManager.GoldenButtonSize(26, text, Font);
             var btn = new Button
             {
                 Text = text,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(80, 26),
-                Padding = new Padding(8, 2, 8, 2),
-                Margin = new Padding(0, 3, 5, 3)
+                Size = phi,
+                Margin = new Padding(0, ThemeManager.F3, ThemeManager.F5, ThemeManager.F3)
             };
             btn.Click += (s, e) =>
             {
@@ -1049,8 +1046,8 @@ namespace WinParted.UI.Dialogs
         public AlignmentAndHealthDialog(DiskInfo disk)
         {
             Text = "Alignment & Disk Health Analyzer — " + disk.DisplayName;
-            Size = new Size(880, 520);
-            MinimumSize = new Size(760, 440);
+            Size = new Size(890, 550);
+            MinimumSize = new Size(760, 470);
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Segoe UI", 9f);
 
@@ -1079,25 +1076,22 @@ namespace WinParted.UI.Dialogs
                     p.IsAligned1MiB ? "OPTIMAL" : "Suboptimal"));
             }
 
-            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(14) };
+            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F21) };
             Controls.Add(root);
 
             var bottomBar = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 56,
+                Height = ThemeManager.F55,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 8)
+                Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
             };
             var btnClose = new Button
             {
                 Text = "Close",
                 DialogResult = DialogResult.OK,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(100, 34),
-                Padding = new Padding(14, 2, 14, 2),
-                Margin = new Padding(0, 2, 0, 2),
+                Size = new Size(ThemeManager.F89, ThemeManager.F34),
+                Margin = new Padding(0),
                 Tag = "PrimaryButton"
             };
             bottomBar.Controls.Add(btnClose);

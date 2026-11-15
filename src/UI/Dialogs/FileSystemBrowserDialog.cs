@@ -18,8 +18,8 @@ namespace WinParted.UI.Dialogs
         {
             Text = string.Format("Foreign Filesystem Explorer — {0} ({1})",
                 volume.MountPath, FileSystemColors.GetDisplayName(volume.FileSystem));
-            Size = new Size(1240, 760);
-            MinimumSize = new Size(980, 600);
+            Size = new Size(1262, 780);
+            MinimumSize = new Size(ThemeManager.F987, ThemeManager.F610);
             StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Segoe UI", 9f);
 
@@ -32,8 +32,8 @@ namespace WinParted.UI.Dialogs
             var bottomBar = new Panel
             {
                 Dock = DockStyle.Bottom,
-                Height = 56,
-                Padding = new Padding(12, 10, 12, 10),
+                Height = ThemeManager.F55,
+                Padding = new Padding(ThemeManager.F21, ThemeManager.F8, ThemeManager.F21, ThemeManager.F8),
                 Tag = "ElevatedPanel"
             };
             var lblHint = new Label
@@ -46,16 +46,14 @@ namespace WinParted.UI.Dialogs
             var spacer = new Panel
             {
                 Dock = DockStyle.Right,
-                Width = 12,
+                Width = ThemeManager.F13,
                 Tag = "ElevatedPanel"
             };
             var btnClose = new Button
             {
                 Dock = DockStyle.Right,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(100, 34),
-                Padding = new Padding(12, 2, 12, 2),
+                Width = ThemeManager.F89,
+                Height = ThemeManager.F34,
                 Text = "Close",
                 Tag = "TonalButton",
                 DialogResult = DialogResult.Cancel
