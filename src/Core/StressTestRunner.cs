@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using WinParted.Models;
@@ -735,14 +736,21 @@ namespace WinParted.Core
             if (disk.Partitions.Count != 6)
                 throw new Exception("Expected 6 non-Microsoft partitions in Stress 8 image, got " + disk.Partitions.Count);
 
-            // Strip WinParted synthetic hints (WPL: and WPROFS01) from HFS+ partition so label + catalog tree are proven to come purely from Big-Endian HFS+ B-Tree
+            // Strip WinParted synthetic hints (WPL: and WPROFS01) from APFS and HFS+ partitions so labels + trees are proven to come purely from on-disk B-Trees
+            byte[] zeroSlot = new byte[32];
+            var apfsPartRaw = disk.Partitions[3];
+            apfsPartRaw.Label = string.Empty;
+            RawDiskEngine.WriteBytes(disk, apfsPartRaw.StartingOffset + 0x1A0, zeroSlot);
+            RawDiskEngine.WriteBytes(disk, apfsPartRaw.StartingOffset + 0x3000, new byte[4096]);
+
             var hfsPartRaw = disk.Partitions[4];
             hfsPartRaw.Label = string.Empty;
-            byte[] zeroSlot = new byte[32];
             RawDiskEngine.WriteBytes(disk, hfsPartRaw.StartingOffset + 0x1A0, zeroSlot);
             RawDiskEngine.WriteBytes(disk, hfsPartRaw.StartingOffset + 0x3000, new byte[4096]);
 
             disk = RawDiskEngine.LoadVirtualDisk(imgPath, 98);
+            if (disk.Partitions[3].Label != "ro-apfs")
+                throw new Exception("APFS OMAP/APSB volume label extraction failed: got '" + disk.Partitions[3].Label + "'");
             if (disk.Partitions[4].Label != "ro-hfsplus")
                 throw new Exception("HFS+ Catalog B-Tree volume label extraction failed: got '" + disk.Partitions[4].Label + "'");
 
@@ -759,8 +767,10 @@ namespace WinParted.Core
                 VerifyRoMountAndFile(disk, disk.Partitions[1], "/etc/filesystems", "btrfs");
                 VerifyRoMountAndFile(disk, disk.Partitions[2], "/home/ReadMe.txt", "XFS");
 
-                // 3. Apple APFS, pure Big-Endian HFS+ Catalog B-Tree, Classic HFS
-                VerifyRoMountAndFile(disk, disk.Partitions[3], "/System/Library/CoreServices/SystemVersion.plist", "<string>apfs</string>");
+                // 3. Pure Apple APFS Container/OMAP/FS-Tree, Big-Endian HFS+ Catalog B-Tree, Classic HFS
+                VerifyRoMountAndFile(disk, disk.Partitions[3], "/System/Library/CoreServices/SystemVersion.plist", "<string>APFS</string>");
+                VerifyRoMountAndFile(disk, disk.Partitions[3], "/Users/Shared/ReadMe.txt", "ro-apfs");
+                VerifyRoMountAndFile(disk, disk.Partitions[3], "/.VolumeLabel", "ro-apfs");
                 VerifyRoMountAndFile(disk, disk.Partitions[4], "/.hfsplus_volume_info.txt", "Catalog B-Tree Summary");
                 VerifyRoMountAndFile(disk, disk.Partitions[4], "/System/Library/CoreServices/SystemVersion.plist", "<string>hfs+</string>");
                 VerifyRoMountAndFile(disk, disk.Partitions[4], "/Users/Shared/ReadMe.txt", "hfs+");
@@ -768,7 +778,12 @@ namespace WinParted.Core
 
                 // 4. Verify Search & Host Copy (File + Recursive Folder) in strictly Read-Only mode
                 var extVol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, disk.Partitions[0].StartingOffset);
+                var apfsVol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, disk.Partitions[3].StartingOffset);
                 var hfsVol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, disk.Partitions[4].StartingOffset);
+
+                var apfsHits = ReadOnlyFileSystemMountEngine.SearchVolume(apfsVol, "SystemVersion.plist");
+                if (apfsHits.Count != 1 || apfsHits[0].FullPath != "/System/Library/CoreServices/SystemVersion.plist")
+                    throw new Exception("SearchVolume failed on APFS: expected /System/Library/CoreServices/SystemVersion.plist.");
 
                 var hfsHits = ReadOnlyFileSystemMountEngine.SearchVolume(hfsVol, "SystemVersion.plist");
                 if (hfsHits.Count != 1 || hfsHits[0].FullPath != "/System/Library/CoreServices/SystemVersion.plist")
@@ -794,6 +809,13 @@ namespace WinParted.Core
                 int fCount;
                 int dCount;
                 long bCount;
+                string apfsExportRoot = Path.Combine(tempDir, "host_export_apfs");
+                var apfsSystemDir = FindFsNodeByPath(apfsVol.RootNode, "/System");
+                ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[3], apfsSystemDir, apfsExportRoot, out fCount, out dCount, out bCount);
+                string exportedApfsFile = Path.Combine(apfsExportRoot, "System", "Library", "CoreServices", "SystemVersion.plist");
+                if (!File.Exists(exportedApfsFile) || File.ReadAllText(exportedApfsFile).IndexOf("ro-apfs", StringComparison.OrdinalIgnoreCase) < 0 || fCount < 1 || dCount < 3)
+                    throw new Exception("Recursive APFS folder copy to host failed.");
+
                 string hfsExportRoot = Path.Combine(tempDir, "host_export_hfs");
                 var usersDir = FindFsNodeByPath(hfsVol.RootNode, "/Users");
                 ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[4], usersDir, hfsExportRoot, out fCount, out dCount, out bCount);
@@ -816,6 +838,9 @@ namespace WinParted.Core
 
             // 4b. Verify >16 MiB Multi-Extent + HFS+ Extents Overflow B-Tree Streaming Copy (20 MiB BaseSystem.dmg)
             VerifyLargeHfsPlusOverflowExport(tempDir, log);
+
+            // 4b2. Verify Multi-Volume / Multi-Level APFS Container B-Tree, Sparse Multi-Extent Export, & decmpfs
+            VerifyAdvancedApfsContainerExport(tempDir, log);
 
             // 4c. Verify Btrfs, XFS, Ext2 & Dev Filesystems (F2FS, ZFS, SquashFS, ISO9660, UDF)
             VerifyDevFileSystemsMountAndFormat(tempDir, log);
@@ -1672,6 +1697,308 @@ namespace WinParted.Core
                 WriteBE32(buf, dataOff + 104 + i * 8 + 4, blockCounts[i]);
             }
             return dataOff + 168;
+        }
+
+        private static byte[] BuildZlibDecmpfsValue(byte[] plainBytes)
+        {
+            byte[] deflatePayload;
+            using (var ms = new MemoryStream())
+            {
+                ms.WriteByte(0x78);
+                ms.WriteByte(0x9C);
+                using (var def = new DeflateStream(ms, CompressionMode.Compress, true))
+                {
+                    def.Write(plainBytes, 0, plainBytes.Length);
+                }
+                deflatePayload = ms.ToArray();
+            }
+
+            // j_xattr_val_t: flags(2)=2 (XATTR_DATA_EMBEDDED) | xdata_len(2) | decmpfs hdr(16) + payload
+            int xdataLen = 16 + deflatePayload.Length;
+            byte[] val = new byte[4 + xdataLen];
+            BitConverter.GetBytes((ushort)2).CopyTo(val, 0);
+            BitConverter.GetBytes((ushort)xdataLen).CopyTo(val, 2);
+            BitConverter.GetBytes(0x636D7066U).CopyTo(val, 4 + 0); // 'fpmc'
+            BitConverter.GetBytes(3U).CopyTo(val, 4 + 4);          // type 3: inline zlib
+            BitConverter.GetBytes((ulong)plainBytes.Length).CopyTo(val, 4 + 8);
+            Array.Copy(deflatePayload, 0, val, 4 + 16, deflatePayload.Length);
+            return val;
+        }
+
+        /// <summary>
+        /// Verifies real-world APFS container structures with zero synthetic WinParted hints:
+        /// checkpoint descriptor ring superblock discovery (stale block 0 vs newer o_xid checkpoint),
+        /// 2-level Container OMAP + Volume OMAP + 2-level FS-Tree, clone private_id multi-extent + sparse hole export,
+        /// inline zlib <c>com.apple.decmpfs</c> decompression, and dual-volume Macintosh HD + Data merging.
+        /// </summary>
+        private static void VerifyAdvancedApfsContainerExport(string tempDir, Action<string> log)
+        {
+            const long DiskBytes = 32L * 1048576L;
+            const int BlockSize = 4096;
+            const ulong TotalBlocks = 7168UL; // 28 MiB partition
+
+            string apfsImg = Path.Combine(tempDir, "stress8_apfs_advanced.img");
+            var disk = RawDiskEngine.CreateBlankVirtualDisk(apfsImg, DiskBytes, PartitionTableStyle.GPT);
+            disk.DiskNumber = 96;
+
+            long partStart = 1 * MiB;
+            long partLen = 28 * MiB;
+            var qm = new OperationQueueManager();
+            qm.SetBaselineDisks(null, new[] { disk });
+            qm.Enqueue(MakeCreateOp(96, apfsImg, partStart, partLen, FileSystemType.APFS, "InitApfs"));
+            qm.ApplyAll();
+
+            disk = RawDiskEngine.LoadVirtualDisk(apfsImg, 96);
+            var apfsPart = disk.Partitions[0];
+
+            // Wipe the entire partition header completely clean so zero synthetic WPROFS01 / WPL: / WPU: hints remain
+            byte[] zeroHdr = new byte[128 * 1024];
+            RawDiskEngine.WriteBytes(disk, apfsPart.StartingOffset, zeroHdr);
+
+            // Prepare container metadata blocks 0..49
+            byte[] meta = new byte[50 * BlockSize];
+            byte[] fsUuidBytes = Guid.NewGuid().ToByteArray();
+
+            // Block 0: Stale NXSB (o_xid = 1, empty fs_oid[]) pointing to checkpoint descriptor ring blocks 2..5
+            BitConverter.GetBytes(1UL).CopyTo(meta, 0x08);
+            BitConverter.GetBytes(1UL).CopyTo(meta, 0x10);
+            BitConverter.GetBytes(0x80000001U).CopyTo(meta, 0x18);
+            Encoding.ASCII.GetBytes("NXSB").CopyTo(meta, 0x20);
+            BitConverter.GetBytes((uint)BlockSize).CopyTo(meta, 0x24);
+            BitConverter.GetBytes(TotalBlocks).CopyTo(meta, 0x28);
+            fsUuidBytes.CopyTo(meta, 0x48);
+            BitConverter.GetBytes(4U).CopyTo(meta, 0x68);   // nx_xp_desc_blocks = 4 (blocks 2..5)
+            BitConverter.GetBytes(2L).CopyTo(meta, 0x70);   // nx_xp_desc_base = block 2
+            BitConverter.GetBytes(100U).CopyTo(meta, 0xB4); // nx_max_file_systems
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(meta, 0, BlockSize);
+
+            // Block 4 (in checkpoint ring): Live latest NXSB (o_xid = 5) pointing to Container OMAP at block 10 and two volumes (0x402, 0x403)
+            int ckOff = 4 * BlockSize;
+            Array.Copy(meta, 0, meta, ckOff, BlockSize);
+            BitConverter.GetBytes(5UL).CopyTo(meta, ckOff + 0x10);      // o_xid = 5
+            BitConverter.GetBytes(10UL).CopyTo(meta, ckOff + 0xA0);     // nx_omap_oid = 10
+            BitConverter.GetBytes(0x402UL).CopyTo(meta, ckOff + 0xB8);  // nx_fs_oid[0] = Macintosh HD
+            BitConverter.GetBytes(0x403UL).CopyTo(meta, ckOff + 0xC0);  // nx_fs_oid[1] = Macintosh HD - Data
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(meta, ckOff, BlockSize);
+
+            // Block 10: Container OMAP phys header -> 2-level OMAP root internal node at block 11
+            RawDiskEngine.WriteApfsOmapHeaderBlock(meta, 10 * BlockSize, 10UL, 5UL, 11UL);
+
+            // Block 11: Container OMAP internal node (btn_level = 1) -> leaf1 (block 12) for <=0x402, leaf2 (block 13) for >=0x403
+            var contOmapIdx = new List<RawDiskEngine.ApfsBTreeRecord>
+            {
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x402UL, 1UL), Val = BitConverter.GetBytes(12UL) },
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x403UL, 1UL), Val = BitConverter.GetBytes(13UL) }
+            };
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 11 * BlockSize, BlockSize, 11UL, 5UL, 0x40000002U, 0x000BU, 0x0005, 1, 16U, 16U, 3UL, contOmapIdx);
+
+            // Block 12: Container OMAP leaf1 (old deleted tombstone xid=4 for 0x402? no, xid=4 -> block 999, newer xid=5 -> block 20!)
+            var contOmapLeaf1 = new List<RawDiskEngine.ApfsBTreeRecord>
+            {
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x402UL, 4UL), Val = RawDiskEngine.BuildApfsOmapVal(0U, 4096U, 999UL) },
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x402UL, 5UL), Val = RawDiskEngine.BuildApfsOmapVal(0U, 4096U, 20UL) }
+            };
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 12 * BlockSize, BlockSize, 12UL, 5UL, 0x40000003U, 0x000BU, 0x0006, 0, 16U, 16U, 0UL, contOmapLeaf1);
+
+            // Block 13: Container OMAP leaf2 -> 0x403 @ xid 5 -> block 30
+            var contOmapLeaf2 = new List<RawDiskEngine.ApfsBTreeRecord>
+            {
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x403UL, 5UL), Val = RawDiskEngine.BuildApfsOmapVal(0U, 4096U, 30UL) }
+            };
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 13 * BlockSize, BlockSize, 13UL, 5UL, 0x40000003U, 0x000BU, 0x0006, 0, 16U, 16U, 0UL, contOmapLeaf2);
+
+            // ---------------- Volume 0: "Macintosh HD" at block 20 (with 2-level FS-Tree) ----------------
+            int apsb0 = 20 * BlockSize;
+            BitConverter.GetBytes(0x402UL).CopyTo(meta, apsb0 + 0x08);
+            BitConverter.GetBytes(5UL).CopyTo(meta, apsb0 + 0x10);
+            BitConverter.GetBytes(0x8000000DU).CopyTo(meta, apsb0 + 0x18);
+            Encoding.ASCII.GetBytes("APSB").CopyTo(meta, apsb0 + 0x20);
+            BitConverter.GetBytes(40UL).CopyTo(meta, apsb0 + 0x58);       // alloc count
+            BitConverter.GetBytes(21UL).CopyTo(meta, apsb0 + 0x80);       // apfs_omap_oid = 21
+            BitConverter.GetBytes(0x500UL).CopyTo(meta, apsb0 + 0x88);    // apfs_root_tree_oid = 0x500 (virtual internal root)
+            Guid.NewGuid().ToByteArray().CopyTo(meta, apsb0 + 0xF0);
+            BitConverter.GetBytes(1UL).CopyTo(meta, apsb0 + 0x108);       // APFS_FS_UNENCRYPTED
+            Encoding.UTF8.GetBytes("Macintosh HD").CopyTo(meta, apsb0 + 0x2C0);
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(meta, apsb0, BlockSize);
+
+            // Volume 0 OMAP @ block 21 -> leaf @ block 22 mapping FS-Tree nodes 0x500->23, 0x501->24, 0x502->25
+            RawDiskEngine.WriteApfsOmapHeaderBlock(meta, 21 * BlockSize, 21UL, 5UL, 22UL);
+            var vol0OmapRecs = new List<RawDiskEngine.ApfsBTreeRecord>
+            {
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x500UL, 5UL), Val = RawDiskEngine.BuildApfsOmapVal(0U, 4096U, 23UL) },
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x501UL, 5UL), Val = RawDiskEngine.BuildApfsOmapVal(0U, 4096U, 24UL) },
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x502UL, 5UL), Val = RawDiskEngine.BuildApfsOmapVal(0U, 4096U, 25UL) }
+            };
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 22 * BlockSize, BlockSize, 22UL, 5UL, 0x40000002U, 0x000BU, 0x0007, 0, 16U, 16U, 1UL, vol0OmapRecs);
+
+            // Volume 0 FS-Tree Internal Root @ block 23 (0x500, btn_level=1) -> 0x501 (leaf 1) and 0x502 (leaf 2)
+            var fs0IdxRecs = new List<RawDiskEngine.ApfsBTreeRecord>
+            {
+                new RawDiskEngine.ApfsBTreeRecord { Key = BitConverter.GetBytes(2UL | (3UL << 60)), Val = BitConverter.GetBytes(0x501UL) },
+                new RawDiskEngine.ApfsBTreeRecord { Key = BitConverter.GetBytes(30UL | (3UL << 60)), Val = BitConverter.GetBytes(0x502UL) }
+            };
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 23 * BlockSize, BlockSize, 0x500UL, 5UL, 0x80000002U, 0x000EU, 0x0009, 1, 0U, 0U, 3UL, fs0IdxRecs);
+
+            // Prepare zlib decmpfs content for /CompressedNotes.txt (inode 20)
+            string compressedPlainText = "APFS Transparent zlib com.apple.decmpfs test payload: " + new string('Z', 240) + "-END-APFS-DECMPFS!";
+            byte[] compressedPlainBytes = Encoding.UTF8.GetBytes(compressedPlainText);
+
+            // Volume 0 FS-Tree Leaf 1 @ block 24 (0x501): root(2), Users(16 empty stub), CompressedNotes.txt(20), DirRecs
+            var fs0Leaf1 = new List<RawDiskEngine.ApfsBTreeRecord>();
+            RawDiskEngine.AddApfsDirInode(fs0Leaf1, 2UL, 1UL, "Macintosh HD", 0x41ED);
+            RawDiskEngine.AddApfsDirInode(fs0Leaf1, 16UL, 2UL, "Users", 0x41ED);
+
+            // Inode 20: CompressedNotes.txt with bsd_flags=0x20 (UF_COMPRESSED) & xattr com.apple.decmpfs
+            RawDiskEngine.AddApfsFileRecords(fs0Leaf1, 20UL, 2UL, "CompressedNotes.txt", 0UL, 0UL, 0L);
+            byte[] xattrKey = new byte[10 + "com.apple.decmpfs\0".Length];
+            BitConverter.GetBytes(20UL | (4UL << 60)).CopyTo(xattrKey, 0);
+            byte[] xNameBytes = Encoding.UTF8.GetBytes("com.apple.decmpfs\0");
+            BitConverter.GetBytes((ushort)xNameBytes.Length).CopyTo(xattrKey, 8);
+            Array.Copy(xNameBytes, 0, xattrKey, 10, xNameBytes.Length);
+            fs0Leaf1.Add(new RawDiskEngine.ApfsBTreeRecord
+            {
+                SortObjId = 20UL,
+                SortRecType = 4,
+                Key = xattrKey,
+                Val = BuildZlibDecmpfsValue(compressedPlainBytes)
+            });
+
+            RawDiskEngine.AddApfsDirRec(fs0Leaf1, 2UL, "Users", 16UL, 4);
+            RawDiskEngine.AddApfsDirRec(fs0Leaf1, 2UL, "CompressedNotes.txt", 20UL, 8);
+            RawDiskEngine.AddApfsDirRec(fs0Leaf1, 2UL, "LargeSparseMultiExtent.bin", 30UL, 8);
+            fs0Leaf1.Sort(delegate(RawDiskEngine.ApfsBTreeRecord a, RawDiskEngine.ApfsBTreeRecord b)
+            {
+                int c = a.SortObjId.CompareTo(b.SortObjId);
+                return (c != 0) ? c : a.SortRecType.CompareTo(b.SortRecType);
+            });
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 24 * BlockSize, BlockSize, 0x501UL, 5UL, 0x80000003U, 0x000EU, 0x000A, 0, 0U, 0U, 0UL, fs0Leaf1);
+
+            // Volume 0 FS-Tree Leaf 2 @ block 25 (0x502): Inode 30 with clone private_id = 9001 and non-contiguous extents + sparse hole
+            const ulong clonePrivId = 9001UL;
+            const long ext1Bytes = 65536L;  // phys blocks 100..115
+            const long holeBytes = 8192L;   // sparse zero hole [65536..73727]
+            const long ext2Bytes = 65536L;  // phys blocks 200..215
+            const long largeFileTotal = ext1Bytes + holeBytes + ext2Bytes; // 139,264 bytes
+
+            var fs0Leaf2 = new List<RawDiskEngine.ApfsBTreeRecord>();
+            RawDiskEngine.AddApfsFileRecords(fs0Leaf2, 30UL, 2UL, "LargeSparseMultiExtent.bin", (ulong)largeFileTotal, 0UL, 0L);
+            // Patch private_id of inode 30 record to clonePrivId (9001) to prove clone private_id extent lookup
+            BitConverter.GetBytes(clonePrivId).CopyTo(fs0Leaf2[0].Val, 0x08);
+            RawDiskEngine.AddApfsFileExtent(fs0Leaf2, clonePrivId, 0UL, ext1Bytes, 100UL);
+            RawDiskEngine.AddApfsFileExtent(fs0Leaf2, clonePrivId, (ulong)(ext1Bytes + holeBytes), ext2Bytes, 200UL);
+            fs0Leaf2.Sort(delegate(RawDiskEngine.ApfsBTreeRecord a, RawDiskEngine.ApfsBTreeRecord b)
+            {
+                int c = a.SortObjId.CompareTo(b.SortObjId);
+                return (c != 0) ? c : a.SortRecType.CompareTo(b.SortRecType);
+            });
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 25 * BlockSize, BlockSize, 0x502UL, 5UL, 0x80000003U, 0x000EU, 0x000A, 0, 0U, 0U, 0UL, fs0Leaf2);
+
+            // ---------------- Volume 1: "Macintosh HD - Data" at block 30 ----------------
+            int apsb1 = 30 * BlockSize;
+            BitConverter.GetBytes(0x403UL).CopyTo(meta, apsb1 + 0x08);
+            BitConverter.GetBytes(5UL).CopyTo(meta, apsb1 + 0x10);
+            BitConverter.GetBytes(0x8000000DU).CopyTo(meta, apsb1 + 0x18);
+            Encoding.ASCII.GetBytes("APSB").CopyTo(meta, apsb1 + 0x20);
+            BitConverter.GetBytes(10UL).CopyTo(meta, apsb1 + 0x58);
+            BitConverter.GetBytes(31UL).CopyTo(meta, apsb1 + 0x80);
+            BitConverter.GetBytes(0x600UL).CopyTo(meta, apsb1 + 0x88);
+            Guid.NewGuid().ToByteArray().CopyTo(meta, apsb1 + 0xF0);
+            BitConverter.GetBytes(1UL).CopyTo(meta, apsb1 + 0x108);
+            Encoding.UTF8.GetBytes("Macintosh HD - Data").CopyTo(meta, apsb1 + 0x2C0);
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(meta, apsb1, BlockSize);
+
+            RawDiskEngine.WriteApfsOmapHeaderBlock(meta, 31 * BlockSize, 31UL, 5UL, 32UL);
+            var vol1OmapRecs = new List<RawDiskEngine.ApfsBTreeRecord>
+            {
+                new RawDiskEngine.ApfsBTreeRecord { Key = RawDiskEngine.BuildApfsOmapKey(0x600UL, 5UL), Val = RawDiskEngine.BuildApfsOmapVal(0U, 4096U, 33UL) }
+            };
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 32 * BlockSize, BlockSize, 32UL, 5UL, 0x40000002U, 0x000BU, 0x0007, 0, 16U, 16U, 1UL, vol1OmapRecs);
+
+            string dataVolTxt = "APFS Data Volume User Document (Merged Firmlink /Users/tester/notes.md)\n";
+            byte[] dataVolBytes = Encoding.UTF8.GetBytes(dataVolTxt);
+            var fs1Leaf = new List<RawDiskEngine.ApfsBTreeRecord>();
+            RawDiskEngine.AddApfsDirInode(fs1Leaf, 2UL, 1UL, "Macintosh HD - Data", 0x41ED);
+            RawDiskEngine.AddApfsDirInode(fs1Leaf, 40UL, 2UL, "Users", 0x41ED);
+            RawDiskEngine.AddApfsDirInode(fs1Leaf, 41UL, 40UL, "tester", 0x41ED);
+            RawDiskEngine.AddApfsFileRecords(fs1Leaf, 42UL, 41UL, "notes.md", (ulong)dataVolBytes.Length, 45UL, 4096L);
+            RawDiskEngine.AddApfsDirRec(fs1Leaf, 2UL, "Users", 40UL, 4);
+            RawDiskEngine.AddApfsDirRec(fs1Leaf, 40UL, "tester", 41UL, 4);
+            RawDiskEngine.AddApfsDirRec(fs1Leaf, 41UL, "notes.md", 42UL, 8);
+            fs1Leaf.Sort(delegate(RawDiskEngine.ApfsBTreeRecord a, RawDiskEngine.ApfsBTreeRecord b)
+            {
+                int c = a.SortObjId.CompareTo(b.SortObjId);
+                return (c != 0) ? c : a.SortRecType.CompareTo(b.SortRecType);
+            });
+            RawDiskEngine.WriteApfsBTreeNodeBlock(meta, 33 * BlockSize, BlockSize, 0x600UL, 5UL, 0x80000002U, 0x000EU, 0x000B, 0, 0U, 0U, 1UL, fs1Leaf);
+            Array.Copy(dataVolBytes, 0, meta, 45 * BlockSize, dataVolBytes.Length);
+
+            // Write metadata blocks 0..49
+            RawDiskEngine.WriteBytes(disk, apfsPart.StartingOffset, meta);
+
+            // Write LargeSparseMultiExtent.bin extent1 (blocks 100..115) & extent2 (blocks 200..215)
+            byte[] ext1Buf = new byte[ext1Bytes];
+            for (int i = 0; i < ext1Buf.Length; i++) ext1Buf[i] = (byte)(0xA1 ^ (i & 0x3F));
+            Encoding.ASCII.GetBytes("APFS-EXTENT-1-START").CopyTo(ext1Buf, 0);
+
+            byte[] ext2Buf = new byte[ext2Bytes];
+            for (int i = 0; i < ext2Buf.Length; i++) ext2Buf[i] = (byte)(0x5B ^ (i & 0x1F));
+            Encoding.ASCII.GetBytes("APFS-EXTENT-2-TAIL!").CopyTo(ext2Buf, ext2Buf.Length - 19);
+
+            RawDiskEngine.WriteBytes(disk, apfsPart.StartingOffset + 100L * BlockSize, ext1Buf);
+            RawDiskEngine.WriteBytes(disk, apfsPart.StartingOffset + 200L * BlockSize, ext2Buf);
+
+            // Reload virtual disk from scratch and assert pure metadata inspection
+            disk = RawDiskEngine.LoadVirtualDisk(apfsImg, 96);
+            apfsPart = disk.Partitions[0];
+            if (apfsPart.FileSystem != FileSystemType.APFS)
+                throw new Exception("Advanced APFS image was not detected as APFS.");
+            if (apfsPart.Label != "Macintosh HD")
+                throw new Exception("Advanced APFS checkpoint/OMAP label extraction failed: got '" + apfsPart.Label + "'");
+
+            var vol = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, apfsPart, true);
+            try
+            {
+                // Verify decmpfs zlib-compressed file
+                VerifyRoMountAndFile(disk, apfsPart, "/CompressedNotes.txt", "-END-APFS-DECMPFS!");
+                var decNode = FindFsNodeByPath(vol.RootNode, "/CompressedNotes.txt");
+                byte[] gotDec = ReadOnlyFileSystemMountEngine.ReadFileBytes(disk, apfsPart, decNode, compressedPlainBytes.Length + 64);
+                if (gotDec.Length != compressedPlainBytes.Length || Encoding.UTF8.GetString(gotDec) != compressedPlainText)
+                    throw new Exception("APFS com.apple.decmpfs zlib decompression payload mismatch.");
+
+                // Verify second volume merged firmlink + /Volumes/<VolName> browsing
+                VerifyRoMountAndFile(disk, apfsPart, "/Users/tester/notes.md", "Merged Firmlink");
+                VerifyRoMountAndFile(disk, apfsPart, "/Volumes/Macintosh HD - Data/Users/tester/notes.md", "Merged Firmlink");
+
+                // Export file to host folder and verify multi-extent + sparse zero hole byte-for-byte
+                string exportRoot = Path.Combine(tempDir, "host_export_apfs_advanced");
+                Directory.CreateDirectory(exportRoot);
+                int fc, dc;
+                long bc;
+                var largeNode = FindFsNodeByPath(vol.RootNode, "/LargeSparseMultiExtent.bin");
+                if (largeNode == null || largeNode.SizeBytes != largeFileTotal)
+                    throw new Exception("Advanced APFS /LargeSparseMultiExtent.bin size mismatch.");
+                ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, apfsPart, largeNode, exportRoot, out fc, out dc, out bc);
+
+                string exportedPath = Path.Combine(exportRoot, "LargeSparseMultiExtent.bin");
+                byte[] exported = File.ReadAllBytes(exportedPath);
+                if (exported.Length != largeFileTotal)
+                    throw new Exception("APFS sparse/multi-extent exported size mismatch: " + exported.Length);
+                for (int i = 0; i < ext1Buf.Length; i++)
+                    if (exported[i] != ext1Buf[i])
+                        throw new Exception("APFS extent 1 mismatch at offset " + i);
+                for (int i = 0; i < holeBytes; i++)
+                    if (exported[ext1Buf.Length + i] != 0)
+                        throw new Exception("APFS sparse zero hole corrupted at offset " + i);
+                for (int i = 0; i < ext2Buf.Length; i++)
+                    if (exported[ext1Buf.Length + (int)holeBytes + i] != ext2Buf[i])
+                        throw new Exception("APFS extent 2 mismatch at offset " + i);
+            }
+            finally
+            {
+                ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, apfsPart.StartingOffset);
+            }
+
+            log("  -> Advanced APFS Verified (checkpoint xid=5, 2-level OMAP & FS-Tree, clone private_id sparse multi-extent, zlib decmpfs, multi-volume).");
         }
 
         /// <summary>

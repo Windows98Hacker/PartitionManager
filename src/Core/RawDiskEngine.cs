@@ -1163,12 +1163,36 @@ namespace WinParted.Core
                     if (uuidBytes.Any(b => b != 0))
                         part.UUID = FormatRfcUuid(uuidBytes);
                 }
+
                 string apfsLbl = ReadCustomLabelHint(data, 0x1A0);
-                if (string.IsNullOrEmpty(apfsLbl) && data.Length >= 0x300)
-                    apfsLbl = Encoding.UTF8.GetString(data, 0x2C0, 64).TrimEnd('\0', ' ');
+                long apfsUsed = ReadCustomUsedHint(data, 0x1C0);
+
+                if (string.IsNullOrEmpty(apfsLbl) || apfsUsed < 0 || string.IsNullOrEmpty(part.UUID))
+                {
+                    string volLbl;
+                    string volUuid;
+                    long volUsed;
+                    if (ReadOnlyFileSystemMountEngine.TryReadApfsVolumeMetadata(disk, part, data, out volLbl, out volUuid, out volUsed))
+                    {
+                        if (string.IsNullOrEmpty(apfsLbl) && !string.IsNullOrEmpty(volLbl))
+                            apfsLbl = volLbl;
+                        if (string.IsNullOrEmpty(part.UUID) && !string.IsNullOrEmpty(volUuid))
+                            part.UUID = volUuid;
+                        if (apfsUsed < 0 && volUsed >= 0)
+                            apfsUsed = volUsed;
+                    }
+                }
+
+                if (string.IsNullOrEmpty(apfsLbl) && MatchesAscii(data, 32, "APSB") && data.Length >= 0x3C0)
+                {
+                    int end = 0x2C0;
+                    while (end < 0x3C0 && data[end] != 0) end++;
+                    if (end > 0x2C0)
+                        apfsLbl = Encoding.UTF8.GetString(data, 0x2C0, end - 0x2C0).Trim();
+                }
+
                 if (!string.IsNullOrEmpty(apfsLbl))
                     part.Label = apfsLbl;
-                long apfsUsed = ReadCustomUsedHint(data, 0x1C0);
                 if (apfsUsed >= 0 && apfsUsed <= part.PartitionLength)
                 {
                     part.UsedBytes = apfsUsed;
@@ -1679,20 +1703,33 @@ namespace WinParted.Core
                 case FileSystemType.APFS:
                     uint apfsBlockSize = 4096;
                     ulong apfsBlocks = (ulong)Math.Max(1, part.PartitionLength / apfsBlockSize);
+                    BitConverter.GetBytes(1UL).CopyTo(buf, 0x08);
+                    BitConverter.GetBytes(1UL).CopyTo(buf, 0x10);
+                    BitConverter.GetBytes(0x80000001U).CopyTo(buf, 0x18);
                     Encoding.ASCII.GetBytes("NXSB").CopyTo(buf, 32);
                     BitConverter.GetBytes(apfsBlockSize).CopyTo(buf, 36);
                     BitConverter.GetBytes(apfsBlocks).CopyTo(buf, 40);
                     Guid apfsUuid = Guid.NewGuid();
                     byte[] apfsUuidBytes = apfsUuid.ToByteArray();
                     apfsUuidBytes.CopyTo(buf, 0x48);
-                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                    BitConverter.GetBytes(16UL).CopyTo(buf, 0x58);
+                    BitConverter.GetBytes(3UL).CopyTo(buf, 0x60);
+                    BitConverter.GetBytes(1U).CopyTo(buf, 0x68);
+                    BitConverter.GetBytes(1U).CopyTo(buf, 0x6C);
+                    BitConverter.GetBytes(1L).CopyTo(buf, 0x70);
+                    BitConverter.GetBytes(2L).CopyTo(buf, 0x78);
+                    BitConverter.GetBytes(10UL).CopyTo(buf, 0xA0);
+                    BitConverter.GetBytes(16U).CopyTo(buf, 0xB4);
+                    BitConverter.GetBytes(0x402UL).CopyTo(buf, 0xB8);
                     long apfsUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
-                    WriteCustomUsedHint(buf, 0x1C0, apfsUsed);
                     part.UUID = FormatRfcUuid(apfsUuidBytes);
                     part.UsedBytes = apfsUsed;
                     part.FreeBytes = Math.Max(0, part.PartitionLength - apfsUsed);
                     if (buf.Length >= 0x8000)
                         PopulateReadOnlyFsCatalog(buf, part);
+                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                    WriteCustomUsedHint(buf, 0x1C0, apfsUsed);
+                    ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(buf, 0, 4096);
                     break;
 
                 case FileSystemType.HFSPlus:
@@ -2741,6 +2778,10 @@ namespace WinParted.Core
                 {
                     PopulateHfsPlusCatalogBTree(buf, part, macReadme, plistBytes, labelFile);
                 }
+                else if (part.FileSystem == FileSystemType.APFS && buf.Length >= 0x14000)
+                {
+                    PopulateApfsContainerBTree(buf, part, macReadme, plistBytes, labelFile);
+                }
             }
             else
             {
@@ -2973,6 +3014,331 @@ namespace WinParted.Core
             WriteUInt32BE(buf, d + 104, startBlock);
             WriteUInt32BE(buf, d + 108, blockCount);
             return dataRel + 248;
+        }
+
+        internal sealed class ApfsBTreeRecord
+        {
+            public ulong SortObjId;
+            public int SortRecType;
+            public byte[] Key;
+            public byte[] Val;
+        }
+
+        private static void PopulateApfsContainerBTree(byte[] buf, PartitionEntry part, byte[] macReadme, byte[] plistBytes, byte[] labelFile)
+        {
+            const int blockSize = 4096;
+            if (buf.Length < 19 * blockSize) return;
+
+            // Block 1: Clean checkpoint NXSB descriptor copy (o_xid = 2)
+            Array.Copy(buf, 0, buf, 0x1000, blockSize);
+            BitConverter.GetBytes(2UL).CopyTo(buf, 0x1010);
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(buf, 0x1000, blockSize);
+
+            // Block 10: Container OMAP phys header (om_tree_oid = 11)
+            WriteApfsOmapHeaderBlock(buf, 10 * blockSize, 10UL, 1UL, 11UL);
+
+            // Block 11: Container OMAP B-Tree root leaf (oid 0x402, xid 1 -> paddr 12)
+            var containerOmapRecs = new List<ApfsBTreeRecord>
+            {
+                new ApfsBTreeRecord
+                {
+                    SortObjId = 0x402UL,
+                    Key = BuildApfsOmapKey(0x402UL, 1UL),
+                    Val = BuildApfsOmapVal(0U, 4096U, 12UL)
+                }
+            };
+            WriteApfsBTreeNodeBlock(buf, 11 * blockSize, blockSize, 11UL, 1UL, 0x40000002U, 0x000BU, 0x0007, 0, 16U, 16U, 1UL, containerOmapRecs);
+
+            // Block 12: Volume 0 APSB superblock
+            int apsbOff = 12 * blockSize;
+            BitConverter.GetBytes(0x402UL).CopyTo(buf, apsbOff + 0x08);
+            BitConverter.GetBytes(1UL).CopyTo(buf, apsbOff + 0x10);
+            BitConverter.GetBytes(0x8000000DU).CopyTo(buf, apsbOff + 0x18);
+            BitConverter.GetBytes(0x00000000U).CopyTo(buf, apsbOff + 0x1C);
+            Encoding.ASCII.GetBytes("APSB").CopyTo(buf, apsbOff + 0x20);
+            ulong allocBlocks = (ulong)Math.Max(20L, (part.UsedBytes ?? (20L * blockSize)) / blockSize);
+            BitConverter.GetBytes(allocBlocks).CopyTo(buf, apsbOff + 0x58);
+            BitConverter.GetBytes(0x00000002U).CopyTo(buf, apsbOff + 0x74); // apfs_root_tree_type
+            BitConverter.GetBytes(13UL).CopyTo(buf, apsbOff + 0x80);        // apfs_omap_oid = 13
+            BitConverter.GetBytes(0x404UL).CopyTo(buf, apsbOff + 0x88);     // apfs_root_tree_oid = 0x404
+            BitConverter.GetBytes(100UL).CopyTo(buf, apsbOff + 0xB0);       // apfs_next_obj_id
+            BitConverter.GetBytes(3UL).CopyTo(buf, apsbOff + 0xB8);         // apfs_num_files
+            BitConverter.GetBytes(5UL).CopyTo(buf, apsbOff + 0xC0);         // apfs_num_directories
+            if (buf.Length >= 0x58)
+                Array.Copy(buf, 0x48, buf, apsbOff + 0xF0, 16);             // apfs_vol_uuid
+            BitConverter.GetBytes(1UL).CopyTo(buf, apsbOff + 0x108);        // APFS_FS_UNENCRYPTED
+            string volLabel = string.IsNullOrEmpty(part.Label) ? "Macintosh HD" : part.Label;
+            byte[] volNameBytes = Encoding.UTF8.GetBytes(volLabel);
+            Array.Copy(volNameBytes, 0, buf, apsbOff + 0x2C0, Math.Min(volNameBytes.Length, 255));
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(buf, apsbOff, blockSize);
+
+            // Block 13: Volume OMAP phys header (om_tree_oid = 14)
+            WriteApfsOmapHeaderBlock(buf, 13 * blockSize, 13UL, 1UL, 14UL);
+
+            // Block 14: Volume OMAP B-Tree root leaf (oid 0x404, xid 1 -> paddr 15)
+            var volOmapRecs = new List<ApfsBTreeRecord>
+            {
+                new ApfsBTreeRecord
+                {
+                    SortObjId = 0x404UL,
+                    Key = BuildApfsOmapKey(0x404UL, 1UL),
+                    Val = BuildApfsOmapVal(0U, 4096U, 15UL)
+                }
+            };
+            WriteApfsBTreeNodeBlock(buf, 14 * blockSize, blockSize, 14UL, 1UL, 0x40000002U, 0x000BU, 0x0007, 0, 16U, 16U, 1UL, volOmapRecs);
+
+            // Blocks 16..18: File extent payloads
+            Array.Copy(macReadme, 0, buf, 16 * blockSize, Math.Min(macReadme.Length, blockSize));
+            Array.Copy(plistBytes, 0, buf, 17 * blockSize, Math.Min(plistBytes.Length, blockSize));
+            Array.Copy(labelFile, 0, buf, 18 * blockSize, Math.Min(labelFile.Length, blockSize));
+
+            // Block 15: Volume FS-Tree B-Tree root leaf
+            var fsRecs = new List<ApfsBTreeRecord>();
+            AddApfsDirInode(fsRecs, 2UL, 1UL, volLabel, 0x41ED);
+            AddApfsDirInode(fsRecs, 16UL, 2UL, "System", 0x41ED);
+            AddApfsDirInode(fsRecs, 17UL, 16UL, "Library", 0x41ED);
+            AddApfsDirInode(fsRecs, 18UL, 17UL, "CoreServices", 0x41ED);
+            AddApfsDirInode(fsRecs, 19UL, 2UL, "Users", 0x41ED);
+            AddApfsDirInode(fsRecs, 20UL, 19UL, "Shared", 0x41ED);
+
+            AddApfsFileRecords(fsRecs, 21UL, 2UL, ".VolumeLabel", (ulong)labelFile.Length, 18UL, 4096L);
+            AddApfsFileRecords(fsRecs, 22UL, 18UL, "SystemVersion.plist", (ulong)plistBytes.Length, 17UL, 4096L);
+            AddApfsFileRecords(fsRecs, 23UL, 20UL, "ReadMe.txt", (ulong)macReadme.Length, 16UL, 4096L);
+
+            AddApfsDirRec(fsRecs, 2UL, "System", 16UL, 4);
+            AddApfsDirRec(fsRecs, 16UL, "Library", 17UL, 4);
+            AddApfsDirRec(fsRecs, 17UL, "CoreServices", 18UL, 4);
+            AddApfsDirRec(fsRecs, 2UL, "Users", 19UL, 4);
+            AddApfsDirRec(fsRecs, 19UL, "Shared", 20UL, 4);
+            AddApfsDirRec(fsRecs, 2UL, ".VolumeLabel", 21UL, 8);
+            AddApfsDirRec(fsRecs, 18UL, "SystemVersion.plist", 22UL, 8);
+            AddApfsDirRec(fsRecs, 20UL, "ReadMe.txt", 23UL, 8);
+
+            fsRecs.Sort(delegate(ApfsBTreeRecord a, ApfsBTreeRecord b)
+            {
+                int c = a.SortObjId.CompareTo(b.SortObjId);
+                return (c != 0) ? c : a.SortRecType.CompareTo(b.SortRecType);
+            });
+
+            WriteApfsBTreeNodeBlock(buf, 15 * blockSize, blockSize, 0x404UL, 1UL, 0x80000002U, 0x000EU, 0x000B, 0, 0U, 0U, 1UL, fsRecs);
+        }
+
+        internal static void WriteApfsOmapHeaderBlock(byte[] buf, int off, ulong oOid, ulong oXid, ulong omTreeOid)
+        {
+            BitConverter.GetBytes(oOid).CopyTo(buf, off + 0x08);
+            BitConverter.GetBytes(oXid).CopyTo(buf, off + 0x10);
+            BitConverter.GetBytes(0x0000000BU).CopyTo(buf, off + 0x18); // OBJECT_TYPE_OMAP
+            BitConverter.GetBytes(0x00000000U).CopyTo(buf, off + 0x1C);
+            BitConverter.GetBytes(0x00000002U).CopyTo(buf, off + 0x28); // om_tree_type = BTREE
+            BitConverter.GetBytes(omTreeOid).CopyTo(buf, off + 0x30);
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(buf, off, 4096);
+        }
+
+        internal static byte[] BuildApfsOmapKey(ulong oid, ulong xid)
+        {
+            byte[] k = new byte[16];
+            BitConverter.GetBytes(oid).CopyTo(k, 0);
+            BitConverter.GetBytes(xid).CopyTo(k, 8);
+            return k;
+        }
+
+        internal static byte[] BuildApfsOmapVal(uint flags, uint size, ulong paddr)
+        {
+            byte[] v = new byte[16];
+            BitConverter.GetBytes(flags).CopyTo(v, 0);
+            BitConverter.GetBytes(size).CopyTo(v, 4);
+            BitConverter.GetBytes(paddr).CopyTo(v, 8);
+            return v;
+        }
+
+        internal static void AddApfsDirInode(List<ApfsBTreeRecord> recs, ulong ino, ulong parentId, string name, ushort mode)
+        {
+            byte[] nameBytes = Encoding.UTF8.GetBytes((name ?? "dir") + "\0");
+            int extPadLen = (nameBytes.Length + 7) & ~7;
+            byte[] val = new byte[92 + 8 + extPadLen];
+            BitConverter.GetBytes(parentId).CopyTo(val, 0x00);
+            BitConverter.GetBytes(ino).CopyTo(val, 0x08);
+            ulong ts = 1762992000000000000UL;
+            BitConverter.GetBytes(ts).CopyTo(val, 0x10);
+            BitConverter.GetBytes(ts).CopyTo(val, 0x18);
+            BitConverter.GetBytes(ts).CopyTo(val, 0x20);
+            BitConverter.GetBytes(ts).CopyTo(val, 0x28);
+            BitConverter.GetBytes(1).CopyTo(val, 0x38);
+            BitConverter.GetBytes(mode).CopyTo(val, 0x50);
+            BitConverter.GetBytes((ushort)1).CopyTo(val, 92);
+            BitConverter.GetBytes((ushort)extPadLen).CopyTo(val, 94);
+            val[96] = 4; // INO_EXT_TYPE_NAME
+            BitConverter.GetBytes((ushort)nameBytes.Length).CopyTo(val, 98);
+            Array.Copy(nameBytes, 0, val, 100, nameBytes.Length);
+
+            recs.Add(new ApfsBTreeRecord
+            {
+                SortObjId = ino,
+                SortRecType = 3,
+                Key = BitConverter.GetBytes(ino | (3UL << 60)),
+                Val = val
+            });
+        }
+
+        internal static void AddApfsFileRecords(List<ApfsBTreeRecord> recs, ulong ino, ulong parentId, string name, ulong fileSize, ulong physBlock, long extentLenBytes)
+        {
+            byte[] nameBytes = Encoding.UTF8.GetBytes((name ?? "file") + "\0");
+            int namePad = (nameBytes.Length + 7) & ~7;
+            int dstreamLen = 40;
+            byte[] val = new byte[92 + 12 + namePad + dstreamLen];
+            BitConverter.GetBytes(parentId).CopyTo(val, 0x00);
+            BitConverter.GetBytes(ino).CopyTo(val, 0x08);
+            ulong ts = 1762992000000000000UL;
+            BitConverter.GetBytes(ts).CopyTo(val, 0x10);
+            BitConverter.GetBytes(ts).CopyTo(val, 0x18);
+            BitConverter.GetBytes(ts).CopyTo(val, 0x20);
+            BitConverter.GetBytes(ts).CopyTo(val, 0x28);
+            BitConverter.GetBytes(1).CopyTo(val, 0x38);
+            BitConverter.GetBytes((ushort)0x81A4).CopyTo(val, 0x50);
+            BitConverter.GetBytes((ushort)2).CopyTo(val, 92);
+            BitConverter.GetBytes((ushort)(namePad + dstreamLen)).CopyTo(val, 94);
+            val[96] = 4; // INO_EXT_TYPE_NAME
+            BitConverter.GetBytes((ushort)nameBytes.Length).CopyTo(val, 98);
+            val[100] = 8; // INO_EXT_TYPE_DSTREAM
+            BitConverter.GetBytes((ushort)dstreamLen).CopyTo(val, 102);
+            Array.Copy(nameBytes, 0, val, 104, nameBytes.Length);
+            int dsOff = 104 + namePad;
+            BitConverter.GetBytes(fileSize).CopyTo(val, dsOff + 0);
+            BitConverter.GetBytes((ulong)extentLenBytes).CopyTo(val, dsOff + 8);
+
+            recs.Add(new ApfsBTreeRecord
+            {
+                SortObjId = ino,
+                SortRecType = 3,
+                Key = BitConverter.GetBytes(ino | (3UL << 60)),
+                Val = val
+            });
+
+            if (physBlock > 0 && extentLenBytes > 0)
+                AddApfsFileExtent(recs, ino, 0UL, extentLenBytes, physBlock);
+        }
+
+        internal static void AddApfsFileExtent(List<ApfsBTreeRecord> recs, ulong privId, ulong logicalAddr, long lenBytes, ulong physBlock)
+        {
+            byte[] extKey = new byte[16];
+            BitConverter.GetBytes(privId | (8UL << 60)).CopyTo(extKey, 0);
+            BitConverter.GetBytes(logicalAddr).CopyTo(extKey, 8);
+
+            byte[] extVal = new byte[24];
+            BitConverter.GetBytes((ulong)lenBytes & 0x00FFFFFFFFFFFFFFUL).CopyTo(extVal, 0);
+            BitConverter.GetBytes(physBlock).CopyTo(extVal, 8);
+
+            recs.Add(new ApfsBTreeRecord
+            {
+                SortObjId = privId,
+                SortRecType = 8,
+                Key = extKey,
+                Val = extVal
+            });
+        }
+
+        internal static void AddApfsDirRec(List<ApfsBTreeRecord> recs, ulong parentId, string name, ulong childId, byte dtType)
+        {
+            byte[] nameBytes = Encoding.UTF8.GetBytes((name ?? "entry") + "\0");
+            uint crc = Crc32.Compute(nameBytes, 0, nameBytes.Length);
+            uint lenAndHash = ((crc & 0x3FFFFFU) << 10) | (uint)(nameBytes.Length & 0x3FF);
+            byte[] key = new byte[12 + nameBytes.Length];
+            BitConverter.GetBytes(parentId | (9UL << 60)).CopyTo(key, 0);
+            BitConverter.GetBytes(lenAndHash).CopyTo(key, 8);
+            Array.Copy(nameBytes, 0, key, 12, nameBytes.Length);
+
+            byte[] val = new byte[18];
+            BitConverter.GetBytes(childId).CopyTo(val, 0);
+            BitConverter.GetBytes(1762992000000000000UL).CopyTo(val, 8);
+            BitConverter.GetBytes((ushort)dtType).CopyTo(val, 16);
+
+            recs.Add(new ApfsBTreeRecord
+            {
+                SortObjId = parentId,
+                SortRecType = 9,
+                Key = key,
+                Val = val
+            });
+        }
+
+        internal static void WriteApfsBTreeNodeBlock(
+            byte[] buf, int off, int blockSize,
+            ulong oOid, ulong oXid, uint oType, uint oSubtype,
+            ushort btnFlags, ushort btnLevel, uint btKeySize, uint btValSize, ulong btNodeCount,
+            List<ApfsBTreeRecord> recs)
+        {
+            if (off < 0 || off + blockSize > buf.Length) return;
+
+            bool isRoot = (btnFlags & 0x0001) != 0;
+            bool isFixed = (btnFlags & 0x0004) != 0;
+            bool isHashed = (btnFlags & 0x0008) != 0;
+            int tocEntryLen = isFixed ? 4 : 8;
+            int tocLen = recs.Count * tocEntryLen;
+
+            BitConverter.GetBytes(oOid).CopyTo(buf, off + 0x08);
+            BitConverter.GetBytes(oXid).CopyTo(buf, off + 0x10);
+            BitConverter.GetBytes(oType).CopyTo(buf, off + 0x18);
+            BitConverter.GetBytes(oSubtype).CopyTo(buf, off + 0x1C);
+            BitConverter.GetBytes(btnFlags).CopyTo(buf, off + 0x20);
+            BitConverter.GetBytes(btnLevel).CopyTo(buf, off + 0x22);
+            BitConverter.GetBytes((uint)recs.Count).CopyTo(buf, off + 0x24);
+            BitConverter.GetBytes((ushort)0).CopyTo(buf, off + 0x28);
+            BitConverter.GetBytes((ushort)tocLen).CopyTo(buf, off + 0x2A);
+
+            int tocStart = off + 0x38;
+            int keyCursor = tocStart + tocLen;
+            int keyAreaStart = keyCursor;
+            int valAreaEnd = off + (isRoot ? (blockSize - 40) : blockSize);
+            int valCursor = valAreaEnd;
+
+            uint maxKeyLen = 0;
+            uint maxValLen = 0;
+            for (int i = 0; i < recs.Count; i++)
+            {
+                var r = recs[i];
+                if (keyCursor + r.Key.Length > valCursor - r.Val.Length) break;
+
+                int kRel = keyCursor - keyAreaStart;
+                Array.Copy(r.Key, 0, buf, keyCursor, r.Key.Length);
+                keyCursor += r.Key.Length;
+
+                valCursor -= r.Val.Length;
+                Array.Copy(r.Val, 0, buf, valCursor, r.Val.Length);
+                int vRel = valAreaEnd - valCursor;
+
+                int tOff = tocStart + i * tocEntryLen;
+                if (isFixed)
+                {
+                    BitConverter.GetBytes((ushort)kRel).CopyTo(buf, tOff);
+                    BitConverter.GetBytes((ushort)vRel).CopyTo(buf, tOff + 2);
+                }
+                else
+                {
+                    BitConverter.GetBytes((ushort)kRel).CopyTo(buf, tOff);
+                    BitConverter.GetBytes((ushort)r.Key.Length).CopyTo(buf, tOff + 2);
+                    BitConverter.GetBytes((ushort)vRel).CopyTo(buf, tOff + 4);
+                    BitConverter.GetBytes((ushort)r.Val.Length).CopyTo(buf, tOff + 6);
+                }
+
+                if ((uint)r.Key.Length > maxKeyLen) maxKeyLen = (uint)r.Key.Length;
+                if ((uint)r.Val.Length > maxValLen) maxValLen = (uint)r.Val.Length;
+            }
+
+            if (isRoot)
+            {
+                int infoOff = off + blockSize - 40;
+                uint btFlags = (isFixed ? 1U : 0U) | (isHashed ? 0x80U : 0U);
+                BitConverter.GetBytes(btFlags).CopyTo(buf, infoOff + 0);
+                BitConverter.GetBytes((uint)blockSize).CopyTo(buf, infoOff + 4);
+                BitConverter.GetBytes(btKeySize).CopyTo(buf, infoOff + 8);
+                BitConverter.GetBytes(btValSize).CopyTo(buf, infoOff + 12);
+                BitConverter.GetBytes(maxKeyLen).CopyTo(buf, infoOff + 16);
+                BitConverter.GetBytes(maxValLen).CopyTo(buf, infoOff + 20);
+                BitConverter.GetBytes((ulong)recs.Count).CopyTo(buf, infoOff + 24);
+                BitConverter.GetBytes(btNodeCount).CopyTo(buf, infoOff + 32);
+            }
+
+            ReadOnlyFileSystemMountEngine.WriteApfsFletcher64(buf, off, blockSize);
         }
 
         private sealed class BtrfsLeafSpec
