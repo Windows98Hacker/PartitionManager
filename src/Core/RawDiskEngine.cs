@@ -3024,6 +3024,10 @@ namespace WinParted.Core
             public byte[] Val;
         }
 
+        /// <summary>
+        /// Populates an APFS partition buffer with a valid Container (<c>NXSB</c>) + checkpoint descriptor,
+        /// Container OMAP, Volume (<c>APSB</c>) + Volume OMAP, and FS-Tree B-tree containing starter files.
+        /// </summary>
         private static void PopulateApfsContainerBTree(byte[] buf, PartitionEntry part, byte[] macReadme, byte[] plistBytes, byte[] labelFile)
         {
             const int blockSize = 4096;

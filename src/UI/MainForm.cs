@@ -27,16 +27,24 @@ namespace WinParted.UI
         private string _clipboardSourceDiskPath = string.Empty;
         private int _nextVirtualDiskNumber = 91;
         private bool _suppressUiEvents;
+        private bool _isSyncingToolbarLayout;
+        private bool _toolbarLayoutQueued;
 
+        private Panel _toolbarBar;
+        private ToolStrip _mainToolStrip;
+        private Panel _driveRightPanel;
+        private Label _lblDrive;
         private ComboBox _cmbDrives;
         private Label _lblArchBadge;
         private Button _btnElevate;
         private ToolStripMenuItem _miDarkMode;
         private PartitionRibbonControl _ribbon;
         private SplitContainer _mainSplit;
+        private Splitter _deviceSplitter;
         private Panel _deviceInfoPanel;
         private Label _lblDeviceInfo;
         private DataGridView _gridPartitions;
+        private FlowLayoutPanel _opsQuickFlow;
         private ListView _lvOperations;
         private Label _lblStatus;
         private ContextMenuStrip _partContextMenu;
@@ -50,7 +58,7 @@ namespace WinParted.UI
 
         public MainForm()
         {
-            Text = "WinParted \u03C6 — Golden Ratio Partition Manager";
+            Text = "WinParted — Disk & Partition Manager";
             Size = new Size(1437, 888);
             MinimumSize = new Size(1094, 676);
             StartPosition = FormStartPosition.CenterScreen;
@@ -104,7 +112,11 @@ namespace WinParted.UI
 
             var mView = new ToolStripMenuItem("View");
             var miDeviceInfo = new ToolStripMenuItem("Device Information") { Checked = true, CheckOnClick = true };
-            miDeviceInfo.CheckedChanged += (s, e) => _deviceInfoPanel.Visible = miDeviceInfo.Checked;
+            miDeviceInfo.CheckedChanged += (s, e) =>
+            {
+                _deviceInfoPanel.Visible = miDeviceInfo.Checked;
+                if (_deviceSplitter != null) _deviceSplitter.Visible = miDeviceInfo.Checked;
+            };
             var miPendingOps = new ToolStripMenuItem("Pending Operations") { Checked = true, CheckOnClick = true };
             miPendingOps.CheckedChanged += (s, e) =>
             {
@@ -171,17 +183,17 @@ namespace WinParted.UI
             menu.Items.AddRange(new ToolStripItem[] { mApp, mEdit, mView, mDevice, mPart, mTools, mHelp });
             MainMenuStrip = menu;
 
-            // 2. Unified Golden Ratio Toolbar + Right-Aligned Drive Selector
-            var toolbarBar = new Panel
+            // 2. Unified Toolbar + Right-Aligned Drive Selector
+            _toolbarBar = new Panel
             {
                 Dock = DockStyle.Top,
                 Height = ThemeManager.F55,
                 Padding = new Padding(ThemeManager.F8, ThemeManager.F5, ThemeManager.F8, ThemeManager.F5),
                 Tag = "ElevatedPanel"
             };
-            EnableDoubleBuffering(toolbarBar);
+            EnableDoubleBuffering(_toolbarBar);
 
-            var ts = new ToolStrip
+            _mainToolStrip = new ToolStrip
             {
                 Dock = DockStyle.Fill,
                 AutoSize = false,
@@ -193,6 +205,8 @@ namespace WinParted.UI
                 LayoutStyle = ToolStripLayoutStyle.Flow,
                 Padding = new Padding(ThemeManager.F5, ThemeManager.F8, ThemeManager.F5, ThemeManager.F5)
             };
+            var ts = _mainToolStrip;
+            var toolbarBar = _toolbarBar;
             _tbNew = new ToolStripButton("New", DrawGPartedToolbarIcon("new"), (s, e) => QueueNewPartition())
             {
                 DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
@@ -277,42 +291,18 @@ namespace WinParted.UI
                 tsItem.Margin = new Padding(1, 1, 1, 1);
             }
 
-            var driveRightPanel = new Panel
+            _driveRightPanel = new Panel
             {
                 Dock = DockStyle.Right,
                 Width = Win32DiskInterop.IsAdministrator() ? 288 : ThemeManager.F377,
                 Padding = new Padding(ThemeManager.F8, ThemeManager.F3, ThemeManager.F5, ThemeManager.F3),
                 Tag = "ElevatedPanel"
             };
+            var driveRightPanel = _driveRightPanel;
             EnableDoubleBuffering(driveRightPanel);
 
-            Action syncToolbarHeight = () =>
-            {
-                if (toolbarBar.IsDisposed || ts.IsDisposed || toolbarBar.ClientSize.Width < 500) return;
-                int availW = Math.Max(ThemeManager.F144, toolbarBar.ClientSize.Width - driveRightPanel.Width - ts.Padding.Horizontal - ThemeManager.F13);
-                int rows = 1;
-                int curX = ts.Padding.Left;
-                foreach (ToolStripItem tsItem in ts.Items)
-                {
-                    if (!tsItem.Available) continue;
-                    int w = tsItem.Width > 0 ? tsItem.Width : tsItem.GetPreferredSize(Size.Empty).Width;
-                    int itemSpan = w + tsItem.Margin.Horizontal + ThemeManager.F3;
-                    if (curX > ts.Padding.Left && curX + itemSpan > availW)
-                    {
-                        rows++;
-                        curX = ts.Padding.Left;
-                    }
-                    curX += itemSpan;
-                }
-                int desiredH = rows <= 1 ? ThemeManager.F55 : Math.Max(ThemeManager.F55, rows * ThemeManager.F34 + ThemeManager.F13);
-                if (toolbarBar.Height != desiredH)
-                {
-                    toolbarBar.Height = desiredH;
-                    ts.PerformLayout();
-                }
-            };
-            ts.LayoutCompleted += (s, e) => syncToolbarHeight();
-            toolbarBar.Resize += (s, e) => syncToolbarHeight();
+            ts.LayoutCompleted += (s, e) => QueueSyncToolbarLayout();
+            toolbarBar.Resize += (s, e) => SyncToolbarLayout();
 
             var driveTable = new TableLayoutPanel
             {
@@ -327,7 +317,7 @@ namespace WinParted.UI
                 driveTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             driveTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
-            var lblDrive = new Label
+            _lblDrive = new Label
             {
                 Text = "Drive:",
                 AutoSize = true,
@@ -335,6 +325,7 @@ namespace WinParted.UI
                 Margin = new Padding(0, 0, ThemeManager.F8, 0),
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold)
             };
+            var lblDrive = _lblDrive;
 
             _cmbDrives = new ComboBox
             {
@@ -410,18 +401,13 @@ namespace WinParted.UI
             {
                 Graphics g = e.Graphics;
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                ThemeManager.DrawGoldenSpiralBadge(
-                    g,
-                    new Rectangle(ThemeManager.F13, ThemeManager.F13, ThemeManager.F21, ThemeManager.F13),
-                    ThemeManager.BorderColor,
-                    ThemeManager.AccentGold);
                 using (var hdrFont = new Font("Segoe UI", 8.5f, FontStyle.Bold))
                 {
                     TextRenderer.DrawText(
                         g,
-                        "DEVICE OVERVIEW  (\u03C6)",
+                        "DEVICE OVERVIEW",
                         hdrFont,
-                        new Rectangle(ThemeManager.F34 + ThemeManager.F5, ThemeManager.F8, _deviceInfoPanel.ClientSize.Width - ThemeManager.F55, ThemeManager.F21 + ThemeManager.F3),
+                        new Rectangle(ThemeManager.F13, ThemeManager.F8, Math.Max(20, _deviceInfoPanel.ClientSize.Width - ThemeManager.F21 - ThemeManager.F5), ThemeManager.F21 + ThemeManager.F3),
                         ThemeManager.AccentGold,
                         TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
                 }
@@ -439,7 +425,35 @@ namespace WinParted.UI
             _deviceInfoPanel.ClientSizeChanged += (s, e) =>
             {
                 if (_deviceInfoPanel != null && _lblDeviceInfo != null)
-                    _lblDeviceInfo.MaximumSize = new Size(Math.Max(ThemeManager.F144, _deviceInfoPanel.ClientSize.Width - ThemeManager.F21 - ThemeManager.F5), 0);
+                {
+                    _lblDeviceInfo.MaximumSize = new Size(Math.Max(110, _deviceInfoPanel.ClientSize.Width - ThemeManager.F21 - ThemeManager.F5), 0);
+                    _deviceInfoPanel.Invalidate();
+                }
+            };
+
+            _deviceSplitter = new Splitter
+            {
+                Dock = DockStyle.Left,
+                Width = 6,
+                MinSize = 150,
+                MinExtra = 320,
+                BackColor = ThemeManager.BorderColor,
+                Cursor = Cursors.VSplit
+            };
+            EnableDoubleBuffering(_deviceSplitter);
+            _deviceSplitter.Paint += (s, e) =>
+            {
+                int midX = _deviceSplitter.Width / 2;
+                int midY = _deviceSplitter.Height / 2;
+                using (var bgBr = new SolidBrush(ThemeManager.BackPrimary))
+                    e.Graphics.FillRectangle(bgBr, _deviceSplitter.ClientRectangle);
+                using (var linePen = new Pen(ThemeManager.BorderColor, 1f))
+                    e.Graphics.DrawLine(linePen, midX, 0, midX, _deviceSplitter.Height);
+                using (var gripPen = new Pen(ThemeManager.TextSecondary, 1.5f))
+                {
+                    if (midY > 24)
+                        e.Graphics.DrawLine(gripPen, midX, midY - 14, midX, midY + 14);
+                }
             };
 
             _gridPartitions = new DataGridView
@@ -510,44 +524,48 @@ namespace WinParted.UI
             EnableDoubleBuffering(_gridPartitions);
 
             _mainSplit.Panel1.Controls.Add(_gridPartitions);
+            _mainSplit.Panel1.Controls.Add(_deviceSplitter);
             _mainSplit.Panel1.Controls.Add(_deviceInfoPanel);
 
             var opsHeader = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = ThemeManager.F34,
-                Padding = new Padding(ThemeManager.F13, ThemeManager.F3, ThemeManager.F13, ThemeManager.F3),
+                Height = 36,
+                Padding = new Padding(ThemeManager.F13, 4, ThemeManager.F13, 4),
                 Tag = "ElevatedPanel"
             };
             EnableDoubleBuffering(opsHeader);
             opsHeader.Controls.Add(new Label
             {
-                Text = "Pending Operations Queue  (\u03C6 Minor)",
+                Text = "Pending Operations Queue",
                 Dock = DockStyle.Left,
                 AutoSize = true,
                 Padding = new Padding(0, ThemeManager.F5, 0, 0),
                 Font = new Font("Segoe UI", 8.8f, FontStyle.Bold)
             });
 
-            var opsQuickFlow = new FlowLayoutPanel
+            _opsQuickFlow = new FlowLayoutPanel
             {
                 Dock = DockStyle.Right,
-                Width = ThemeManager.F233,
-                FlowDirection = FlowDirection.RightToLeft,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = false,
-                Padding = new Padding(0, 1, 0, 0),
+                Margin = new Padding(0),
+                Padding = new Padding(0, 1, 0, 1),
                 Tag = "ElevatedPanel"
             };
-            _btnOpsClearQuick = new Button { Text = "Clear", Size = new Size(ThemeManager.F55, 26), Margin = new Padding(ThemeManager.F5, 0, 0, 0) };
-            _btnOpsClearQuick.Click += (s, e) => ClearOperations();
-            _btnOpsUndoQuick = new Button { Text = "Undo", Size = new Size(ThemeManager.F55, 26), Margin = new Padding(ThemeManager.F5, 0, 0, 0), Tag = "TonalButton" };
-            _btnOpsUndoQuick.Click += (s, e) => UndoOperation();
-            _btnOpsApplyQuick = new Button { Text = "Apply", Size = new Size(ThemeManager.F89, 26), Margin = new Padding(0), Tag = "PrimaryButton" };
+            _btnOpsApplyQuick = new Button { Text = "Apply", Size = new Size(ThemeManager.F89, 26), Margin = new Padding(0, 0, ThemeManager.F5, 0), Tag = "PrimaryButton" };
             _btnOpsApplyQuick.Click += (s, e) => ApplyOperations();
-            opsQuickFlow.Controls.Add(_btnOpsClearQuick);
-            opsQuickFlow.Controls.Add(_btnOpsUndoQuick);
-            opsQuickFlow.Controls.Add(_btnOpsApplyQuick);
-            opsHeader.Controls.Add(opsQuickFlow);
+            _btnOpsUndoQuick = new Button { Text = "Undo", Size = new Size(ThemeManager.F55, 26), Margin = new Padding(0, 0, ThemeManager.F5, 0), Tag = "TonalButton" };
+            _btnOpsUndoQuick.Click += (s, e) => UndoOperation();
+            _btnOpsClearQuick = new Button { Text = "Clear", Size = new Size(ThemeManager.F55, 26), Margin = new Padding(0) };
+            _btnOpsClearQuick.Click += (s, e) => ClearOperations();
+            _opsQuickFlow.Controls.Add(_btnOpsApplyQuick);
+            _opsQuickFlow.Controls.Add(_btnOpsUndoQuick);
+            _opsQuickFlow.Controls.Add(_btnOpsClearQuick);
+            opsHeader.Controls.Add(_opsQuickFlow);
+            opsHeader.Resize += (s, e) => SyncOpsQuickFlowWidth();
 
             _lvOperations = new ListView
             {
@@ -576,7 +594,7 @@ namespace WinParted.UI
             _mainSplit.Panel2.Controls.Add(_lvOperations);
             _mainSplit.Panel2.Controls.Add(opsHeader);
 
-            // 5. Golden Ratio Status Bar (Fibonacci 34px height)
+            // 5. Status Bar
             var statusPanel = new Panel
             {
                 Dock = DockStyle.Bottom,
@@ -588,7 +606,7 @@ namespace WinParted.UI
             _lblStatus = new Label { Dock = DockStyle.Fill, Text = "0 operations pending", Font = new Font("Segoe UI", 8.8f), TextAlign = ContentAlignment.MiddleLeft };
             _lblArchBadge = new Label
             {
-                Text = Win32DiskInterop.GetArchitectureBadge() + "  \u00B7  \u03C6 1.618",
+                Text = Win32DiskInterop.GetArchitectureBadge(),
                 Dock = DockStyle.Right,
                 AutoSize = true,
                 TextAlign = ContentAlignment.MiddleRight,
@@ -632,7 +650,14 @@ namespace WinParted.UI
             Load += (s, e) =>
             {
                 ThemeManager.ApplyGoldenSplitter(_mainSplit, true, ThemeManager.F233, ThemeManager.F144);
+                SyncOpsQuickFlowWidth();
+                SyncToolbarLayout();
                 AutoSizeOperationsColumns();
+            };
+            Shown += (s, e) =>
+            {
+                SyncOpsQuickFlowWidth();
+                SyncToolbarLayout();
             };
             FormClosed += (s, e) => ThemeManager.ThemeChanged -= OnThemeChangedHandler;
             ApplyMainFormTheme();
@@ -819,6 +844,192 @@ namespace WinParted.UI
             _lvOperations.Columns[4].Width = c4;
         }
 
+        /// <summary>
+        /// Ensures the right-aligned Quick Actions flow panel in the Pending Operations header
+        /// is always wide enough to render Apply, Undo, and Clear without horizontal clipping.
+        /// </summary>
+        private void SyncOpsQuickFlowWidth()
+        {
+            if (_opsQuickFlow == null || _opsQuickFlow.IsDisposed || _btnOpsApplyQuick == null || _btnOpsUndoQuick == null || _btnOpsClearQuick == null)
+                return;
+            int neededW = _btnOpsApplyQuick.Width + _btnOpsApplyQuick.Margin.Horizontal
+                        + _btnOpsUndoQuick.Width + _btnOpsUndoQuick.Margin.Horizontal
+                        + _btnOpsClearQuick.Width + _btnOpsClearQuick.Margin.Horizontal
+                        + _opsQuickFlow.Padding.Horizontal + ThemeManager.F5;
+            if (_opsQuickFlow.MinimumSize.Width != neededW)
+                _opsQuickFlow.MinimumSize = new Size(neededW, 0);
+            if (_opsQuickFlow.Width < neededW)
+                _opsQuickFlow.Width = neededW;
+        }
+
+        /// <summary>
+        /// Schedules a single deferred toolbar layout pass via <see cref="Control.BeginInvoke"/> so
+        /// <see cref="UpdateDriveSelectorLayout"/> never modifies docked control widths inside an active
+        /// WinForms layout transaction.
+        /// </summary>
+        private void QueueSyncToolbarLayout()
+        {
+            if (_toolbarLayoutQueued || IsDisposed || !IsHandleCreated)
+                return;
+            _toolbarLayoutQueued = true;
+            BeginInvoke(new Action(delegate
+            {
+                _toolbarLayoutQueued = false;
+                if (!IsDisposed)
+                    SyncToolbarLayout();
+            }));
+        }
+
+        /// <summary>
+        /// Sums the total horizontal pixel width required to render all available toolbar items on one row.
+        /// </summary>
+        private int MeasureToolStripSingleRowItemsWidth()
+        {
+            if (_mainToolStrip == null || _mainToolStrip.IsDisposed)
+                return 0;
+            int sum = 0;
+            foreach (ToolStripItem tsItem in _mainToolStrip.Items)
+            {
+                if (!tsItem.Available) continue;
+                int w = tsItem.Width > 0 ? tsItem.Width : tsItem.GetPreferredSize(Size.Empty).Width;
+                sum += w + tsItem.Margin.Horizontal;
+            }
+            return sum;
+        }
+
+        /// <summary>
+        /// Computes the minimum width needed so the toolbar wraps into at most two horizontal rows
+        /// instead of shrinking the Drive selector prematurely on narrower windows.
+        /// </summary>
+        private int MeasureToolStripTwoRowMinWidth()
+        {
+            if (_mainToolStrip == null || _mainToolStrip.IsDisposed)
+                return 240;
+            int totalW = 0;
+            int maxItemW = 0;
+            foreach (ToolStripItem tsItem in _mainToolStrip.Items)
+            {
+                if (!tsItem.Available) continue;
+                int w = (tsItem.Width > 0 ? tsItem.Width : tsItem.GetPreferredSize(Size.Empty).Width) + tsItem.Margin.Horizontal;
+                totalW += w;
+                if (w > maxItemW) maxItemW = w;
+            }
+            // Half the total width plus the widest item guarantees greedy row 1 leaves < half for row 2
+            return (totalW + 1) / 2 + maxItemW + _mainToolStrip.Padding.Horizontal + ThemeManager.F8;
+        }
+
+        /// <summary>
+        /// Dynamically sizes the Drive selector container up to the exact length of the longest device
+        /// name and capacity (never wider), allowing the action toolbar to compress to two horizontal
+        /// rows when the window becomes narrower.
+        /// </summary>
+        private void UpdateDriveSelectorLayout()
+        {
+            if (_toolbarBar == null || _toolbarBar.IsDisposed || _driveRightPanel == null || _driveRightPanel.IsDisposed || _cmbDrives == null || _cmbDrives.IsDisposed)
+                return;
+            if (_toolbarBar.ClientSize.Width < 300)
+                return;
+
+            int maxTextW = 140;
+            Font driveFont = _cmbDrives.Font ?? Font;
+            Size probeBounds = new Size(int.MaxValue, 32);
+            TextFormatFlags measureFlags = TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+            for (int i = 0; i < _cmbDrives.Items.Count; i++)
+            {
+                object item = _cmbDrives.Items[i];
+                string text = item != null ? item.ToString() : string.Empty;
+                if (!string.IsNullOrEmpty(text))
+                {
+                    int w = TextRenderer.MeasureText(text, driveFont, probeBounds, measureFlags).Width;
+                    if (w > maxTextW) maxTextW = w;
+                }
+            }
+            if (_cmbDrives.Items.Count == 0 && _currentPreviewDisk != null && !string.IsNullOrEmpty(_currentPreviewDisk.DisplayName))
+            {
+                int w = TextRenderer.MeasureText(_currentPreviewDisk.DisplayName, driveFont, probeBounds, measureFlags).Width;
+                if (w > maxTextW) maxTextW = w;
+            }
+
+            // Expand up to the exact length of the longest device name + size (plus combo chrome), never wider
+            int desiredComboW = maxTextW + 38;
+            int desiredDropDownW = Math.Min(1000, Math.Max(desiredComboW, _cmbDrives.Width));
+            if (_cmbDrives.DropDownWidth != desiredDropDownW)
+                _cmbDrives.DropDownWidth = desiredDropDownW;
+
+            int labelW = (_lblDrive != null ? Math.Max(_lblDrive.Width, _lblDrive.PreferredWidth) + _lblDrive.Margin.Horizontal : 52);
+            int elevateW = (_btnElevate != null && _btnElevate.Visible) ? (Math.Max(_btnElevate.Width, _btnElevate.PreferredSize.Width) + _btnElevate.Margin.Horizontal) : 0;
+            int chromePad = _driveRightPanel.Padding.Horizontal + _cmbDrives.Margin.Horizontal + 6;
+            int desiredPanelW = labelW + desiredComboW + elevateW + chromePad;
+
+            int twoRowToolbarMinW = _toolbarBar.Padding.Horizontal + MeasureToolStripTwoRowMinWidth();
+            int availWithTwoRowCompression = _toolbarBar.ClientSize.Width - twoRowToolbarMinW;
+
+            int minPanelW = (_btnElevate != null && _btnElevate.Visible) ? 300 : 210;
+            int maxAllowedW = Math.Max(minPanelW, availWithTwoRowCompression);
+            int targetPanelW = Math.Max(minPanelW, Math.Min(desiredPanelW, maxAllowedW));
+
+            if (_driveRightPanel.Width != targetPanelW)
+            {
+                _driveRightPanel.Width = targetPanelW;
+                _toolbarBar.PerformLayout();
+            }
+        }
+
+        /// <summary>
+        /// Synchronizes <see cref="_driveRightPanel"/> width and compresses <see cref="_mainToolStrip"/>
+        /// between one horizontal row (height 55px) and two horizontal rows (height 74px) as needed.
+        /// </summary>
+        private void SyncToolbarLayout()
+        {
+            if (_isSyncingToolbarLayout) return;
+            if (_toolbarBar == null || _toolbarBar.IsDisposed || _mainToolStrip == null || _mainToolStrip.IsDisposed || _driveRightPanel == null || _driveRightPanel.IsDisposed)
+                return;
+            if (_toolbarBar.ClientSize.Width < 300)
+                return;
+
+            _isSyncingToolbarLayout = true;
+            try
+            {
+                UpdateDriveSelectorLayout();
+
+                int availW = Math.Max(ThemeManager.F144,
+                    _toolbarBar.ClientSize.Width - _toolbarBar.Padding.Horizontal - _driveRightPanel.Width - _mainToolStrip.Padding.Horizontal);
+                int rows = 1;
+                int curX = 0;
+                foreach (ToolStripItem tsItem in _mainToolStrip.Items)
+                {
+                    if (!tsItem.Available) continue;
+                    int w = tsItem.Width > 0 ? tsItem.Width : tsItem.GetPreferredSize(Size.Empty).Width;
+                    int itemSpan = w + tsItem.Margin.Horizontal;
+                    if (curX > 0 && curX + itemSpan > availW)
+                    {
+                        rows++;
+                        curX = 0;
+                    }
+                    curX += itemSpan;
+                }
+
+                Padding targetTsPad = rows <= 1
+                    ? new Padding(ThemeManager.F5, ThemeManager.F8, ThemeManager.F5, ThemeManager.F5)
+                    : new Padding(ThemeManager.F5, 3, ThemeManager.F5, 3);
+                if (_mainToolStrip.Padding != targetTsPad)
+                    _mainToolStrip.Padding = targetTsPad;
+
+                int effectiveRows = Math.Min(2, rows);
+                int desiredH = effectiveRows <= 1 ? ThemeManager.F55 : 74;
+                if (_toolbarBar.Height != desiredH)
+                {
+                    _toolbarBar.Height = desiredH;
+                    _toolbarBar.PerformLayout();
+                    _mainToolStrip.PerformLayout();
+                }
+            }
+            finally
+            {
+                _isSyncingToolbarLayout = false;
+            }
+        }
+
         private void ApplyMainFormTheme()
         {
             ThemeManager.ApplyTheme(this);
@@ -829,6 +1040,9 @@ namespace WinParted.UI
                 _lblArchBadge.ForeColor = Win32DiskInterop.IsAdministrator() ? ThemeManager.AccentGreen : ThemeManager.AccentAmber;
             if (_tbApply != null)
                 _tbApply.ForeColor = ThemeManager.AccentGreen;
+
+            SyncOpsQuickFlowWidth();
+            SyncToolbarLayout();
 
             if (_gridPartitions != null)
             {
@@ -967,6 +1181,7 @@ namespace WinParted.UI
 
             OnDriveSelected();
             RefreshOperationsList();
+            SyncToolbarLayout();
         }
 
         private void SelectDiskByNumber(int diskNum)
