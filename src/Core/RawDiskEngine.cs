@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using WinParted.Interop;
 using WinParted.Models;
@@ -133,6 +134,7 @@ namespace WinParted.Core
         public static DiskInfo CreateBlankVirtualDisk(string filePath, long sizeBytes, PartitionTableStyle style)
         {
             long alignedSize = Math.Max(4L * 1048576L, ByteFormatter.AlignUp(sizeBytes, 512));
+            if (File.Exists(filePath)) File.Delete(filePath);
             using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
             {
                 fs.SetLength(alignedSize);
@@ -168,6 +170,8 @@ namespace WinParted.Core
         /// </summary>
         public static DiskInfo CreateDemoVirtualDisk(string filePath, int diskNumber = 90)
         {
+            ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(diskNumber);
+            if (File.Exists(filePath)) File.Delete(filePath);
             long totalSize = 128L * 1048576L; // 128 MiB
             using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
             {
@@ -1238,6 +1242,9 @@ namespace WinParted.Core
             if (part.FileSystem != FileSystemType.MicrosoftReserved)
             {
                 part.FileSystem = FileSystemType.RAW;
+                part.Label = string.Empty;
+                part.UsedBytes = 0;
+                part.FreeBytes = part.PartitionLength;
             }
         }
 
@@ -1248,6 +1255,8 @@ namespace WinParted.Core
         public static void WriteFileSystemHeader(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 65536) return;
+
+            ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, part.StartingOffset, part.PartitionLength, true);
 
             int headerClearLen = (int)Math.Min(131072, part.PartitionLength);
             byte[] buf = new byte[headerClearLen];
@@ -2306,11 +2315,31 @@ namespace WinParted.Core
         }
 
         /// <summary>Overwrites a byte range with Zero-Fill, Ones-Fill, or PRNG Random data.</summary>
+        private static void FillCryptoRandom(byte[] buffer, int count)
+        {
+            if (buffer == null || count <= 0) return;
+            using (var rng = new RNGCryptoServiceProvider())
+            {
+                if (count == buffer.Length)
+                {
+                    rng.GetBytes(buffer);
+                }
+                else
+                {
+                    byte[] tmp = new byte[count];
+                    rng.GetBytes(tmp);
+                    Buffer.BlockCopy(tmp, 0, buffer, 0, count);
+                }
+            }
+        }
+
         public static void WipeRange(DiskInfo disk, long startOffset, long length, WipePattern pattern)
         {
+            if (disk == null || length <= 0) return;
+            ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, startOffset, length, false);
+
             const int chunkSize = 1048576;
             byte[] buf = new byte[chunkSize];
-            var rng = new Random();
 
             if (pattern == WipePattern.OnesFill)
             {
@@ -2326,7 +2355,7 @@ namespace WinParted.Core
                     {
                         int n = (int)Math.Min(chunkSize, length - written);
                         if (pattern == WipePattern.RandomDoD)
-                            rng.NextBytes(buf);
+                            FillCryptoRandom(buf, n);
 
                         fs.Seek(startOffset + written, SeekOrigin.Begin);
                         fs.Write(buf, 0, n);
@@ -2342,7 +2371,7 @@ namespace WinParted.Core
             {
                 int n = (int)Math.Min(chunkSize, length - rawWritten);
                 if (pattern == WipePattern.RandomDoD)
-                    rng.NextBytes(buf);
+                    FillCryptoRandom(buf, n);
 
                 byte[] slice = buf;
                 if (n != buf.Length)

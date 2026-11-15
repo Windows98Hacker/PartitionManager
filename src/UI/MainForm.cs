@@ -811,6 +811,7 @@ namespace WinParted.UI
         private void CreateAndMountDemoDisk()
         {
             string demoPath = GetWritableDemoDiskPath();
+            ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(90);
             var demo = RawDiskEngine.CreateDemoVirtualDisk(demoPath, 90);
             _mountedVirtualDisks.RemoveAll(d => string.Equals(d.BackingFilePath, demoPath, StringComparison.OrdinalIgnoreCase));
             _mountedVirtualDisks.Add(demo);
@@ -828,6 +829,7 @@ namespace WinParted.UI
                 {
                     var existing = _mountedVirtualDisks.FirstOrDefault(d => string.Equals(d.BackingFilePath, ofd.FileName, StringComparison.OrdinalIgnoreCase));
                     int diskNum = existing != null ? existing.DiskNumber : _nextVirtualDiskNumber++;
+                    ReadOnlyFileSystemMountEngine.UnmountDisk(diskNum);
                     var vdisk = RawDiskEngine.LoadVirtualDisk(ofd.FileName, diskNum);
                     _mountedVirtualDisks.RemoveAll(d => string.Equals(d.BackingFilePath, ofd.FileName, StringComparison.OrdinalIgnoreCase));
                     _mountedVirtualDisks.Add(vdisk);
@@ -845,6 +847,7 @@ namespace WinParted.UI
                 {
                     var existing = _mountedVirtualDisks.FirstOrDefault(d => string.Equals(d.BackingFilePath, sfd.FileName, StringComparison.OrdinalIgnoreCase));
                     int diskNum = existing != null ? existing.DiskNumber : _nextVirtualDiskNumber++;
+                    ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(diskNum);
                     var vdisk = RawDiskEngine.CreateBlankVirtualDisk(sfd.FileName, 64L * 1048576L, PartitionTableStyle.GPT);
                     vdisk.DiskNumber = diskNum;
                     _mountedVirtualDisks.RemoveAll(d => string.Equals(d.BackingFilePath, sfd.FileName, StringComparison.OrdinalIgnoreCase));
@@ -1266,8 +1269,7 @@ namespace WinParted.UI
 
             try
             {
-                var vol = ReadOnlyFileSystemMountEngine.GetMount(_currentPreviewDisk.DiskNumber, sel.StartingOffset)
-                          ?? ReadOnlyFileSystemMountEngine.MountReadOnly(_currentPreviewDisk, sel, false);
+                var vol = ReadOnlyFileSystemMountEngine.MountReadOnly(_currentPreviewDisk, sel, false);
                 RenderCurrentDisk();
                 using (var dlg = new FileSystemBrowserDialog(_currentPreviewDisk, sel, vol))
                     dlg.ShowDialog(this);
@@ -1464,16 +1466,21 @@ namespace WinParted.UI
                 return;
             }
 
-            using (var dlg = new Form { Text = "Format Partition — " + sel.ShortDeviceName, Size = new Size(480, 250), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
+            using (var dlg = new Form { Text = "Format Partition — " + sel.ShortDeviceName, Size = new Size(500, 268), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
             {
                 var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
                 dlg.Controls.Add(root);
 
-                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 46, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 0) };
-                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, MinimumSize = new Size(100, 32), Padding = new Padding(10, 0, 10, 0), Margin = new Padding(8, 0, 0, 0) };
-                var btnOk = new Button { Text = "Queue Format", DialogResult = DialogResult.OK, AutoSize = true, MinimumSize = new Size(126, 32), Padding = new Padding(10, 0, 10, 0), Tag = "PrimaryButton" };
+                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 56, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 8) };
+                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(96, 34), Padding = new Padding(12, 2, 12, 2), Margin = new Padding(8, 2, 0, 2) };
+                var btnOk = new Button { Text = "Queue Format", DialogResult = DialogResult.OK, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(118, 34), Padding = new Padding(12, 2, 12, 2), Margin = new Padding(8, 2, 0, 2), Tag = "TonalButton" };
+                var btnFormatNow = new Button { Text = "Format Now", DialogResult = DialogResult.OK, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(118, 34), Padding = new Padding(14, 2, 14, 2), Margin = new Padding(0, 2, 0, 2), Tag = "PrimaryButton" };
+                bool executeNow = false;
+                btnOk.Click += delegate { executeNow = false; };
+                btnFormatNow.Click += delegate { executeNow = true; };
                 btnFlow.Controls.Add(btnCancel);
                 btnFlow.Controls.Add(btnOk);
+                btnFlow.Controls.Add(btnFormatNow);
 
                 var tbl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
                 tbl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -1505,6 +1512,7 @@ namespace WinParted.UI
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
                     var fs = (FileSystemType)cmbFs.SelectedItem;
+                    int beforeCount = _queueManager.PendingCount;
                     TryEnqueue(new PendingOperation
                     {
                         Type = OperationType.FormatPartition,
@@ -1521,6 +1529,15 @@ namespace WinParted.UI
                         DetailDescription = string.Format("Label: '{0}'", txtLbl.Text.Trim()),
                         RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "High"
                     });
+
+                    if (executeNow && _queueManager.PendingCount > beforeCount)
+                    {
+                        string msg = string.Format("Format {0} as {1} immediately?", sel.ShortDeviceName, FileSystemColors.GetDisplayName(fs));
+                        if (_queueManager.PendingCount > 1)
+                            msg += string.Format("\n\nAll {0} pending operation(s) in the queue will be applied together so offsets remain consistent.", _queueManager.PendingCount);
+                        if (MessageBox.Show(this, msg, "Confirm Immediate Format", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                            ApplyOperationsInternal(true);
+                    }
                 }
             }
         }
@@ -1559,14 +1576,14 @@ namespace WinParted.UI
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
 
-            using (var dlg = new Form { Text = "Label Partition — " + sel.ShortDeviceName, Size = new Size(480, 240), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
+            using (var dlg = new Form { Text = "Label Partition — " + sel.ShortDeviceName, Size = new Size(480, 258), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
             {
                 var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
                 dlg.Controls.Add(root);
 
-                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 46, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 0) };
-                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, MinimumSize = new Size(100, 32), Padding = new Padding(10, 0, 10, 0), Margin = new Padding(8, 0, 0, 0) };
-                var btnOk = new Button { Text = "Apply Label", DialogResult = DialogResult.OK, AutoSize = true, MinimumSize = new Size(126, 32), Padding = new Padding(10, 0, 10, 0), Tag = "PrimaryButton" };
+                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 56, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 8, 0, 8) };
+                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(100, 34), Padding = new Padding(12, 2, 12, 2), Margin = new Padding(8, 2, 0, 2) };
+                var btnOk = new Button { Text = "Apply Label", DialogResult = DialogResult.OK, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(126, 34), Padding = new Padding(14, 2, 14, 2), Margin = new Padding(0, 2, 0, 2), Tag = "PrimaryButton" };
                 btnFlow.Controls.Add(btnCancel);
                 btnFlow.Controls.Add(btnOk);
 
@@ -1652,6 +1669,7 @@ namespace WinParted.UI
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
+                    int beforeCount = _queueManager.PendingCount;
                     TryEnqueue(new PendingOperation
                     {
                         Type = OperationType.WipePartition,
@@ -1665,6 +1683,15 @@ namespace WinParted.UI
                         DetailDescription = string.Format("Overwrite {0}", ByteFormatter.FormatBytes(sel.PartitionLength)),
                         RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "Critical"
                     });
+
+                    if (dlg.ExecuteImmediately && _queueManager.PendingCount > beforeCount)
+                    {
+                        string msg = string.Format("Secure wipe {0} ({1}) immediately? This will permanently erase all data in the partition.", sel.ShortDeviceName, dlg.SelectedPattern);
+                        if (_queueManager.PendingCount > 1)
+                            msg += string.Format("\n\nAll {0} pending operation(s) in the queue will be applied together so offsets remain consistent.", _queueManager.PendingCount);
+                        if (MessageBox.Show(this, msg, "Confirm Immediate Secure Wipe", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                            ApplyOperationsInternal(true);
+                    }
                 }
             }
         }
@@ -1805,9 +1832,14 @@ namespace WinParted.UI
         /// </summary>
         private void ApplyOperations()
         {
+            ApplyOperationsInternal(false);
+        }
+
+        private void ApplyOperationsInternal(bool skipConfirmPrompt)
+        {
             if (_queueManager.PendingCount == 0) return;
 
-            if (MessageBox.Show(this,
+            if (!skipConfirmPrompt && MessageBox.Show(this,
                 string.Format("Are you sure you want to apply {0} pending operation(s)?\nEditing partitions can cause data loss if interrupted.", _queueManager.PendingCount),
                 "Apply Pending Operations", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                 return;

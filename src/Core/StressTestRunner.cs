@@ -41,6 +41,7 @@ namespace WinParted.Core
                 RunStress7_PhysicalDiskScriptAndFormatType(tempDir, log);
                 RunStress8_ReadOnlyNonMicrosoftMountAndBrowse(tempDir, log);
                 RunStress9_BootUnlockFullFormatAndHybridOverlay(tempDir, log);
+                RunStress10_SecureWipeFormatAndDemoResetOverlayPurge(tempDir, log);
 
                 log("STRESS_TEST_ALL_PASSED");
                 return true;
@@ -1415,13 +1416,14 @@ namespace WinParted.Core
 
                     var part = fmtDisk.Partitions[0];
                     var vol = ReadOnlyFileSystemMountEngine.MountReadOnly(fmtDisk, part, true);
+                    if (FindFsNodeByPath(vol.RootNode, "/probe.txt") != null)
+                        throw new Exception("Stale overlay file /probe.txt survived full-drive reformat to " + fs);
                     ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(vol, true);
                     string payloadText = "rw-probe-" + fs;
                     var node = ReadOnlyFileSystemMountEngine.WriteFileToVolume(fmtDisk, part, vol, null, "probe.txt", Encoding.UTF8.GetBytes(payloadText));
                     byte[] gotBytes = ReadOnlyFileSystemMountEngine.ReadFileBytes(fmtDisk, part, node);
                     if (Encoding.UTF8.GetString(gotBytes) != payloadText)
                         throw new Exception("Experimental write roundtrip mismatch for " + fs);
-                    ReadOnlyFileSystemMountEngine.Unmount(fmtDisk.DiskNumber, part.StartingOffset);
                 }
 
                 // 9d. Simulated isohybrid disk: Partition 1 (ISO9660 at +0x8000, 24 MiB) overlaps nested Partition 2 (ESP at +0x20000, 2 MiB)
@@ -1856,6 +1858,352 @@ namespace WinParted.Core
             finally
             {
                 ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, hfsPart.StartingOffset);
+            }
+        }
+
+        private static void AssertBytesUniform(byte[] data, byte expectedValue, string context)
+        {
+            for (int i = 0; i < data.Length; i++)
+            {
+                if (data[i] != expectedValue)
+                    throw new Exception(string.Format("Secure wipe byte mismatch in {0} at +0x{1:X}: expected 0x{2:X2}, got 0x{3:X2}.",
+                        context, i, expectedValue, data[i]));
+            }
+        }
+
+        private static void AssertHighEntropyRandom(byte[] sample, string context)
+        {
+            int[] counts = new int[256];
+            for (int i = 0; i < sample.Length; i++)
+                counts[sample[i]]++;
+
+            int distinct = 0;
+            int maxFreq = 0;
+            for (int b = 0; b < 256; b++)
+            {
+                if (counts[b] > 0) distinct++;
+                if (counts[b] > maxFreq) maxFreq = counts[b];
+            }
+
+            if (distinct < 240 || maxFreq >= 512)
+                throw new Exception(string.Format("Cryptographic random wipe failed entropy check in {0}: distinct={1}/256, maxFreq={2}/65536.",
+                    context, distinct, maxFreq));
+        }
+
+        private static void RunStress10_SecureWipeFormatAndDemoResetOverlayPurge(string tempDir, Action<string> log)
+        {
+            log("[Stress 10] Secure Wipe (Zero/Ones/CryptoRandom), Reformat Overlay Purge, and Demo Disk Reset Completeness...");
+
+            string shadowDir = Path.Combine(tempDir, "stress10_shadow");
+            Directory.CreateDirectory(shadowDir);
+            ReadOnlyFileSystemMountEngine.ShadowOverlayRootOverride = shadowDir;
+            try
+            {
+                // 10a. Secure Wipe (ZeroFill, OnesFill, RandomDoD) must clear superblocks, WPRWOVL1 overlays, host shadow overlays, and RAM ActiveMounts
+                WipePattern[] patterns = new WipePattern[]
+                {
+                    WipePattern.ZeroFill,
+                    WipePattern.OnesFill,
+                    WipePattern.RandomDoD
+                };
+
+                for (int i = 0; i < patterns.Length; i++)
+                {
+                    WipePattern pat = patterns[i];
+                    int diskNum = 905 + i;
+                    string imgPath = Path.Combine(tempDir, "stress10_wipe_" + pat + ".img");
+                    var disk = RawDiskEngine.CreateBlankVirtualDisk(imgPath, 36L * MiB, PartitionTableStyle.GPT);
+                    disk.DiskNumber = diskNum;
+
+                    var qm = new OperationQueueManager();
+                    qm.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { disk });
+                    qm.Enqueue(MakeCreateOp(diskNum, imgPath, 1L * MiB, 16L * MiB, FileSystemType.Ext4, "WIPE_EXT4"));
+                    qm.Enqueue(MakeCreateOp(diskNum, imgPath, 17L * MiB, 16L * MiB, FileSystemType.HFSPlus, "WIPE_HFS"));
+                    qm.ApplyAll(null);
+
+                    disk = RawDiskEngine.LoadVirtualDisk(imgPath, diskNum);
+                    var pExt = disk.Partitions[0];
+                    var pHfs = disk.Partitions[1];
+
+                    // Populate both partitions and keep BOTH mounted in ActiveMounts
+                    var volExt = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, pExt, true);
+                    ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(volExt, true);
+                    var secDir = ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(disk, pExt, volExt, volExt.RootNode, "secret_dir");
+                    ReadOnlyFileSystemMountEngine.WriteFileToVolume(disk, pExt, volExt, secDir, "classified.txt", Encoding.UTF8.GetBytes("TOP_SECRET_EXT4_PAYLOAD_" + pat));
+
+                    string extShadowPath = Path.Combine(shadowDir, "ovl_d" + diskNum + "_" + pExt.StartingOffset.ToString("X") + "_deadbeef.bin");
+                    File.WriteAllBytes(extShadowPath, new byte[] { 0xDE, 0xAD, 0xBE, 0xEF });
+
+                    var volHfs = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, pHfs, true);
+                    ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(volHfs, true);
+                    ReadOnlyFileSystemMountEngine.WriteFileToVolume(disk, pHfs, volHfs, volHfs.RootNode, "hfs_keep.txt", Encoding.UTF8.GetBytes("HFS_INTACT_PAYLOAD_" + pat));
+                    ReadOnlyFileSystemMountEngine.Unmount(diskNum, pHfs.StartingOffset);
+
+                    // Enqueue WipePartition ONLY on Partition 1 (Ext4) while still mounted
+                    qm = new OperationQueueManager();
+                    qm.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { disk });
+                    qm.Enqueue(new PendingOperation
+                    {
+                        Type = OperationType.WipePartition,
+                        TargetDiskNumber = diskNum,
+                        TargetDiskPath = disk.DevicePath,
+                        TargetPartitionNumber = pExt.PartitionNumber,
+                        OriginalStartOffset = pExt.StartingOffset,
+                        OriginalLength = pExt.PartitionLength,
+                        WipePattern = pat,
+                        Summary = "Wipe Ext4 " + pat
+                    });
+                    qm.ApplyAll(null);
+
+                    if (ReadOnlyFileSystemMountEngine.GetMount(diskNum, pExt.StartingOffset) != null)
+                        throw new Exception("ActiveMounts cache was NOT evicted after WipePartition (" + pat + ").");
+                    if (File.Exists(extShadowPath))
+                        throw new Exception("Host shadow overlay file survived WipePartition (" + pat + ").");
+
+                    disk = RawDiskEngine.LoadVirtualDisk(imgPath, diskNum);
+                    if (disk.Partitions.Count != 2)
+                        throw new Exception("Unexpected partition count after WipePartition (" + pat + "): " + disk.Partitions.Count);
+
+                    pExt = disk.Partitions[0];
+                    pHfs = disk.Partitions[1];
+                    if (pExt.FileSystem != FileSystemType.RAW || !string.IsNullOrEmpty(pExt.Label) || !string.IsNullOrEmpty(pExt.PartitionName))
+                        throw new Exception("Wiped partition metadata not reset to clean RAW (" + pat + "): FS=" + pExt.FileSystem + ", Label=" + pExt.Label);
+
+                    long[] sampleOffsets = new long[]
+                    {
+                        pExt.StartingOffset,
+                        pExt.StartingOffset + 0x20000L,
+                        pExt.StartingOffset + 8L * MiB,
+                        pExt.StartingOffset + pExt.PartitionLength - 65536L
+                    };
+                    for (int s = 0; s < sampleOffsets.Length; s++)
+                    {
+                        byte[] raw = RawDiskEngine.ReadBytes(disk, sampleOffsets[s], 65536);
+                        string ctx = pat + " @ +0x" + (sampleOffsets[s] - pExt.StartingOffset).ToString("X");
+                        if (pat == WipePattern.ZeroFill)
+                            AssertBytesUniform(raw, 0x00, ctx);
+                        else if (pat == WipePattern.OnesFill)
+                            AssertBytesUniform(raw, 0xFF, ctx);
+                        else
+                            AssertHighEntropyRandom(raw, ctx);
+                    }
+
+                    // Neighbor HFS+ partition must remain completely untouched
+                    VerifyRoMountAndFile(disk, pHfs, "/hfs_keep.txt", "HFS_INTACT_PAYLOAD_" + pat);
+
+                    // Even if metadata is spoofed back to Ext4, MountReadOnly MUST reject a wiped partition lacking a superblock
+                    var spoofedExt = new PartitionEntry
+                    {
+                        DiskNumber = pExt.DiskNumber,
+                        PartitionNumber = pExt.PartitionNumber,
+                        StartingOffset = pExt.StartingOffset,
+                        PartitionLength = pExt.PartitionLength,
+                        FileSystem = FileSystemType.Ext4
+                    };
+                    ExpectRejected(() => ReadOnlyFileSystemMountEngine.MountReadOnly(disk, spoofedExt, true), "MountReadOnly on wiped " + pat + " partition");
+
+                    // Reformat the wiped partition back to Ext4 and verify old written files NEVER reappear
+                    qm = new OperationQueueManager();
+                    qm.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { disk });
+                    qm.Enqueue(new PendingOperation
+                    {
+                        Type = OperationType.FormatPartition,
+                        TargetDiskNumber = diskNum,
+                        TargetDiskPath = disk.DevicePath,
+                        TargetPartitionNumber = pExt.PartitionNumber,
+                        OriginalStartOffset = pExt.StartingOffset,
+                        OriginalLength = pExt.PartitionLength,
+                        NewFileSystem = FileSystemType.Ext4,
+                        NewLabel = "CLEAN_EXT4",
+                        NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(FileSystemType.Ext4),
+                        NewMbrType = RawDiskEngine.GetDefaultMbrType(FileSystemType.Ext4),
+                        Summary = "Reformat wiped partition to Ext4"
+                    });
+                    qm.ApplyAll(null);
+
+                    disk = RawDiskEngine.LoadVirtualDisk(imgPath, diskNum);
+                    var cleanVol = ReadOnlyFileSystemMountEngine.MountReadOnly(disk, disk.Partitions[0], true);
+                    if (FindFsNodeByPath(cleanVol.RootNode, "/secret_dir/classified.txt") != null ||
+                        (cleanVol.OverlayRecords != null && cleanVol.OverlayRecords.Count != 0))
+                        throw new Exception("Old experimental files or overlay records reappeared after wipe + reformat (" + pat + ").");
+
+                    // Now wipe the HFS+ partition with RandomDoD while still mounted and verify full erasure too
+                    if (pat == WipePattern.RandomDoD)
+                    {
+                        qm = new OperationQueueManager();
+                        qm.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { disk });
+                        qm.Enqueue(new PendingOperation
+                        {
+                            Type = OperationType.WipePartition,
+                            TargetDiskNumber = diskNum,
+                            TargetDiskPath = disk.DevicePath,
+                            TargetPartitionNumber = disk.Partitions[1].PartitionNumber,
+                            OriginalStartOffset = disk.Partitions[1].StartingOffset,
+                            OriginalLength = disk.Partitions[1].PartitionLength,
+                            WipePattern = WipePattern.RandomDoD,
+                            Summary = "Wipe HFS+ RandomDoD"
+                        });
+                        qm.ApplyAll(null);
+
+                        if (ReadOnlyFileSystemMountEngine.GetMount(diskNum, disk.Partitions[1].StartingOffset) != null)
+                            throw new Exception("HFS+ ActiveMounts cache survived WipePartition.");
+                        disk = RawDiskEngine.LoadVirtualDisk(imgPath, diskNum);
+                        if (disk.Partitions[1].FileSystem != FileSystemType.RAW)
+                            throw new Exception("HFS+ partition did not become RAW after RandomDoD wipe.");
+                        var spoofedHfs = new PartitionEntry
+                        {
+                            DiskNumber = disk.Partitions[1].DiskNumber,
+                            PartitionNumber = disk.Partitions[1].PartitionNumber,
+                            StartingOffset = disk.Partitions[1].StartingOffset,
+                            PartitionLength = disk.Partitions[1].PartitionLength,
+                            FileSystem = FileSystemType.HFSPlus
+                        };
+                        ExpectRejected(() => ReadOnlyFileSystemMountEngine.MountReadOnly(disk, spoofedHfs, true), "MountReadOnly on wiped HFS+ partition");
+                    }
+                }
+
+                // 10b. Format Partition without prior Wipe (Ext4 -> Btrfs -> Ext4) must completely purge overlay & cache
+                string fmtImgPath = Path.Combine(tempDir, "stress10_fmt_only.img");
+                var fmtDisk = RawDiskEngine.CreateBlankVirtualDisk(fmtImgPath, 32L * MiB, PartitionTableStyle.GPT);
+                fmtDisk.DiskNumber = 909;
+
+                var qmFmt = new OperationQueueManager();
+                qmFmt.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { fmtDisk });
+                qmFmt.Enqueue(MakeCreateOp(909, fmtImgPath, 1L * MiB, 24L * MiB, FileSystemType.Ext4, "FMT_SRC"));
+                qmFmt.ApplyAll(null);
+
+                fmtDisk = RawDiskEngine.LoadVirtualDisk(fmtImgPath, 909);
+                var fmtPart = fmtDisk.Partitions[0];
+                var fmtVol1 = ReadOnlyFileSystemMountEngine.MountReadOnly(fmtDisk, fmtPart, true);
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(fmtVol1, true);
+                var oldDir = ReadOnlyFileSystemMountEngine.CreateDirectoryOnVolume(fmtDisk, fmtPart, fmtVol1, fmtVol1.RootNode, "old_format_dir");
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(fmtDisk, fmtPart, fmtVol1, oldDir, "old_secret.txt", Encoding.UTF8.GetBytes("OLD_FORMAT_SECRET"));
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(fmtDisk, fmtPart, fmtVol1, fmtVol1.RootNode, "top_secret.bin", new byte[4096]);
+                string fmtShadowPath = Path.Combine(shadowDir, "ovl_d909_" + fmtPart.StartingOffset.ToString("X") + "_fmtmarker.bin");
+                File.WriteAllBytes(fmtShadowPath, new byte[] { 0xCA, 0xFE, 0xBA, 0xBE });
+
+                qmFmt = new OperationQueueManager();
+                qmFmt.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { fmtDisk });
+                qmFmt.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.FormatPartition,
+                    TargetDiskNumber = 909,
+                    TargetDiskPath = fmtDisk.DevicePath,
+                    TargetPartitionNumber = fmtPart.PartitionNumber,
+                    OriginalStartOffset = fmtPart.StartingOffset,
+                    OriginalLength = fmtPart.PartitionLength,
+                    NewFileSystem = FileSystemType.Btrfs,
+                    NewLabel = "FMT_BTRFS",
+                    NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(FileSystemType.Btrfs),
+                    NewMbrType = RawDiskEngine.GetDefaultMbrType(FileSystemType.Btrfs),
+                    Summary = "Format Ext4 -> Btrfs"
+                });
+                qmFmt.ApplyAll(null);
+
+                if (ReadOnlyFileSystemMountEngine.GetMount(909, fmtPart.StartingOffset) != null)
+                    throw new Exception("ActiveMounts cache survived FormatPartition (Ext4 -> Btrfs).");
+                if (File.Exists(fmtShadowPath))
+                    throw new Exception("Shadow overlay file survived FormatPartition (Ext4 -> Btrfs).");
+
+                fmtDisk = RawDiskEngine.LoadVirtualDisk(fmtImgPath, 909);
+                var btrfsVol = ReadOnlyFileSystemMountEngine.MountReadOnly(fmtDisk, fmtDisk.Partitions[0], true);
+                if (FindFsNodeByPath(btrfsVol.RootNode, "/old_format_dir/old_secret.txt") != null ||
+                    FindFsNodeByPath(btrfsVol.RootNode, "/top_secret.bin") != null ||
+                    (btrfsVol.OverlayRecords != null && btrfsVol.OverlayRecords.Count != 0))
+                    throw new Exception("Stale overlay files survived FormatPartition (Ext4 -> Btrfs).");
+
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(btrfsVol, true);
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(fmtDisk, fmtDisk.Partitions[0], btrfsVol, btrfsVol.RootNode, "btrfs_secret.txt", Encoding.UTF8.GetBytes("BTRFS_SECRET"));
+
+                qmFmt = new OperationQueueManager();
+                qmFmt.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { fmtDisk });
+                qmFmt.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.FormatPartition,
+                    TargetDiskNumber = 909,
+                    TargetDiskPath = fmtDisk.DevicePath,
+                    TargetPartitionNumber = fmtDisk.Partitions[0].PartitionNumber,
+                    OriginalStartOffset = fmtDisk.Partitions[0].StartingOffset,
+                    OriginalLength = fmtDisk.Partitions[0].PartitionLength,
+                    NewFileSystem = FileSystemType.Ext4,
+                    NewLabel = "FMT_EXT4_2",
+                    NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(FileSystemType.Ext4),
+                    NewMbrType = RawDiskEngine.GetDefaultMbrType(FileSystemType.Ext4),
+                    Summary = "Format Btrfs -> Ext4"
+                });
+                qmFmt.ApplyAll(null);
+
+                fmtDisk = RawDiskEngine.LoadVirtualDisk(fmtImgPath, 909);
+                var ext2Vol = ReadOnlyFileSystemMountEngine.MountReadOnly(fmtDisk, fmtDisk.Partitions[0], true);
+                if (FindFsNodeByPath(ext2Vol.RootNode, "/btrfs_secret.txt") != null ||
+                    FindFsNodeByPath(ext2Vol.RootNode, "/old_format_dir/old_secret.txt") != null ||
+                    (ext2Vol.OverlayRecords != null && ext2Vol.OverlayRecords.Count != 0))
+                    throw new Exception("Stale overlay files survived FormatPartition (Btrfs -> Ext4).");
+
+                // 10c. Demo Virtual Disk Reset must clear written experimental files, shadow overlays, and RAM cache
+                string demoPath = Path.Combine(tempDir, "stress10_demo.img");
+                var demo1 = RawDiskEngine.CreateDemoVirtualDisk(demoPath, 90);
+                var demoExt1 = demo1.Partitions.FirstOrDefault(p => p.FileSystem == FileSystemType.Ext4);
+                var demoSwap1 = demo1.Partitions.FirstOrDefault(p => p.FileSystem == FileSystemType.LinuxSwap);
+                if (demoExt1 == null || demoSwap1 == null)
+                    throw new Exception("Demo virtual disk missing expected Ext4 or LinuxSwap partition.");
+
+                var demoExtVol1 = ReadOnlyFileSystemMountEngine.MountReadOnly(demo1, demoExt1, true);
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(demoExtVol1, true);
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(demo1, demoExt1, demoExtVol1, demoExtVol1.RootNode, "secret_after_demo.txt", Encoding.UTF8.GetBytes("DEMO_RESET_MUST_DELETE"));
+
+                var qmDemo = new OperationQueueManager();
+                qmDemo.SetBaselineDisks(new DiskInfo[0], new DiskInfo[] { demo1 });
+                qmDemo.Enqueue(MakeResizeOp(90, demoPath, demoExt1, demoExt1.StartingOffset, 16L * MiB));
+                qmDemo.ApplyAll(null);
+
+                demo1 = RawDiskEngine.LoadVirtualDisk(demoPath, 90);
+                demoExt1 = demo1.Partitions.FirstOrDefault(p => p.FileSystem == FileSystemType.Ext4);
+                demoSwap1 = demo1.Partitions.FirstOrDefault(p => p.FileSystem == FileSystemType.LinuxSwap);
+                if (demoExt1 == null || demoExt1.PartitionLength != 16L * MiB || demoSwap1 == null)
+                    throw new Exception("Expected resized demo Ext4 partition (16 MiB) before reset.");
+
+                // Re-mount both (now at 16 MiB Ext4 and 8 MiB Swap) and write overlay + shadow files, leaving BOTH mounted in ActiveMounts
+                demoExtVol1 = ReadOnlyFileSystemMountEngine.MountReadOnly(demo1, demoExt1, true);
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(demoExtVol1, true);
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(demo1, demoExt1, demoExtVol1, demoExtVol1.RootNode, "secret_after_demo.txt", Encoding.UTF8.GetBytes("DEMO_RESET_MUST_DELETE"));
+
+                var demoSwapVol1 = ReadOnlyFileSystemMountEngine.MountReadOnly(demo1, demoSwap1, true);
+                ReadOnlyFileSystemMountEngine.SetExperimentalWriteMode(demoSwapVol1, true);
+                ReadOnlyFileSystemMountEngine.WriteFileToVolume(demo1, demoSwap1, demoSwapVol1, demoSwapVol1.RootNode, "secret_after_demo.txt", Encoding.UTF8.GetBytes("DEMO_RESET_MUST_DELETE"));
+
+                string demoShadowPath = Path.Combine(shadowDir, "ovl_d90_" + demoExt1.StartingOffset.ToString("X") + "_demomarker.bin");
+                File.WriteAllBytes(demoShadowPath, new byte[] { 1, 2, 3, 4 });
+
+                // Reset demo virtual disk while caches & overlays exist
+                var demo2 = RawDiskEngine.CreateDemoVirtualDisk(demoPath, 90);
+                if (ReadOnlyFileSystemMountEngine.GetMount(90, demoExt1.StartingOffset) != null ||
+                    ReadOnlyFileSystemMountEngine.GetMount(90, demoSwap1.StartingOffset) != null)
+                    throw new Exception("Demo reset did not evict ActiveMounts cache for disk 90.");
+                if (File.Exists(demoShadowPath))
+                    throw new Exception("Demo reset did not delete shadow overlay file for disk 90.");
+
+                var demoExt2 = demo2.Partitions.FirstOrDefault(p => p.FileSystem == FileSystemType.Ext4);
+                var demoSwap2 = demo2.Partitions.FirstOrDefault(p => p.FileSystem == FileSystemType.LinuxSwap);
+                if (demoExt2 == null || demoSwap2 == null ||
+                    demoExt2.PartitionLength != 24L * MiB ||
+                    demoSwap2.PartitionLength != 8L * MiB)
+                    throw new Exception("Reset demo disk did not restore original partition sizes (expected 24 MiB Ext4 and 8 MiB Swap).");
+
+                var demoExtVol2 = ReadOnlyFileSystemMountEngine.MountReadOnly(demo2, demoExt2, true);
+                var demoSwapVol2 = ReadOnlyFileSystemMountEngine.MountReadOnly(demo2, demoSwap2, true);
+                if (FindFsNodeByPath(demoExtVol2.RootNode, "/secret_after_demo.txt") != null ||
+                    FindFsNodeByPath(demoSwapVol2.RootNode, "/secret_after_demo.txt") != null ||
+                    (demoExtVol2.OverlayRecords != null && demoExtVol2.OverlayRecords.Count != 0) ||
+                    (demoSwapVol2.OverlayRecords != null && demoSwapVol2.OverlayRecords.Count != 0))
+                    throw new Exception("Experimental files or overlay records survived CreateDemoVirtualDisk reset!");
+
+                log("  -> Stress 10 PASSED (Zero/Ones/CryptoRandom wipe, Format overlay purge, and Demo reset cache/overlay cleanup verified).");
+            }
+            finally
+            {
+                ReadOnlyFileSystemMountEngine.ShadowOverlayRootOverride = null;
+                ReadOnlyFileSystemMountEngine.UnmountAll();
             }
         }
 

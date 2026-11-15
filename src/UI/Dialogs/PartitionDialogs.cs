@@ -59,8 +59,8 @@ namespace WinParted.UI.Dialogs
             if (_minSizeBytes > _regionTotalBytes) _minSizeBytes = _regionTotalBytes;
 
             Text = isCreateMode ? "Create New Partition" : "Resize / Move Partition — " + targetSlice.ShortDeviceName;
-            Size = new Size(700, 600);
-            MinimumSize = new Size(660, 560);
+            Size = new Size(700, 612);
+            MinimumSize = new Size(660, 572);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -78,9 +78,9 @@ namespace WinParted.UI.Dialogs
             var bottomButtons = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 48,
+                Height = 56,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 0)
+                Padding = new Padding(0, 8, 0, 8)
             };
             var btnCancel = new Button
             {
@@ -89,8 +89,8 @@ namespace WinParted.UI.Dialogs
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 MinimumSize = new Size(104, 34),
-                Padding = new Padding(12, 4, 12, 4),
-                Margin = new Padding(8, 0, 0, 0)
+                Padding = new Padding(12, 2, 12, 2),
+                Margin = new Padding(8, 2, 0, 2)
             };
             var btnOk = new Button
             {
@@ -99,7 +99,8 @@ namespace WinParted.UI.Dialogs
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 MinimumSize = new Size(124, 34),
-                Padding = new Padding(14, 4, 14, 4),
+                Padding = new Padding(14, 2, 14, 2),
+                Margin = new Padding(0, 2, 0, 2),
                 Tag = "PrimaryButton"
             };
             btnOk.Click += (s, e) => CommitValues();
@@ -483,8 +484,8 @@ namespace WinParted.UI.Dialogs
         {
             _disk = disk;
             Text = "Manage Partition Flags — " + part.ShortDeviceName;
-            Size = new Size(580, 470);
-            MinimumSize = new Size(540, 440);
+            Size = new Size(580, 484);
+            MinimumSize = new Size(540, 454);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -497,9 +498,9 @@ namespace WinParted.UI.Dialogs
             var btnPanel = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 48,
+                Height = 56,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 0)
+                Padding = new Padding(0, 8, 0, 8)
             };
             var btnCancel = new Button
             {
@@ -508,8 +509,8 @@ namespace WinParted.UI.Dialogs
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 MinimumSize = new Size(100, 34),
-                Padding = new Padding(12, 4, 12, 4),
-                Margin = new Padding(8, 0, 0, 0)
+                Padding = new Padding(12, 2, 12, 2),
+                Margin = new Padding(8, 2, 0, 2)
             };
             var btnOk = new Button
             {
@@ -518,7 +519,8 @@ namespace WinParted.UI.Dialogs
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 MinimumSize = new Size(118, 34),
-                Padding = new Padding(14, 4, 14, 4),
+                Padding = new Padding(14, 2, 14, 2),
+                Margin = new Padding(0, 2, 0, 2),
                 Tag = "PrimaryButton"
             };
             btnPanel.Controls.Add(btnCancel);
@@ -653,11 +655,13 @@ namespace WinParted.UI.Dialogs
             }
         }
 
+        public bool ExecuteImmediately { get; private set; }
+
         public WipePartitionDialog(PartitionEntry part)
         {
             Text = "Secure Wipe Partition — " + part.ShortDeviceName;
-            Size = new Size(540, 310);
-            MinimumSize = new Size(500, 290);
+            Size = new Size(560, 330);
+            MinimumSize = new Size(520, 310);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -670,9 +674,9 @@ namespace WinParted.UI.Dialogs
             var btnPanel = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 48,
+                Height = 56,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 0)
+                Padding = new Padding(0, 8, 0, 8)
             };
             var btnCancel = new Button
             {
@@ -680,9 +684,9 @@ namespace WinParted.UI.Dialogs
                 DialogResult = DialogResult.Cancel,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(100, 34),
-                Padding = new Padding(12, 4, 12, 4),
-                Margin = new Padding(8, 0, 0, 0)
+                MinimumSize = new Size(96, 34),
+                Padding = new Padding(12, 2, 12, 2),
+                Margin = new Padding(8, 2, 0, 2)
             };
             var btnOk = new Button
             {
@@ -690,12 +694,27 @@ namespace WinParted.UI.Dialogs
                 DialogResult = DialogResult.OK,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(118, 34),
-                Padding = new Padding(14, 4, 14, 4),
+                MinimumSize = new Size(116, 34),
+                Padding = new Padding(12, 2, 12, 2),
+                Margin = new Padding(8, 2, 0, 2),
+                Tag = "TonalButton"
+            };
+            btnOk.Click += delegate { ExecuteImmediately = false; };
+            var btnWipeNow = new Button
+            {
+                Text = "Wipe Now",
+                DialogResult = DialogResult.OK,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(116, 34),
+                Padding = new Padding(14, 2, 14, 2),
+                Margin = new Padding(0, 2, 0, 2),
                 Tag = "DangerButton"
             };
+            btnWipeNow.Click += delegate { ExecuteImmediately = true; };
             btnPanel.Controls.Add(btnCancel);
             btnPanel.Controls.Add(btnOk);
+            btnPanel.Controls.Add(btnWipeNow);
 
             var flow = new FlowLayoutPanel
             {
@@ -1066,9 +1085,9 @@ namespace WinParted.UI.Dialogs
             var bottomBar = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 48,
+                Height = 56,
                 FlowDirection = FlowDirection.RightToLeft,
-                Padding = new Padding(0, 8, 0, 0)
+                Padding = new Padding(0, 8, 0, 8)
             };
             var btnClose = new Button
             {
@@ -1077,7 +1096,8 @@ namespace WinParted.UI.Dialogs
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 MinimumSize = new Size(100, 34),
-                Padding = new Padding(14, 4, 14, 4),
+                Padding = new Padding(14, 2, 14, 2),
+                Margin = new Padding(0, 2, 0, 2),
                 Tag = "PrimaryButton"
             };
             bottomBar.Controls.Add(btnClose);
