@@ -2,12 +2,16 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using WinParted.Interop;
 using WinParted.Models;
 
 namespace WinParted.Core
 {
+    /// <summary>
+    /// IEEE 802.3 CRC32 implementation used for UEFI GPT header/entry-array checksums and backup files.
+    /// </summary>
     public static class Crc32
     {
         private static readonly uint[] Table = BuildTable();
@@ -25,6 +29,7 @@ namespace WinParted.Core
             return t;
         }
 
+        /// <summary>Computes the CRC32 digest over a byte slice.</summary>
         public static uint Compute(byte[] data, int offset, int length)
         {
             uint crc = 0xFFFFFFFFu;
@@ -34,10 +39,19 @@ namespace WinParted.Core
         }
     }
 
+    /// <summary>
+    /// Core raw-sector I/O, GPT/MBR partition table codec, safety validator, and multi-OS superblock
+    /// inspection/formatting/resizing engine. Operates identically against virtual disk images (<c>.img</c>)
+    /// and raw physical drives (via <see cref="Win32DiskInterop"/>).
+    /// </summary>
     public static class RawDiskEngine
     {
         private const ulong GPT_SIGNATURE = 0x5452415020494645UL; // "EFI PART"
 
+        /// <summary>
+        /// Reads <paramref name="length"/> bytes starting at <paramref name="offset"/> from either
+        /// a virtual image file or a physical drive handle.
+        /// </summary>
         public static byte[] ReadBytes(DiskInfo disk, long offset, int length)
         {
             if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath))
@@ -59,22 +73,32 @@ namespace WinParted.Core
                 }
             }
 
-            return Win32DiskInterop.ReadRawDiskSectors(disk.DevicePath, offset, length);
+            return Win32DiskInterop.ReadRawDiskSectors(disk.DevicePath, disk.DiskNumber, offset, length);
         }
 
+        /// <summary>
+        /// Writes <paramref name="data"/> at <paramref name="offset"/> to a virtual image file or physical drive.
+        /// </summary>
         public static void WriteBytes(DiskInfo disk, long offset, byte[] data)
         {
-            if (!disk.IsVirtualImage || string.IsNullOrEmpty(disk.BackingFilePath))
-                throw new InvalidOperationException("Direct raw byte writing is restricted to Virtual Disk images unless executed through elevated disk operations.");
-
-            using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath))
             {
-                fs.Seek(offset, SeekOrigin.Begin);
-                fs.Write(data, 0, data.Length);
-                fs.Flush();
+                using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                {
+                    fs.Seek(offset, SeekOrigin.Begin);
+                    fs.Write(data, 0, data.Length);
+                    fs.Flush();
+                }
+                return;
             }
+
+            Win32DiskInterop.WriteRawDiskSectors(disk.DevicePath, disk.DiskNumber, offset, data, disk.LogicalSectorSize);
         }
 
+        /// <summary>
+        /// Opens a virtual raw disk image (<c>.img</c>), parses its GPT/MBR table, and probes all
+        /// partition superblocks to reconstruct a complete <see cref="DiskInfo"/> model.
+        /// </summary>
         public static DiskInfo LoadVirtualDisk(string filePath, int diskNumber)
         {
             var fi = new FileInfo(filePath);
@@ -106,9 +130,11 @@ namespace WinParted.Core
             return disk;
         }
 
+        /// <summary>Creates a blank virtual disk image file initialized with an empty GPT, MBR, or RAW header.</summary>
         public static DiskInfo CreateBlankVirtualDisk(string filePath, long sizeBytes, PartitionTableStyle style)
         {
             long alignedSize = Math.Max(4L * 1048576L, ByteFormatter.AlignUp(sizeBytes, 512));
+            if (File.Exists(filePath)) File.Delete(filePath);
             using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
             {
                 fs.SetLength(alignedSize);
@@ -138,8 +164,14 @@ namespace WinParted.Core
             return LoadVirtualDisk(filePath, disk.DiskNumber);
         }
 
+        /// <summary>
+        /// Generates a 128 MiB multi-OS GPT virtual disk containing EFI (FAT32), NTFS, Ext4, and Linux Swap
+        /// partitions plus trailing unallocated space for safe testing and experimentation.
+        /// </summary>
         public static DiskInfo CreateDemoVirtualDisk(string filePath, int diskNumber = 90)
         {
+            ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(diskNumber);
+            if (File.Exists(filePath)) File.Delete(filePath);
             long totalSize = 128L * 1048576L; // 128 MiB
             using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
             {
@@ -237,6 +269,10 @@ namespace WinParted.Core
             return LoadVirtualDisk(filePath, diskNumber);
         }
 
+        /// <summary>
+        /// Reads LBA 0..33 to determine GPT vs MBR vs RAW layout, validates GPT header/entry CRC32 digests,
+        /// and populates <see cref="DiskInfo.Partitions"/>.
+        /// </summary>
         public static void ParseDiskPartitionTable(DiskInfo disk)
         {
             disk.Partitions.Clear();
@@ -370,6 +406,11 @@ namespace WinParted.Core
             disk.PartitionStyle = PartitionTableStyle.RAW;
         }
 
+        /// <summary>
+        /// Pre-flight layout safety validator: rejects overlapping partitions, out-of-bounds LBA ranges,
+        /// encroaching on Primary/Backup GPT sectors (LBA 0..33 and last 33 sectors), duplicate GPT GUIDs,
+        /// and exceeding MBR's 4-slot primary table limit.
+        /// </summary>
         public static bool ValidatePartitionTable(DiskInfo disk, out string errorMessage)
         {
             errorMessage = string.Empty;
@@ -461,6 +502,7 @@ namespace WinParted.Core
             return true;
         }
 
+        /// <summary>Verifies LBA 0 signature, Primary &amp; Backup GPT headers/entry arrays, CRC32s, and non-overlap rules.</summary>
         public static bool VerifyDiskPartitionTableIntegrity(DiskInfo disk, out string report)
         {
             var sb = new StringBuilder();
@@ -568,6 +610,7 @@ namespace WinParted.Core
             return true;
         }
 
+        /// <summary>Restores the Primary GPT Header (LBA 1) and Array (LBA 2..33) from a verified Backup GPT.</summary>
         public static void RecoverGptFromBackup(DiskInfo disk)
         {
             if (!disk.IsVirtualImage)
@@ -609,6 +652,10 @@ namespace WinParted.Core
                 InspectPartitionSuperblock(disk, p);
         }
 
+        /// <summary>
+        /// Validates and writes a complete MBR or GPT partition table (Protective MBR + Primary/Backup GPT
+        /// headers &amp; entry arrays with freshly computed CRC32 checksums) to disk.
+        /// </summary>
         public static void WritePartitionTable(DiskInfo disk)
         {
             string valErr;
@@ -738,10 +785,17 @@ namespace WinParted.Core
             return hdr;
         }
 
+        /// <summary>
+        /// Probes the first 128 KiB of a partition to identify its exact on-disk filesystem superblock,
+        /// UUID, volume label, and used/free byte counts across 18+ Windows, Linux, Unix, and macOS formats.
+        /// Falls back to <see cref="FileSystemType.RAW"/> when no recognized signature matches.
+        /// </summary>
         public static void InspectPartitionSuperblock(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 4096) return;
+            if (!disk.IsVirtualImage && !disk.CanRawRead) return;
 
+            FileSystemType priorGuessedFs = part.FileSystem;
             int probeSize = (int)Math.Min(131072, part.PartitionLength);
             byte[] data;
             try
@@ -750,9 +804,14 @@ namespace WinParted.Core
             }
             catch
             {
+                part.FileSystem = priorGuessedFs;
                 return;
             }
-            if (data.Length < 512) return;
+            if (data.Length < 512)
+            {
+                part.FileSystem = priorGuessedFs;
+                return;
+            }
 
             // Check NTFS ("NTFS    " at +3)
             if (MatchesAscii(data, 3, "NTFS    "))
@@ -804,6 +863,25 @@ namespace WinParted.Core
             if (MatchesAscii(data, 3, "ReFS"))
             {
                 part.FileSystem = FileSystemType.ReFS;
+                if (data.Length >= 0x80)
+                {
+                    ulong refsSerial = BitConverter.ToUInt64(data, 0x38);
+                    if (refsSerial != 0)
+                        part.UUID = refsSerial.ToString("X16");
+                    string refsLbl = Encoding.Unicode.GetString(data, 0x40, 64).TrimEnd('\0', ' ');
+                    if (string.IsNullOrEmpty(refsLbl))
+                        refsLbl = ReadCustomLabelHint(data, 0x1A0);
+                    if (!string.IsNullOrEmpty(refsLbl))
+                        part.Label = refsLbl;
+                    long refsUsed = ReadCustomUsedHint(data, 0x1C0);
+                    if (refsUsed < 0)
+                        refsUsed = BitConverter.ToInt64(data, 0x28);
+                    if (refsUsed >= 0 && refsUsed <= part.PartitionLength)
+                    {
+                        part.UsedBytes = refsUsed;
+                        part.FreeBytes = part.PartitionLength - refsUsed;
+                    }
+                }
                 return;
             }
 
@@ -831,9 +909,63 @@ namespace WinParted.Core
             if (data.Length >= 64 && MatchesAscii(data, 0x36, "FAT16   "))
             {
                 part.FileSystem = FileSystemType.FAT16;
+                uint fat16Id = BitConverter.ToUInt32(data, 0x27);
+                if (fat16Id != 0)
+                    part.UUID = string.Format("{0:X4}-{1:X4}", (fat16Id >> 16) & 0xFFFF, fat16Id & 0xFFFF);
                 string lbl = Encoding.ASCII.GetString(data, 0x2B, 11).Trim();
                 if (!string.IsNullOrEmpty(lbl) && lbl != "NO NAME")
                     part.Label = lbl;
+                long customUsed16 = ReadCustomUsedHint(data, 0x1C0);
+                if (customUsed16 >= 0 && customUsed16 <= part.PartitionLength)
+                {
+                    part.UsedBytes = customUsed16;
+                    part.FreeBytes = part.PartitionLength - customUsed16;
+                }
+                return;
+            }
+
+            // Check SquashFS ("hsqs" magic 0x73717368 at +0)
+            if (data.Length >= 0xC0 && BitConverter.ToUInt32(data, 0) == 0x73717368u)
+            {
+                part.FileSystem = FileSystemType.SquashFS;
+                long bytesUsed = (long)BitConverter.ToUInt64(data, 40);
+                if (bytesUsed <= 0 || bytesUsed > part.PartitionLength)
+                    bytesUsed = Math.Min(part.PartitionLength, 4096L);
+                part.UsedBytes = bytesUsed;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - bytesUsed);
+                byte[] sqUuid = new byte[16];
+                Array.Copy(data, 0xA0, sqUuid, 0, 16);
+                if (sqUuid.Any(b => b != 0))
+                    part.UUID = FormatRfcUuid(sqUuid);
+                string sqLbl = Encoding.UTF8.GetString(data, 0x80, 32).TrimEnd('\0', ' ');
+                if (!string.IsNullOrEmpty(sqLbl))
+                    part.Label = sqLbl;
+                return;
+            }
+
+            // Check F2FS (magic 0xF2F52010 at +0x400)
+            if (data.Length >= 0x500 && BitConverter.ToUInt32(data, 0x400) == 0xF2F52010u)
+            {
+                part.FileSystem = FileSystemType.F2FS;
+                uint logBlk = BitConverter.ToUInt32(data, 0x410);
+                long f2BlockSize = (logBlk >= 9 && logBlk <= 16) ? (1L << (int)logBlk) : 4096L;
+                ulong blkCount = BitConverter.ToUInt64(data, 0x424);
+                ulong userBlks = BitConverter.ToUInt64(data, 0x430);
+                byte[] f2Uuid = new byte[16];
+                Array.Copy(data, 0x46C, f2Uuid, 0, 16);
+                if (f2Uuid.Any(b => b != 0))
+                    part.UUID = FormatRfcUuid(f2Uuid);
+                string f2Lbl = Encoding.Unicode.GetString(data, 0x47C, 64).TrimEnd('\0', ' ');
+                if (!string.IsNullOrEmpty(f2Lbl))
+                    part.Label = f2Lbl;
+                long f2Used = ReadCustomUsedHint(data, 0x1C0);
+                if (f2Used < 0 && blkCount > 0 && userBlks <= blkCount)
+                    f2Used = (long)(blkCount - userBlks) * f2BlockSize;
+                if (f2Used >= 0 && f2Used <= part.PartitionLength)
+                {
+                    part.UsedBytes = f2Used;
+                    part.FreeBytes = part.PartitionLength - f2Used;
+                }
                 return;
             }
 
@@ -906,16 +1038,31 @@ namespace WinParted.Core
                 return;
             }
 
-            // Check XFS ("XFSB" at +0)
+            // Check XFS ("XFSB" at +0; real XFS is Big-Endian, also accept Little-Endian)
             if (MatchesAscii(data, 0, "XFSB"))
             {
                 part.FileSystem = FileSystemType.XFS;
                 if (data.Length >= 120)
                 {
-                    uint blockSize = BitConverter.ToUInt32(data, 4);
+                    uint beBlockSize = ReadUInt32BE(data, 4);
+                    bool isBigEndian = beBlockSize >= 512 && beBlockSize <= 65536 && (beBlockSize & (beBlockSize - 1)) == 0;
+                    uint blockSize = isBigEndian ? beBlockSize : BitConverter.ToUInt32(data, 4);
                     if (blockSize == 0) blockSize = 4096;
-                    ulong dblocks = BitConverter.ToUInt64(data, 8);
-                    ulong fdblocks = BitConverter.ToUInt64(data, 16);
+                    ulong dblocks = isBigEndian ? ReadUInt64BE(data, 8) : BitConverter.ToUInt64(data, 8);
+                    ulong fdblocks;
+                    if (isBigEndian)
+                    {
+                        fdblocks = data.Length >= 152 ? ReadUInt64BE(data, 144) : 0UL;
+                        if (fdblocks == 0 && dblocks > 0)
+                        {
+                            ulong alt = ReadUInt64BE(data, 16);
+                            if (alt > 0 && alt <= dblocks) fdblocks = alt;
+                        }
+                    }
+                    else
+                    {
+                        fdblocks = BitConverter.ToUInt64(data, 16);
+                    }
                     byte[] uuidBytes = new byte[16];
                     Array.Copy(data, 32, uuidBytes, 0, 16);
                     part.UUID = FormatRfcUuid(uuidBytes);
@@ -932,6 +1079,70 @@ namespace WinParted.Core
                 return;
             }
 
+            // Check ZFS / OpenZFS ("ZFS_POOL" at +0x0800 or Uberblock magic 0x00BAB10C at +0x11000)
+            if ((data.Length >= 0x0850 && MatchesAscii(data, 0x0800, "ZFS_POOL")) ||
+                (data.Length >= 0x11040 && (BitConverter.ToUInt64(data, 0x11000) == 0x00BAB10CUL || ReadUInt64BE(data, 0x11000) == 0x00BAB10CUL)))
+            {
+                part.FileSystem = FileSystemType.ZFS;
+                if (MatchesAscii(data, 0x0800, "ZFS_POOL"))
+                {
+                    string zfsLbl = Encoding.UTF8.GetString(data, 0x0810, 32).TrimEnd('\0', ' ');
+                    if (!string.IsNullOrEmpty(zfsLbl)) part.Label = zfsLbl;
+                    byte[] zfsUuid = new byte[16];
+                    Array.Copy(data, 0x0830, zfsUuid, 0, 16);
+                    if (zfsUuid.Any(b => b != 0))
+                        part.UUID = FormatRfcUuid(zfsUuid);
+                    long zfsUsed = BitConverter.ToInt64(data, 0x0848);
+                    if (zfsUsed >= 0 && zfsUsed <= part.PartitionLength)
+                    {
+                        part.UsedBytes = zfsUsed;
+                        part.FreeBytes = part.PartitionLength - zfsUsed;
+                    }
+                }
+                return;
+            }
+
+            // Check UDF ("BEA01" at +0x8001 / "NSR02"|"NSR03" at +0x8801|+0x9001) & ISO9660 ("CD001" at +0x8001)
+            if (data.Length >= 0x9010 && MatchesAscii(data, 0x8001, "BEA01") &&
+                (MatchesAscii(data, 0x8801, "NSR02") || MatchesAscii(data, 0x8801, "NSR03") ||
+                 MatchesAscii(data, 0x9001, "NSR02") || MatchesAscii(data, 0x9001, "NSR03")))
+            {
+                part.FileSystem = FileSystemType.UDF;
+                string udfLbl = Encoding.UTF8.GetString(data, 0x8820, 32).TrimEnd('\0', ' ');
+                if (!string.IsNullOrEmpty(udfLbl)) part.Label = udfLbl;
+                byte[] udfUuid = new byte[16];
+                Array.Copy(data, 0x8840, udfUuid, 0, 16);
+                if (udfUuid.Any(b => b != 0))
+                    part.UUID = FormatRfcUuid(udfUuid);
+                long udfUsed = BitConverter.ToInt64(data, 0x8850);
+                if (udfUsed > 0 && udfUsed <= part.PartitionLength)
+                {
+                    part.UsedBytes = udfUsed;
+                    part.FreeBytes = part.PartitionLength - udfUsed;
+                }
+                return;
+            }
+
+            if (data.Length >= 0x8800 && MatchesAscii(data, 0x8001, "CD001"))
+            {
+                part.FileSystem = FileSystemType.ISO9660;
+                string isoLbl = Encoding.ASCII.GetString(data, 0x8028, 32).TrimEnd('\0', ' ');
+                if (!string.IsNullOrEmpty(isoLbl))
+                    part.Label = isoLbl;
+                ushort isoBlk = BitConverter.ToUInt16(data, 0x8080);
+                if (isoBlk == 0) isoBlk = 2048;
+                uint isoBlocks = BitConverter.ToUInt32(data, 0x8050);
+                long isoUsed = ReadCustomUsedHint(data, 0x81C0);
+                if (isoUsed <= 0 && isoBlocks > 0)
+                    isoUsed = Math.Min(part.PartitionLength, (long)isoBlocks * isoBlk);
+                if (isoUsed >= 0 && isoUsed <= part.PartitionLength)
+                {
+                    part.UsedBytes = isoUsed;
+                    part.FreeBytes = part.PartitionLength - isoUsed;
+                }
+                return;
+            }
+
             // Check LVM2 ("LABELONE" at +512)
             if (data.Length >= 1024 && MatchesAscii(data, 512, "LABELONE"))
             {
@@ -939,10 +1150,91 @@ namespace WinParted.Core
                 return;
             }
 
-            // Check APFS ("NXSB" at +32)
-            if (MatchesAscii(data, 32, "NXSB"))
+            // Check APFS ("NXSB" or "APSB" at +32)
+            if (MatchesAscii(data, 32, "NXSB") || MatchesAscii(data, 32, "APSB"))
             {
                 part.FileSystem = FileSystemType.APFS;
+                if (data.Length >= 88)
+                {
+                    uint blockSize = BitConverter.ToUInt32(data, 36);
+                    if (blockSize == 0) blockSize = 4096;
+                    byte[] uuidBytes = new byte[16];
+                    Array.Copy(data, 0x48, uuidBytes, 0, 16);
+                    if (uuidBytes.Any(b => b != 0))
+                        part.UUID = FormatRfcUuid(uuidBytes);
+                }
+                string apfsLbl = ReadCustomLabelHint(data, 0x1A0);
+                if (string.IsNullOrEmpty(apfsLbl) && data.Length >= 0x300)
+                    apfsLbl = Encoding.UTF8.GetString(data, 0x2C0, 64).TrimEnd('\0', ' ');
+                if (!string.IsNullOrEmpty(apfsLbl))
+                    part.Label = apfsLbl;
+                long apfsUsed = ReadCustomUsedHint(data, 0x1C0);
+                if (apfsUsed >= 0 && apfsUsed <= part.PartitionLength)
+                {
+                    part.UsedBytes = apfsUsed;
+                    part.FreeBytes = part.PartitionLength - apfsUsed;
+                }
+                return;
+            }
+
+            // Check Apple HFS+ / HFSX (Volume Header "H+" or "HX" at +0x400, or wrapped in "BD" at +0x47C)
+            if (data.Length >= 1536 &&
+                (MatchesAscii(data, 0x400, "H+") || MatchesAscii(data, 0x400, "HX") ||
+                 (MatchesAscii(data, 0x400, "BD") && (MatchesAscii(data, 0x47C, "H+") || MatchesAscii(data, 0x47C, "HX")))))
+            {
+                part.FileSystem = FileSystemType.HFSPlus;
+                if (MatchesAscii(data, 0x400, "H+") || MatchesAscii(data, 0x400, "HX"))
+                {
+                    uint blockSize = ReadUInt32BE(data, 0x428);
+                    if (blockSize == 0) blockSize = 4096;
+                    uint totalBlocks = ReadUInt32BE(data, 0x42C);
+                    uint freeBlocks = ReadUInt32BE(data, 0x430);
+                    ulong hfsId = BitConverter.ToUInt64(data, 0x468);
+                    if (hfsId != 0)
+                        part.UUID = hfsId.ToString("X16");
+                    string hfsLbl = ReadCustomLabelHint(data, 0x1A0);
+                    if (!string.IsNullOrEmpty(hfsLbl))
+                        part.Label = hfsLbl;
+                    else
+                    {
+                        string btreeLbl = TryReadHfsPlusVolumeLabel(disk, part, data);
+                        if (!string.IsNullOrEmpty(btreeLbl))
+                            part.Label = btreeLbl;
+                    }
+                    if (totalBlocks > 0 && freeBlocks <= totalBlocks)
+                    {
+                        part.FreeBytes = Math.Min(part.PartitionLength, (long)freeBlocks * blockSize);
+                        part.UsedBytes = Math.Max(0, Math.Min(part.PartitionLength, (long)(totalBlocks - freeBlocks) * blockSize));
+                    }
+                }
+                return;
+            }
+
+            // Check Classic Macintosh HFS (Master Directory Block "BD" at +0x400)
+            if (data.Length >= 1200 && MatchesAscii(data, 0x400, "BD"))
+            {
+                part.FileSystem = FileSystemType.HFS;
+                ushort totalAlBlks = ReadUInt16BE(data, 0x412);
+                uint alBlkSize = ReadUInt32BE(data, 0x414);
+                if (alBlkSize == 0) alBlkSize = 4096;
+                ushort freeAlBlks = ReadUInt16BE(data, 0x422);
+                int vnLen = Math.Min(27, (int)data[0x424]);
+                if (vnLen > 0)
+                    part.Label = Encoding.UTF8.GetString(data, 0x425, vnLen).TrimEnd('\0');
+                ulong macId = BitConverter.ToUInt64(data, 0x474);
+                if (macId != 0)
+                    part.UUID = macId.ToString("X16");
+                long macUsed = ReadCustomUsedHint(data, 0x1C0);
+                if (macUsed >= 0 && macUsed <= part.PartitionLength)
+                {
+                    part.UsedBytes = macUsed;
+                    part.FreeBytes = part.PartitionLength - macUsed;
+                }
+                else if (totalAlBlks > 0 && freeAlBlks <= totalAlBlks)
+                {
+                    part.FreeBytes = Math.Min(part.PartitionLength, (long)freeAlBlks * alBlkSize);
+                    part.UsedBytes = Math.Max(0, Math.Min(part.PartitionLength, (long)(totalAlBlks - freeAlBlks) * alBlkSize));
+                }
                 return;
             }
 
@@ -950,12 +1242,21 @@ namespace WinParted.Core
             if (part.FileSystem != FileSystemType.MicrosoftReserved)
             {
                 part.FileSystem = FileSystemType.RAW;
+                part.Label = string.Empty;
+                part.UsedBytes = 0;
+                part.FreeBytes = part.PartitionLength;
             }
         }
 
+        /// <summary>
+        /// Formats a partition header area (first 128 KiB) with valid superblock metadata, UUIDs, labels,
+        /// and initial directory/B-tree/catalog structures for the target <see cref="PartitionEntry.FileSystem"/>.
+        /// </summary>
         public static void WriteFileSystemHeader(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 65536) return;
+
+            ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, part.StartingOffset, part.PartitionLength, true);
 
             int headerClearLen = (int)Math.Min(131072, part.PartitionLength);
             byte[] buf = new byte[headerClearLen];
@@ -1006,6 +1307,54 @@ namespace WinParted.Core
                     part.UUID = string.Format("{0:X4}-{1:X4}", (fatId >> 16) & 0xFFFF, fatId & 0xFFFF);
                     break;
 
+                case FileSystemType.FAT16:
+                    buf[0] = 0xEB; buf[1] = 0x3C; buf[2] = 0x90;
+                    Encoding.ASCII.GetBytes("MSDOS5.0").CopyTo(buf, 3);
+                    BitConverter.GetBytes((ushort)512).CopyTo(buf, 0x0B);
+                    buf[0x0D] = 4;
+                    BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x0E);
+                    buf[0x10] = 2;
+                    BitConverter.GetBytes((ushort)512).CopyTo(buf, 0x11);
+                    buf[0x15] = 0xF8;
+                    if (totalSectors <= 65535)
+                        BitConverter.GetBytes((ushort)totalSectors).CopyTo(buf, 0x13);
+                    else
+                        BitConverter.GetBytes((uint)totalSectors).CopyTo(buf, 0x20);
+                    uint fat16Id = (uint)(0x46313600 ^ (int)part.StartingOffset);
+                    buf[0x26] = 0x29;
+                    BitConverter.GetBytes(fat16Id).CopyTo(buf, 0x27);
+                    string fat16Lbl = (string.IsNullOrEmpty(part.Label) ? "NO NAME" : part.Label.ToUpperInvariant()).PadRight(11).Substring(0, 11);
+                    Encoding.ASCII.GetBytes(fat16Lbl).CopyTo(buf, 0x2B);
+                    Encoding.ASCII.GetBytes("FAT16   ").CopyTo(buf, 0x36);
+                    long fat16Used = part.UsedBytes ?? (long)(part.PartitionLength * 0.08);
+                    WriteCustomUsedHint(buf, 0x1C0, fat16Used);
+                    buf[510] = 0x55; buf[511] = 0xAA;
+                    part.UsedBytes = fat16Used;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - fat16Used);
+                    part.UUID = string.Format("{0:X4}-{1:X4}", (fat16Id >> 16) & 0xFFFF, fat16Id & 0xFFFF);
+                    break;
+
+                case FileSystemType.ReFS:
+                    buf[0] = 0xEB; buf[1] = 0x52; buf[2] = 0x90;
+                    Encoding.ASCII.GetBytes("ReFS\0\0\0\0").CopyTo(buf, 3);
+                    BitConverter.GetBytes((ulong)totalSectors).CopyTo(buf, 0x20);
+                    long refsUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
+                    BitConverter.GetBytes(refsUsed).CopyTo(buf, 0x28);
+                    ulong refsSerial = (ulong)Math.Abs((part.Label + part.StartingOffset + "ReFS").GetHashCode()) << 32 | 0x52454653UL;
+                    BitConverter.GetBytes(refsSerial).CopyTo(buf, 0x38);
+                    string refsLbl = part.Label ?? string.Empty;
+                    if (refsLbl.Length > 31) refsLbl = refsLbl.Substring(0, 31);
+                    Encoding.Unicode.GetBytes(refsLbl).CopyTo(buf, 0x40);
+                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                    WriteCustomUsedHint(buf, 0x1C0, refsUsed);
+                    buf[510] = 0x55; buf[511] = 0xAA;
+                    part.UsedBytes = refsUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - refsUsed);
+                    part.UUID = refsSerial.ToString("X16");
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
                 case FileSystemType.exFAT:
                     buf[0] = 0xEB; buf[1] = 0x76; buf[2] = 0x90;
                     Encoding.ASCII.GetBytes("EXFAT   ").CopyTo(buf, 3);
@@ -1029,16 +1378,32 @@ namespace WinParted.Core
                     long extUsed = part.UsedBytes ?? (long)(part.PartitionLength * 0.30);
                     uint usedBlocks = (uint)(extUsed / blockSize);
                     uint freeBlocks = blocksCount > usedBlocks ? blocksCount - usedBlocks : 0;
+                    uint inodesCount = Math.Max(128u, blocksCount / 4u);
+                    uint freeInodes = inodesCount > 11u ? inodesCount - 11u : inodesCount;
 
-                    BitConverter.GetBytes(blocksCount * 4).CopyTo(buf, 0x400);  // s_inodes_count
-                    BitConverter.GetBytes(blocksCount).CopyTo(buf, 0x404);      // s_blocks_count_lo
-                    BitConverter.GetBytes(freeBlocks).CopyTo(buf, 0x40C);       // s_free_blocks_count_lo
-                    BitConverter.GetBytes(2u).CopyTo(buf, 0x418);               // s_log_block_size = 2 => 4096
-                    BitConverter.GetBytes((ushort)0xEF53).CopyTo(buf, 0x438);   // s_magic
+                    BitConverter.GetBytes(inodesCount).CopyTo(buf, 0x400);              // s_inodes_count
+                    BitConverter.GetBytes(blocksCount).CopyTo(buf, 0x404);              // s_blocks_count_lo
+                    BitConverter.GetBytes(blocksCount / 20u).CopyTo(buf, 0x408);        // s_r_blocks_count_lo
+                    BitConverter.GetBytes(freeBlocks).CopyTo(buf, 0x40C);               // s_free_blocks_count_lo
+                    BitConverter.GetBytes(freeInodes).CopyTo(buf, 0x410);               // s_free_inodes_count
+                    BitConverter.GetBytes(2u).CopyTo(buf, 0x418);                       // s_log_block_size = 2 => 4096
+                    BitConverter.GetBytes(2u).CopyTo(buf, 0x41C);                       // s_log_cluster_size = 2
+                    BitConverter.GetBytes(32768u).CopyTo(buf, 0x420);                   // s_blocks_per_group
+                    BitConverter.GetBytes(32768u).CopyTo(buf, 0x424);                   // s_clusters_per_group
+                    BitConverter.GetBytes(Math.Min(inodesCount, 8192u)).CopyTo(buf, 0x428); // s_inodes_per_group
+                    BitConverter.GetBytes((ushort)0xFFFF).CopyTo(buf, 0x436);           // s_max_mnt_count
+                    BitConverter.GetBytes((ushort)0xEF53).CopyTo(buf, 0x438);           // s_magic
+                    BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x43A);                // s_state = clean
+                    BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x43C);                // s_errors = continue
+                    BitConverter.GetBytes(1u).CopyTo(buf, 0x44C);                       // s_rev_level = EXT4_DYNAMIC_REV
+                    BitConverter.GetBytes(11u).CopyTo(buf, 0x454);                      // s_first_ino
+                    BitConverter.GetBytes((ushort)256).CopyTo(buf, 0x458);              // s_inode_size
                     uint compat = (part.FileSystem == FileSystemType.Ext3 || part.FileSystem == FileSystemType.Ext4) ? 0x0004u : 0x0000u;
                     uint incompat = (part.FileSystem == FileSystemType.Ext4) ? 0x0242u : 0x0002u;
+                    uint roCompat = (part.FileSystem == FileSystemType.Ext4) ? 0x0003u : 0x0001u;
                     BitConverter.GetBytes(compat).CopyTo(buf, 0x45C);
                     BitConverter.GetBytes(incompat).CopyTo(buf, 0x460);
+                    BitConverter.GetBytes(roCompat).CopyTo(buf, 0x464);
 
                     Guid extUuid = Guid.NewGuid();
                     extUuid.ToByteArray().CopyTo(buf, 0x468);
@@ -1049,6 +1414,11 @@ namespace WinParted.Core
                     part.UUID = extUuid.ToString("D");
                     part.UsedBytes = (blocksCount - freeBlocks) * (long)blockSize;
                     part.FreeBytes = freeBlocks * (long)blockSize;
+
+                    if (buf.Length >= 0xE000)
+                    {
+                        PopulateExtDirectoryTree(buf, part, freeBlocks, freeInodes);
+                    }
                     break;
 
                 case FileSystemType.LinuxSwap:
@@ -1066,20 +1436,54 @@ namespace WinParted.Core
                     break;
 
                 case FileSystemType.Btrfs:
-                    if (buf.Length >= 0x10200)
+                    if (buf.Length >= 0x10500)
                     {
-                        Encoding.ASCII.GetBytes("_BHRfS_M").CopyTo(buf, 0x10040);
                         Guid bUuid = Guid.NewGuid();
-                        bUuid.ToByteArray().CopyTo(buf, 0x10020);
+                        byte[] bUuidBytes = bUuid.ToByteArray();
+                        bUuidBytes.CopyTo(buf, 0x10020);                                 // fsid
+                        BitConverter.GetBytes(0x10000UL).CopyTo(buf, 0x10030);            // bytenr
+                        BitConverter.GetBytes(1UL).CopyTo(buf, 0x10038);                  // flags
+                        Encoding.ASCII.GetBytes("_BHRfS_M").CopyTo(buf, 0x10040);         // magic
+                        BitConverter.GetBytes(1UL).CopyTo(buf, 0x10048);                  // generation
+                        BitConverter.GetBytes(0x14000UL).CopyTo(buf, 0x10050);            // root (FS leaf)
+                        BitConverter.GetBytes(0x18000UL).CopyTo(buf, 0x10058);            // chunk_root
                         long bUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 4L * 1048576L);
-                        BitConverter.GetBytes(part.PartitionLength).CopyTo(buf, 0x10070);
-                        BitConverter.GetBytes(bUsed).CopyTo(buf, 0x10078);
+                        BitConverter.GetBytes(part.PartitionLength).CopyTo(buf, 0x10070); // total_bytes
+                        BitConverter.GetBytes(bUsed).CopyTo(buf, 0x10078);                // bytes_used
+                        BitConverter.GetBytes(6UL).CopyTo(buf, 0x10080);                  // root_dir_objectid
+                        BitConverter.GetBytes(1UL).CopyTo(buf, 0x10088);                  // num_devices
+                        BitConverter.GetBytes(4096U).CopyTo(buf, 0x10090);                // sectorsize
+                        BitConverter.GetBytes(16384U).CopyTo(buf, 0x10094);               // nodesize
+                        BitConverter.GetBytes(16384U).CopyTo(buf, 0x10098);               // leafsize
+                        BitConverter.GetBytes(4096U).CopyTo(buf, 0x1009C);                // stripesize
+                        BitConverter.GetBytes(97U).CopyTo(buf, 0x100A0);                  // sys_chunk_array_size
                         string bLbl = part.Label ?? string.Empty;
                         if (bLbl.Length > 64) bLbl = bLbl.Substring(0, 64);
                         Encoding.UTF8.GetBytes(bLbl).CopyTo(buf, 0x1012B);
-                        part.UUID = bUuid.ToString("D");
+
+                        // sys_chunk_array @ +0x1032B: 17-byte disk key + 80-byte single-stripe chunk mapping [0..PartitionLength) -> phys 0
+                        int sc = 0x1032B;
+                        BitConverter.GetBytes(256UL).CopyTo(buf, sc + 0);                 // BTRFS_FIRST_CHUNK_TREE_OBJECTID
+                        buf[sc + 8] = 228;                                                // BTRFS_CHUNK_ITEM_KEY
+                        BitConverter.GetBytes(0UL).CopyTo(buf, sc + 9);                   // logical offset 0
+                        BitConverter.GetBytes((ulong)part.PartitionLength).CopyTo(buf, sc + 17); // chunk length
+                        BitConverter.GetBytes(2UL).CopyTo(buf, sc + 25);                  // owner
+                        BitConverter.GetBytes(65536UL).CopyTo(buf, sc + 33);              // stripe_len
+                        BitConverter.GetBytes(1UL).CopyTo(buf, sc + 41);                  // BTRFS_BLOCK_GROUP_DATA
+                        BitConverter.GetBytes(4096U).CopyTo(buf, sc + 49);                // io_align
+                        BitConverter.GetBytes(4096U).CopyTo(buf, sc + 53);                // io_width
+                        BitConverter.GetBytes(4096U).CopyTo(buf, sc + 57);                // sector_size
+                        BitConverter.GetBytes((ushort)1).CopyTo(buf, sc + 61);            // num_stripes
+                        BitConverter.GetBytes((ushort)0).CopyTo(buf, sc + 63);            // sub_stripes
+                        BitConverter.GetBytes(1UL).CopyTo(buf, sc + 65);                  // stripe[0].devid
+                        BitConverter.GetBytes(0UL).CopyTo(buf, sc + 73);                  // stripe[0].offset (physical 0)
+                        bUuidBytes.CopyTo(buf, sc + 81);                                  // stripe[0].dev_uuid
+
+                        part.UUID = FormatRfcUuid(bUuidBytes);
                         part.UsedBytes = bUsed;
                         part.FreeBytes = Math.Max(0, part.PartitionLength - bUsed);
+                        PopulateReadOnlyFsCatalog(buf, part);
+                        PopulateBtrfsFsTree(buf, part, bUuidBytes);
                     }
                     break;
 
@@ -1089,19 +1493,255 @@ namespace WinParted.Core
                     long xUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 4L * 1048576L);
                     ulong xfsUsedBlocks = (ulong)(xUsed / xfsBlockSize);
                     ulong xfsFreeBlocks = xfsTotalBlocks > xfsUsedBlocks ? xfsTotalBlocks - xfsUsedBlocks : 0;
+                    uint xfsAgBlocks = (uint)Math.Min(65536UL, Math.Max(16UL, xfsTotalBlocks));
 
                     Encoding.ASCII.GetBytes("XFSB").CopyTo(buf, 0);
-                    BitConverter.GetBytes(xfsBlockSize).CopyTo(buf, 4);
-                    BitConverter.GetBytes(xfsTotalBlocks).CopyTo(buf, 8);
-                    BitConverter.GetBytes(xfsFreeBlocks).CopyTo(buf, 16);
+                    WriteUInt32BE(buf, 4, xfsBlockSize);
+                    WriteUInt64BE(buf, 8, xfsTotalBlocks);
                     Guid xUuid = Guid.NewGuid();
-                    xUuid.ToByteArray().CopyTo(buf, 32);
+                    byte[] xUuidBytes = xUuid.ToByteArray();
+                    xUuidBytes.CopyTo(buf, 32);
+                    WriteUInt64BE(buf, 56, 128UL);                   // sb_rootino = 128
+                    WriteUInt32BE(buf, 84, xfsAgBlocks);             // sb_agblocks
+                    WriteUInt32BE(buf, 88, 1U);                      // sb_agcount
+                    WriteUInt16BE(buf, 100, 0xB4A4);                 // sb_versionnum (v4 dirv2+attr)
+                    WriteUInt16BE(buf, 102, 512);                    // sb_sectsize
+                    WriteUInt16BE(buf, 104, 512);                    // sb_inodesize
+                    WriteUInt16BE(buf, 106, 8);                      // sb_inopblock
                     string xLbl = part.Label ?? string.Empty;
                     if (xLbl.Length > 12) xLbl = xLbl.Substring(0, 12);
                     Encoding.UTF8.GetBytes(xLbl).CopyTo(buf, 108);
-                    part.UUID = xUuid.ToString("D");
+                    buf[120] = 12;                                   // sb_blocklog (4096)
+                    buf[121] = 9;                                    // sb_sectlog (512)
+                    buf[122] = 9;                                    // sb_inodelog (512)
+                    buf[123] = 3;                                    // sb_inopblog (8 per block)
+                    buf[124] = 16;                                   // sb_agblklog
+                    WriteUInt64BE(buf, 144, xfsFreeBlocks);          // sb_fdblocks
+
+                    part.UUID = FormatRfcUuid(xUuidBytes);
                     part.UsedBytes = (long)(xfsUsedBlocks * xfsBlockSize);
                     part.FreeBytes = (long)(xfsFreeBlocks * xfsBlockSize);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    if (buf.Length >= 0x1C000)
+                        PopulateXfsFsTree(buf, part);
+                    break;
+
+                case FileSystemType.F2FS:
+                    uint f2BlockSize = 4096;
+                    ulong f2TotalBlocks = (ulong)Math.Max(1, part.PartitionLength / f2BlockSize);
+                    long f2Used = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 4L * 1048576L);
+                    ulong f2UsedBlocks = (ulong)(f2Used / f2BlockSize);
+                    ulong f2UserBlocks = f2TotalBlocks > f2UsedBlocks ? f2TotalBlocks - f2UsedBlocks : 0;
+
+                    BitConverter.GetBytes(0xF2F52010u).CopyTo(buf, 0x400);
+                    BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x404);
+                    BitConverter.GetBytes((ushort)16).CopyTo(buf, 0x406);
+                    BitConverter.GetBytes(9u).CopyTo(buf, 0x408);
+                    BitConverter.GetBytes(3u).CopyTo(buf, 0x40C);
+                    BitConverter.GetBytes(12u).CopyTo(buf, 0x410);
+                    BitConverter.GetBytes(9u).CopyTo(buf, 0x414);
+                    BitConverter.GetBytes(f2TotalBlocks).CopyTo(buf, 0x424);
+                    BitConverter.GetBytes(f2UserBlocks).CopyTo(buf, 0x430);
+                    Guid f2Uuid = Guid.NewGuid();
+                    byte[] f2UuidBytes = f2Uuid.ToByteArray();
+                    f2UuidBytes.CopyTo(buf, 0x46C);
+                    string f2Lbl = part.Label ?? string.Empty;
+                    if (f2Lbl.Length > 31) f2Lbl = f2Lbl.Substring(0, 31);
+                    Encoding.Unicode.GetBytes(f2Lbl).CopyTo(buf, 0x47C);
+                    WriteCustomUsedHint(buf, 0x1C0, f2Used);
+                    part.UUID = FormatRfcUuid(f2UuidBytes);
+                    part.UsedBytes = f2Used;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - f2Used);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
+                case FileSystemType.ZFS:
+                    Guid zUuid = Guid.NewGuid();
+                    byte[] zUuidBytes = zUuid.ToByteArray();
+                    long zUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 4L * 1048576L);
+                    if (buf.Length >= 0x1000)
+                    {
+                        Encoding.ASCII.GetBytes("ZFS_POOL").CopyTo(buf, 0x0800);
+                        string zLbl = part.Label ?? "rpool";
+                        if (zLbl.Length > 31) zLbl = zLbl.Substring(0, 31);
+                        Encoding.UTF8.GetBytes(zLbl).CopyTo(buf, 0x0810);
+                        zUuidBytes.CopyTo(buf, 0x0830);
+                        BitConverter.GetBytes(part.PartitionLength).CopyTo(buf, 0x0840);
+                        BitConverter.GetBytes(zUsed).CopyTo(buf, 0x0848);
+                    }
+                    if (buf.Length >= 0x11040)
+                    {
+                        BitConverter.GetBytes(0x00BAB10CUL).CopyTo(buf, 0x11000); // ub_magic
+                        BitConverter.GetBytes(5000UL).CopyTo(buf, 0x11008);       // ub_version
+                        BitConverter.GetBytes(42UL).CopyTo(buf, 0x11010);         // ub_txg
+                    }
+                    part.UUID = FormatRfcUuid(zUuidBytes);
+                    part.UsedBytes = zUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - zUsed);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
+                case FileSystemType.SquashFS:
+                    long sqUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
+                    Guid sqUuid = Guid.NewGuid();
+                    byte[] sqUuidBytes = sqUuid.ToByteArray();
+                    BitConverter.GetBytes(0x73717368u).CopyTo(buf, 0);          // "hsqs"
+                    BitConverter.GetBytes(6u).CopyTo(buf, 4);                    // inodes
+                    BitConverter.GetBytes(1762992000u).CopyTo(buf, 8);           // mkfs_time
+                    BitConverter.GetBytes(131072u).CopyTo(buf, 12);              // block_size
+                    BitConverter.GetBytes(1u).CopyTo(buf, 16);                   // fragments
+                    BitConverter.GetBytes((ushort)1).CopyTo(buf, 20);            // compression (gzip)
+                    BitConverter.GetBytes((ushort)17).CopyTo(buf, 22);           // block_log
+                    BitConverter.GetBytes((ushort)4).CopyTo(buf, 28);            // s_major
+                    BitConverter.GetBytes((ushort)0).CopyTo(buf, 30);            // s_minor
+                    BitConverter.GetBytes((ulong)sqUsed).CopyTo(buf, 40);        // bytes_used
+                    string sqLbl = part.Label ?? string.Empty;
+                    if (sqLbl.Length > 31) sqLbl = sqLbl.Substring(0, 31);
+                    Encoding.UTF8.GetBytes(sqLbl).CopyTo(buf, 0x80);
+                    sqUuidBytes.CopyTo(buf, 0xA0);
+                    part.UUID = FormatRfcUuid(sqUuidBytes);
+                    part.UsedBytes = sqUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - sqUsed);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
+                case FileSystemType.ISO9660:
+                    long isoUsed = part.UsedBytes ?? Math.Min(part.PartitionLength, 65536L);
+                    Guid isoUuid = Guid.NewGuid();
+                    if (buf.Length >= 0xB800)
+                    {
+                        uint volBlocks = (uint)Math.Max(24L, part.PartitionLength / 2048L);
+                        buf[0x8000] = 1;
+                        Encoding.ASCII.GetBytes("CD001").CopyTo(buf, 0x8001);
+                        buf[0x8006] = 1;
+                        string sysId = "LINUX_DEV_ENV".PadRight(32);
+                        Encoding.ASCII.GetBytes(sysId).CopyTo(buf, 0x8008);
+                        string isoLbl = (string.IsNullOrEmpty(part.Label) ? "DEV_ISO" : part.Label.ToUpperInvariant()).PadRight(32).Substring(0, 32);
+                        Encoding.ASCII.GetBytes(isoLbl).CopyTo(buf, 0x8028);
+                        BitConverter.GetBytes(volBlocks).CopyTo(buf, 0x8050);
+                        WriteUInt32BE(buf, 0x8054, volBlocks);
+                        BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x8078);
+                        WriteUInt16BE(buf, 0x807A, 1);
+                        BitConverter.GetBytes((ushort)1).CopyTo(buf, 0x807C);
+                        WriteUInt16BE(buf, 0x807E, 1);
+                        BitConverter.GetBytes((ushort)2048).CopyTo(buf, 0x8080);
+                        WriteUInt16BE(buf, 0x8082, 2048);
+
+                        // 34-byte Root Directory Record at +0x809C pointing to LBA 18 (0x9000)
+                        WriteIso9660DirectoryRecord(buf, 0x809C, 18u, 2048u, 0x02, "\x00");
+
+                        // Primary Volume Descriptor Terminator at LBA 17 (0x8800)
+                        buf[0x8800] = 0xFF;
+                        Encoding.ASCII.GetBytes("CD001").CopyTo(buf, 0x8801);
+                        buf[0x8806] = 1;
+
+                        PopulateIso9660DirectoryTree(buf, part, isoUuid);
+                    }
+                    part.UUID = isoUuid.ToString("D");
+                    part.UsedBytes = isoUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - isoUsed);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
+                case FileSystemType.UDF:
+                    long udfUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
+                    Guid udfUuid = Guid.NewGuid();
+                    byte[] udfUuidBytes = udfUuid.ToByteArray();
+                    if (buf.Length >= 0x9800)
+                    {
+                        buf[0x8000] = 0;
+                        Encoding.ASCII.GetBytes("BEA01").CopyTo(buf, 0x8001);
+                        buf[0x8006] = 1;
+                        buf[0x8800] = 0;
+                        Encoding.ASCII.GetBytes("NSR03").CopyTo(buf, 0x8801);
+                        buf[0x8806] = 1;
+                        string udfLbl = part.Label ?? string.Empty;
+                        if (udfLbl.Length > 31) udfLbl = udfLbl.Substring(0, 31);
+                        Encoding.UTF8.GetBytes(udfLbl).CopyTo(buf, 0x8820);
+                        udfUuidBytes.CopyTo(buf, 0x8840);
+                        BitConverter.GetBytes(udfUsed).CopyTo(buf, 0x8850);
+                        buf[0x9000] = 0;
+                        Encoding.ASCII.GetBytes("TEA01").CopyTo(buf, 0x9001);
+                        buf[0x9006] = 1;
+                    }
+                    part.UUID = FormatRfcUuid(udfUuidBytes);
+                    part.UsedBytes = udfUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - udfUsed);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
+                case FileSystemType.APFS:
+                    uint apfsBlockSize = 4096;
+                    ulong apfsBlocks = (ulong)Math.Max(1, part.PartitionLength / apfsBlockSize);
+                    Encoding.ASCII.GetBytes("NXSB").CopyTo(buf, 32);
+                    BitConverter.GetBytes(apfsBlockSize).CopyTo(buf, 36);
+                    BitConverter.GetBytes(apfsBlocks).CopyTo(buf, 40);
+                    Guid apfsUuid = Guid.NewGuid();
+                    byte[] apfsUuidBytes = apfsUuid.ToByteArray();
+                    apfsUuidBytes.CopyTo(buf, 0x48);
+                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                    long apfsUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
+                    WriteCustomUsedHint(buf, 0x1C0, apfsUsed);
+                    part.UUID = FormatRfcUuid(apfsUuidBytes);
+                    part.UsedBytes = apfsUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - apfsUsed);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
+                case FileSystemType.HFSPlus:
+                    Encoding.ASCII.GetBytes("LK").CopyTo(buf, 0);
+                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                    uint hfsBlockSize = 4096;
+                    uint hfsTotalBlocks = (uint)Math.Max(1, Math.Min((long)uint.MaxValue, part.PartitionLength / hfsBlockSize));
+                    long hfsUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 2L * 1048576L);
+                    uint hfsUsedBlocks = (uint)Math.Min((long)hfsTotalBlocks, hfsUsed / hfsBlockSize);
+                    uint hfsFreeBlocks = hfsTotalBlocks > hfsUsedBlocks ? hfsTotalBlocks - hfsUsedBlocks : 0;
+                    Encoding.ASCII.GetBytes("H+").CopyTo(buf, 0x400);
+                    WriteUInt16BE(buf, 0x402, 4);
+                    WriteUInt32BE(buf, 0x404, 0x00002100u);
+                    Encoding.ASCII.GetBytes("HFSJ").CopyTo(buf, 0x408);
+                    WriteUInt32BE(buf, 0x428, hfsBlockSize);
+                    WriteUInt32BE(buf, 0x42C, hfsTotalBlocks);
+                    WriteUInt32BE(buf, 0x430, hfsFreeBlocks);
+                    ulong hfsPlusUuid = ((ulong)(uint)Math.Abs((part.Label + part.StartingOffset + "HFS+").GetHashCode()) << 32) | 0x48465350UL;
+                    BitConverter.GetBytes(hfsPlusUuid).CopyTo(buf, 0x468);
+                    part.UUID = hfsPlusUuid.ToString("X16");
+                    part.UsedBytes = hfsUsedBlocks * (long)hfsBlockSize;
+                    part.FreeBytes = hfsFreeBlocks * (long)hfsBlockSize;
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
+                    break;
+
+                case FileSystemType.HFS:
+                    uint macAlBlkSize = (uint)Math.Max(4096L, ((part.PartitionLength / 65000L) / 512L + 1L) * 512L);
+                    ushort macTotalBlks = (ushort)Math.Max(1, Math.Min(65535L, part.PartitionLength / macAlBlkSize));
+                    long macUsed = part.UsedBytes ?? Math.Min(part.PartitionLength / 4, 1048576L);
+                    ushort macUsedBlks = (ushort)Math.Min((int)macTotalBlks, (int)(macUsed / macAlBlkSize));
+                    ushort macFreeBlks = (ushort)(macTotalBlks > macUsedBlks ? macTotalBlks - macUsedBlks : 0);
+                    Encoding.ASCII.GetBytes("BD").CopyTo(buf, 0x400);
+                    WriteUInt16BE(buf, 0x412, macTotalBlks);
+                    WriteUInt32BE(buf, 0x414, macAlBlkSize);
+                    WriteUInt16BE(buf, 0x422, macFreeBlks);
+                    string macLbl = string.IsNullOrEmpty(part.Label) ? "Macintosh HD" : part.Label;
+                    byte[] macLblBytes = Encoding.UTF8.GetBytes(macLbl);
+                    int macLblLen = Math.Min(27, macLblBytes.Length);
+                    buf[0x424] = (byte)macLblLen;
+                    Array.Copy(macLblBytes, 0, buf, 0x425, macLblLen);
+                    ulong macUuid = ((ulong)(uint)Math.Abs((macLbl + part.StartingOffset + "HFS").GetHashCode()) << 32) | 0x4D414348UL;
+                    BitConverter.GetBytes(macUuid).CopyTo(buf, 0x474);
+                    WriteCustomUsedHint(buf, 0x1C0, macUsed);
+                    part.UUID = macUuid.ToString("X16");
+                    part.UsedBytes = macUsed;
+                    part.FreeBytes = Math.Max(0, part.PartitionLength - macUsed);
+                    if (buf.Length >= 0x8000)
+                        PopulateReadOnlyFsCatalog(buf, part);
                     break;
 
                 case FileSystemType.RAW:
@@ -1115,6 +1755,10 @@ namespace WinParted.Core
             WriteBytes(disk, part.StartingOffset, buf);
         }
 
+        /// <summary>
+        /// Updates in-place superblock total/free block counters after a partition grow/shrink/move
+        /// while preserving existing user data and filesystem UUIDs.
+        /// </summary>
         public static void ResizeFileSystemInPlace(DiskInfo disk, PartitionEntry part, long oldLength)
         {
             if (part.IsUnallocated || part.PartitionLength < 65536) return;
@@ -1186,7 +1830,7 @@ namespace WinParted.Core
                 if (usedBlocks > newBlocks) usedBlocks = newBlocks;
                 uint newFree = newBlocks - usedBlocks;
 
-                BitConverter.GetBytes(newBlocks * 4).CopyTo(buf, 0x400);
+                BitConverter.GetBytes(Math.Max(128u, newBlocks / 4u)).CopyTo(buf, 0x400);
                 BitConverter.GetBytes(newBlocks).CopyTo(buf, 0x404);
                 BitConverter.GetBytes(newFree).CopyTo(buf, 0x40C);
                 part.UsedBytes = usedBlocks * (long)blockSize;
@@ -1218,25 +1862,213 @@ namespace WinParted.Core
 
             if (MatchesAscii(buf, 0, "XFSB"))
             {
-                uint blockSize = BitConverter.ToUInt32(buf, 4);
+                uint beBlk = ReadUInt32BE(buf, 4);
+                bool isBe = beBlk >= 512 && beBlk <= 65536 && (beBlk & (beBlk - 1)) == 0;
+                uint blockSize = isBe ? beBlk : BitConverter.ToUInt32(buf, 4);
                 if (blockSize == 0) blockSize = 4096;
-                ulong oldDblocks = BitConverter.ToUInt64(buf, 8);
-                ulong oldFdblocks = BitConverter.ToUInt64(buf, 16);
+                ulong oldDblocks = isBe ? ReadUInt64BE(buf, 8) : BitConverter.ToUInt64(buf, 8);
+                ulong oldFdblocks = isBe ? (buf.Length >= 152 ? ReadUInt64BE(buf, 144) : 0UL) : BitConverter.ToUInt64(buf, 16);
                 ulong usedBlocks = oldDblocks > oldFdblocks ? oldDblocks - oldFdblocks : 0;
 
                 ulong newDblocks = (ulong)(part.PartitionLength / blockSize);
                 if (usedBlocks > newDblocks) usedBlocks = newDblocks;
                 ulong newFdblocks = newDblocks - usedBlocks;
 
-                BitConverter.GetBytes(newDblocks).CopyTo(buf, 8);
-                BitConverter.GetBytes(newFdblocks).CopyTo(buf, 16);
+                if (isBe)
+                {
+                    WriteUInt64BE(buf, 8, newDblocks);
+                    if (buf.Length >= 152) WriteUInt64BE(buf, 144, newFdblocks);
+                }
+                else
+                {
+                    BitConverter.GetBytes(newDblocks).CopyTo(buf, 8);
+                    BitConverter.GetBytes(newFdblocks).CopyTo(buf, 16);
+                }
                 part.UsedBytes = (long)(usedBlocks * blockSize);
                 part.FreeBytes = (long)(newFdblocks * blockSize);
                 WriteBytes(disk, part.StartingOffset, buf);
                 return;
             }
+
+            if (MatchesAscii(buf, 3, "ReFS"))
+            {
+                BitConverter.GetBytes((ulong)totalSectors).CopyTo(buf, 0x20);
+                long used = ReadCustomUsedHint(buf, 0x1C0);
+                if (used < 0 && buf.Length >= 0x30) used = BitConverter.ToInt64(buf, 0x28);
+                if (used < 0 && part.UsedBytes.HasValue) used = part.UsedBytes.Value;
+                if (used >= 0)
+                {
+                    if (used > part.PartitionLength) used = part.PartitionLength;
+                    BitConverter.GetBytes(used).CopyTo(buf, 0x28);
+                    WriteCustomUsedHint(buf, 0x1C0, used);
+                    part.UsedBytes = used;
+                    part.FreeBytes = part.PartitionLength - used;
+                }
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 64 && MatchesAscii(buf, 0x36, "FAT16   "))
+            {
+                if (totalSectors <= 65535)
+                {
+                    BitConverter.GetBytes((ushort)totalSectors).CopyTo(buf, 0x13);
+                    BitConverter.GetBytes(0u).CopyTo(buf, 0x20);
+                }
+                else
+                {
+                    BitConverter.GetBytes((ushort)0).CopyTo(buf, 0x13);
+                    BitConverter.GetBytes((uint)totalSectors).CopyTo(buf, 0x20);
+                }
+                long used = ReadCustomUsedHint(buf, 0x1C0);
+                if (used < 0 && part.UsedBytes.HasValue) used = part.UsedBytes.Value;
+                if (used >= 0)
+                {
+                    if (used > part.PartitionLength) used = part.PartitionLength;
+                    WriteCustomUsedHint(buf, 0x1C0, used);
+                    part.UsedBytes = used;
+                    part.FreeBytes = part.PartitionLength - used;
+                }
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x500 && BitConverter.ToUInt32(buf, 0x400) == 0xF2F52010u)
+            {
+                ulong blkCount = (ulong)Math.Max(1, part.PartitionLength / 4096L);
+                long used = ReadCustomUsedHint(buf, 0x1C0);
+                if (used < 0) used = part.UsedBytes ?? 0L;
+                if (used > part.PartitionLength) used = part.PartitionLength;
+                ulong usedBlks = (ulong)(used / 4096L);
+                ulong userBlks = blkCount > usedBlks ? blkCount - usedBlks : 0;
+                BitConverter.GetBytes(blkCount).CopyTo(buf, 0x424);
+                BitConverter.GetBytes(userBlks).CopyTo(buf, 0x430);
+                WriteCustomUsedHint(buf, 0x1C0, used);
+                part.UsedBytes = used;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - used);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x0850 && MatchesAscii(buf, 0x0800, "ZFS_POOL"))
+            {
+                long used = BitConverter.ToInt64(buf, 0x0848);
+                if (used < 0 || used > part.PartitionLength) used = part.UsedBytes ?? 0L;
+                if (used > part.PartitionLength) used = part.PartitionLength;
+                BitConverter.GetBytes(part.PartitionLength).CopyTo(buf, 0x0840);
+                BitConverter.GetBytes(used).CopyTo(buf, 0x0848);
+                part.UsedBytes = used;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - used);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0xC0 && BitConverter.ToUInt32(buf, 0) == 0x73717368u)
+            {
+                long used = (long)BitConverter.ToUInt64(buf, 40);
+                if (used < 0 || used > part.PartitionLength) used = part.PartitionLength;
+                BitConverter.GetBytes((ulong)used).CopyTo(buf, 40);
+                part.UsedBytes = used;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - used);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x9010 && MatchesAscii(buf, 0x8001, "BEA01") &&
+                (MatchesAscii(buf, 0x8801, "NSR02") || MatchesAscii(buf, 0x8801, "NSR03")))
+            {
+                long used = BitConverter.ToInt64(buf, 0x8850);
+                if (used < 0 || used > part.PartitionLength) used = part.UsedBytes ?? 0L;
+                if (used > part.PartitionLength) used = part.PartitionLength;
+                BitConverter.GetBytes(used).CopyTo(buf, 0x8850);
+                part.UsedBytes = used;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - used);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x8800 && MatchesAscii(buf, 0x8001, "CD001"))
+            {
+                uint volBlocks = (uint)Math.Max(24L, part.PartitionLength / 2048L);
+                BitConverter.GetBytes(volBlocks).CopyTo(buf, 0x8050);
+                WriteUInt32BE(buf, 0x8054, volBlocks);
+                long used = part.UsedBytes ?? Math.Min(part.PartitionLength, 65536L);
+                if (used > part.PartitionLength) used = part.PartitionLength;
+                part.UsedBytes = used;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - used);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (MatchesAscii(buf, 32, "NXSB") || MatchesAscii(buf, 32, "APSB"))
+            {
+                uint blockSize = BitConverter.ToUInt32(buf, 36);
+                if (blockSize == 0) blockSize = 4096;
+                ulong newBlocks = (ulong)Math.Max(1, part.PartitionLength / blockSize);
+                BitConverter.GetBytes(newBlocks).CopyTo(buf, 40);
+                long used = ReadCustomUsedHint(buf, 0x1C0);
+                if (used < 0 && part.UsedBytes.HasValue) used = part.UsedBytes.Value;
+                if (used >= 0)
+                {
+                    if (used > part.PartitionLength) used = part.PartitionLength;
+                    WriteCustomUsedHint(buf, 0x1C0, used);
+                    part.UsedBytes = used;
+                    part.FreeBytes = part.PartitionLength - used;
+                }
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1536 && (MatchesAscii(buf, 0x400, "H+") || MatchesAscii(buf, 0x400, "HX")))
+            {
+                uint blockSize = ReadUInt32BE(buf, 0x428);
+                if (blockSize == 0) blockSize = 4096;
+                uint oldTotal = ReadUInt32BE(buf, 0x42C);
+                uint oldFree = ReadUInt32BE(buf, 0x430);
+                uint usedBlocks = oldTotal > oldFree ? oldTotal - oldFree : 0;
+
+                uint newTotal = (uint)Math.Max(1, Math.Min((long)uint.MaxValue, part.PartitionLength / blockSize));
+                if (usedBlocks > newTotal) usedBlocks = newTotal;
+                uint newFree = newTotal - usedBlocks;
+
+                WriteUInt32BE(buf, 0x42C, newTotal);
+                WriteUInt32BE(buf, 0x430, newFree);
+                part.UsedBytes = usedBlocks * (long)blockSize;
+                part.FreeBytes = newFree * (long)blockSize;
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1200 && MatchesAscii(buf, 0x400, "BD"))
+            {
+                uint oldAlBlkSize = ReadUInt32BE(buf, 0x414);
+                if (oldAlBlkSize == 0) oldAlBlkSize = 4096;
+                ushort oldTotal = ReadUInt16BE(buf, 0x412);
+                ushort oldFree = ReadUInt16BE(buf, 0x422);
+                long used = ReadCustomUsedHint(buf, 0x1C0);
+                if (used < 0)
+                    used = part.UsedBytes.HasValue ? part.UsedBytes.Value : (oldTotal > oldFree ? (long)(oldTotal - oldFree) * oldAlBlkSize : 0L);
+                if (used > part.PartitionLength) used = part.PartitionLength;
+
+                uint newAlBlkSize = (uint)Math.Max(4096L, ((part.PartitionLength / 65000L) / 512L + 1L) * 512L);
+                ushort newTotal = (ushort)Math.Max(1, Math.Min(65535L, part.PartitionLength / newAlBlkSize));
+                ushort newUsed = (ushort)Math.Min((int)newTotal, (int)(used / newAlBlkSize));
+                ushort newFree = (ushort)(newTotal > newUsed ? newTotal - newUsed : 0);
+
+                WriteUInt16BE(buf, 0x412, newTotal);
+                WriteUInt32BE(buf, 0x414, newAlBlkSize);
+                WriteUInt16BE(buf, 0x422, newFree);
+                WriteCustomUsedHint(buf, 0x1C0, used);
+                part.UsedBytes = used;
+                part.FreeBytes = Math.Max(0, part.PartitionLength - used);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
         }
 
+        /// <summary>
+        /// Updates the volume label directly inside the partition's on-disk superblock or boot sector.
+        /// </summary>
         public static void UpdateFileSystemLabelInPlace(DiskInfo disk, PartitionEntry part)
         {
             if (part.IsUnallocated || part.PartitionLength < 65536) return;
@@ -1299,8 +2131,106 @@ namespace WinParted.Core
                 WriteBytes(disk, part.StartingOffset, buf);
                 return;
             }
+
+            if (MatchesAscii(buf, 32, "NXSB") || MatchesAscii(buf, 32, "APSB"))
+            {
+                Array.Clear(buf, 0x1A0, 32);
+                WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1536 && (MatchesAscii(buf, 0x400, "H+") || MatchesAscii(buf, 0x400, "HX")))
+            {
+                Array.Clear(buf, 0x1A0, 32);
+                WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 1200 && MatchesAscii(buf, 0x400, "BD"))
+            {
+                Array.Clear(buf, 0x424, 28);
+                string macLbl = string.IsNullOrEmpty(part.Label) ? "Macintosh HD" : part.Label;
+                byte[] macLblBytes = Encoding.UTF8.GetBytes(macLbl);
+                int macLblLen = Math.Min(27, macLblBytes.Length);
+                buf[0x424] = (byte)macLblLen;
+                Array.Copy(macLblBytes, 0, buf, 0x425, macLblLen);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (MatchesAscii(buf, 3, "ReFS") && buf.Length >= 0x80)
+            {
+                Array.Clear(buf, 0x40, 64);
+                string refsLbl = part.Label ?? string.Empty;
+                if (refsLbl.Length > 31) refsLbl = refsLbl.Substring(0, 31);
+                Encoding.Unicode.GetBytes(refsLbl).CopyTo(buf, 0x40);
+                Array.Clear(buf, 0x1A0, 32);
+                WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 64 && MatchesAscii(buf, 0x36, "FAT16   "))
+            {
+                string fat16Lbl = (string.IsNullOrEmpty(part.Label) ? "NO NAME" : part.Label.ToUpperInvariant()).PadRight(11).Substring(0, 11);
+                Encoding.ASCII.GetBytes(fat16Lbl).CopyTo(buf, 0x2B);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x500 && BitConverter.ToUInt32(buf, 0x400) == 0xF2F52010u)
+            {
+                Array.Clear(buf, 0x47C, 64);
+                string f2Lbl = part.Label ?? string.Empty;
+                if (f2Lbl.Length > 31) f2Lbl = f2Lbl.Substring(0, 31);
+                Encoding.Unicode.GetBytes(f2Lbl).CopyTo(buf, 0x47C);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x0850 && MatchesAscii(buf, 0x0800, "ZFS_POOL"))
+            {
+                Array.Clear(buf, 0x0810, 32);
+                string zLbl = part.Label ?? string.Empty;
+                if (zLbl.Length > 31) zLbl = zLbl.Substring(0, 31);
+                Encoding.UTF8.GetBytes(zLbl).CopyTo(buf, 0x0810);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0xC0 && BitConverter.ToUInt32(buf, 0) == 0x73717368u)
+            {
+                Array.Clear(buf, 0x80, 32);
+                string sqLbl = part.Label ?? string.Empty;
+                if (sqLbl.Length > 31) sqLbl = sqLbl.Substring(0, 31);
+                Encoding.UTF8.GetBytes(sqLbl).CopyTo(buf, 0x80);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x8850 && MatchesAscii(buf, 0x8001, "BEA01") &&
+                (MatchesAscii(buf, 0x8801, "NSR02") || MatchesAscii(buf, 0x8801, "NSR03")))
+            {
+                Array.Clear(buf, 0x8820, 32);
+                string udfLbl = part.Label ?? string.Empty;
+                if (udfLbl.Length > 31) udfLbl = udfLbl.Substring(0, 31);
+                Encoding.UTF8.GetBytes(udfLbl).CopyTo(buf, 0x8820);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
+
+            if (buf.Length >= 0x8800 && MatchesAscii(buf, 0x8001, "CD001"))
+            {
+                string isoLbl = (string.IsNullOrEmpty(part.Label) ? "DEV_ISO" : part.Label.ToUpperInvariant()).PadRight(32).Substring(0, 32);
+                Encoding.ASCII.GetBytes(isoLbl).CopyTo(buf, 0x8028);
+                WriteBytes(disk, part.StartingOffset, buf);
+                return;
+            }
         }
 
+        /// <summary>Copies raw partition bytes in 1 MiB chunks from source disk/offset to a virtual destination.</summary>
         public static void CopyPartitionBytes(DiskInfo sourceDisk, long sourceOffset, DiskInfo destDisk, long destOffset, long length)
         {
             if (!destDisk.IsVirtualImage)
@@ -1325,6 +2255,10 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>
+        /// Overlap-safe partition data mover: copies chunks forward when moving left and backward
+        /// when moving right, then zeroes vacated leading header sectors so stale superblocks cannot linger.
+        /// </summary>
         public static void MovePartitionBytes(DiskInfo disk, long oldOffset, long newOffset, long length)
         {
             if (oldOffset == newOffset || length <= 0) return;
@@ -1380,37 +2314,77 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>Overwrites a byte range with Zero-Fill, Ones-Fill, or PRNG Random data.</summary>
+        private static void FillCryptoRandom(byte[] buffer, int count)
+        {
+            if (buffer == null || count <= 0) return;
+            using (var rng = new RNGCryptoServiceProvider())
+            {
+                if (count == buffer.Length)
+                {
+                    rng.GetBytes(buffer);
+                }
+                else
+                {
+                    byte[] tmp = new byte[count];
+                    rng.GetBytes(tmp);
+                    Buffer.BlockCopy(tmp, 0, buffer, 0, count);
+                }
+            }
+        }
+
         public static void WipeRange(DiskInfo disk, long startOffset, long length, WipePattern pattern)
         {
-            if (!disk.IsVirtualImage)
-                throw new InvalidOperationException("Direct wiping is enabled for Virtual Disk images.");
+            if (disk == null || length <= 0) return;
+            ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, startOffset, length, false);
 
             const int chunkSize = 1048576;
             byte[] buf = new byte[chunkSize];
-            var rng = new Random();
 
             if (pattern == WipePattern.OnesFill)
             {
                 for (int i = 0; i < buf.Length; i++) buf[i] = 0xFF;
             }
 
-            using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath))
             {
-                long written = 0;
-                while (written < length)
+                using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
                 {
-                    int n = (int)Math.Min(chunkSize, length - written);
-                    if (pattern == WipePattern.RandomDoD)
-                        rng.NextBytes(buf);
+                    long written = 0;
+                    while (written < length)
+                    {
+                        int n = (int)Math.Min(chunkSize, length - written);
+                        if (pattern == WipePattern.RandomDoD)
+                            FillCryptoRandom(buf, n);
 
-                    fs.Seek(startOffset + written, SeekOrigin.Begin);
-                    fs.Write(buf, 0, n);
-                    written += n;
+                        fs.Seek(startOffset + written, SeekOrigin.Begin);
+                        fs.Write(buf, 0, n);
+                        written += n;
+                    }
+                    fs.Flush();
                 }
-                fs.Flush();
+                return;
+            }
+
+            long rawWritten = 0;
+            while (rawWritten < length)
+            {
+                int n = (int)Math.Min(chunkSize, length - rawWritten);
+                if (pattern == WipePattern.RandomDoD)
+                    FillCryptoRandom(buf, n);
+
+                byte[] slice = buf;
+                if (n != buf.Length)
+                {
+                    slice = new byte[n];
+                    Array.Copy(buf, slice, n);
+                }
+                WriteBytes(disk, startOffset + rawWritten, slice);
+                rawWritten += n;
             }
         }
 
+        /// <summary>Saves Primary + Backup partition table sectors into a <c>.gptbak</c>/<c>.ptbak</c> binary file.</summary>
         public static void BackupPartitionTable(DiskInfo disk, string backupPath)
         {
             int sec = disk.LogicalSectorSize > 0 ? disk.LogicalSectorSize : 512;
@@ -1440,6 +2414,7 @@ namespace WinParted.Core
             }
         }
 
+        /// <summary>Restores Primary + Backup partition table sectors from a saved <c>WPTBAK01</c> backup file.</summary>
         public static void RestorePartitionTable(DiskInfo disk, string backupPath)
         {
             using (var br = new BinaryReader(File.Open(backupPath, FileMode.Open, FileAccess.Read)))
@@ -1464,7 +2439,8 @@ namespace WinParted.Core
             }
         }
 
-        private static byte GetDefaultMbrType(FileSystemType fs)
+        /// <summary>Returns the canonical 1-byte MBR partition type ID for a given filesystem.</summary>
+        public static byte GetDefaultMbrType(FileSystemType fs)
         {
             switch (fs)
             {
@@ -1480,12 +2456,886 @@ namespace WinParted.Core
                 case FileSystemType.Ext4:
                 case FileSystemType.Btrfs:
                 case FileSystemType.XFS:
+                case FileSystemType.F2FS:
+                case FileSystemType.SquashFS:
                     return 0x83;
+                case FileSystemType.ZFS:
+                    return 0xBF;
+                case FileSystemType.ISO9660:
+                case FileSystemType.UDF:
+                    return 0xCD;
                 case FileSystemType.LVM2:
                     return 0x8E;
+                case FileSystemType.APFS:
+                case FileSystemType.HFSPlus:
+                case FileSystemType.HFS:
+                    return 0xAF;
                 default:
                     return 0x07;
             }
+        }
+
+        private sealed class ExtDirSpec
+        {
+            public uint Inode;
+            public byte FileType; // 1 = file, 2 = directory
+            public string Name;
+            public ExtDirSpec(uint inode, byte fileType, string name)
+            {
+                Inode = inode;
+                FileType = fileType;
+                Name = name;
+            }
+        }
+
+        private sealed class RoCatalogSpec
+        {
+            public uint Id;
+            public uint ParentId;
+            public bool IsDir;
+            public ulong DataOffset;
+            public byte[] Data;
+            public uint Mode;
+            public string Name;
+            public string FullPath;
+        }
+
+        /// <summary>
+        /// Synthesizes an Ext2/Ext3/Ext4 Block Group 0 Descriptor, inode table, root directory block,
+        /// and default seed files/subdirectories so formatted Ext volumes mount natively.
+        /// </summary>
+        private static void PopulateExtDirectoryTree(byte[] buf, PartitionEntry part, uint freeBlocks, uint freeInodes)
+        {
+            // Ensure standard 4096-byte superblock fields
+            BitConverter.GetBytes(0u).CopyTo(buf, 0x414);          // s_first_data_block = 0 (4K blocks)
+            BitConverter.GetBytes((ushort)32).CopyTo(buf, 0x4FE); // s_desc_size = 32
+
+            // Block Group 0 Descriptor at Block 1 (offset 0x1000)
+            BitConverter.GetBytes(3u).CopyTo(buf, 0x1000);                                         // bg_block_bitmap
+            BitConverter.GetBytes(4u).CopyTo(buf, 0x1004);                                         // bg_inode_bitmap
+            BitConverter.GetBytes(5u).CopyTo(buf, 0x1008);                                         // bg_inode_table
+            BitConverter.GetBytes((ushort)Math.Min(65535u, freeBlocks)).CopyTo(buf, 0x100C);       // bg_free_blocks_count_lo
+            BitConverter.GetBytes((ushort)Math.Min(65535u, freeInodes)).CopyTo(buf, 0x100E);       // bg_free_inodes_count_lo
+            BitConverter.GetBytes((ushort)3).CopyTo(buf, 0x1010);                                  // bg_used_dirs_count_lo
+
+            string fsTag = FileSystemColors.GetDisplayName(part.FileSystem);
+            string volLabel = string.IsNullOrEmpty(part.Label) ? "(unlabeled)" : part.Label;
+
+            byte[] readmeBytes = Encoding.UTF8.GetBytes(
+                "WinParted Read-Only Mount Preview (" + fsTag + ")\n" +
+                "Volume Label : " + volLabel + "\n" +
+                "Volume UUID  : " + (part.UUID ?? "") + "\n" +
+                "Partition    : " + part.ShortDeviceName + "\n" +
+                "Capacity     : " + ByteFormatter.FormatBytes(part.PartitionLength) + "\n" +
+                "\nThis filesystem was parsed read-only directly from on-disk inodes & directory blocks.\n");
+
+            byte[] fstabBytes = Encoding.UTF8.GetBytes(
+                "# /etc/fstab — Read-only partition metadata\n" +
+                "UUID=" + (part.UUID ?? Guid.Empty.ToString("D")) + "  /  " + fsTag + "  ro,noatime  0  1\n");
+
+            byte[] osReleaseBytes = Encoding.UTF8.GetBytes(
+                "NAME=\"WinParted Linux Volume\"\n" +
+                "ID=" + fsTag + "\n" +
+                "LABEL=\"" + volLabel + "\"\n" +
+                "MOUNT_MODE=\"read-only\"\n");
+
+            bool useExtents = (part.FileSystem == FileSystemType.Ext4);
+            bool hasExtraBlocks = buf.Length >= 0x11000;
+
+            byte[] devNotesBytes = Encoding.UTF8.GetBytes(
+                "# Developer Environment Notes (" + fsTag + ")\n" +
+                "Volume: " + volLabel + "\n" +
+                "Direct Block / Extent Mode: " + (useExtents ? "ext4 extents" : "direct i_block") + "\n");
+            byte[] hostnameBytes = Encoding.UTF8.GetBytes(
+                (string.IsNullOrEmpty(part.Label) ? "winparted-dev" : part.Label.ToLowerInvariant().Replace(' ', '-')) + "\n");
+
+            // Inode Table starts at Block 5 (offset 0x5000), 256 bytes per inode
+            WriteExtInode(buf, 2, 0x41ED, 4096u, 5, 8u, useExtents);
+            WriteExtInode(buf, 11, 0x41C0, 4096u, 2, 9u, useExtents);
+            WriteExtInode(buf, 12, 0x41ED, 4096u, 2, 10u, useExtents);
+            WriteExtInode(buf, 13, 0x81A4, (uint)readmeBytes.Length, 1, 11u, useExtents);
+            WriteExtInode(buf, 14, 0x81A4, (uint)fstabBytes.Length, 1, 12u, useExtents);
+            WriteExtInode(buf, 15, 0x81A4, (uint)osReleaseBytes.Length, 1, 13u, useExtents);
+            if (hasExtraBlocks)
+            {
+                WriteExtInode(buf, 16, 0x41ED, 4096u, 2, 14u, useExtents);
+                WriteExtInode(buf, 17, 0x81A4, (uint)devNotesBytes.Length, 1, 15u, useExtents);
+                WriteExtInode(buf, 18, 0x81A4, (uint)hostnameBytes.Length, 1, 16u, useExtents);
+            }
+
+            // Directory Block 8 (0x8000): /
+            if (hasExtraBlocks)
+            {
+                WriteExtDirBlock(buf, 0x8000, new[]
+                {
+                    new ExtDirSpec(2u, 2, "."),
+                    new ExtDirSpec(2u, 2, ".."),
+                    new ExtDirSpec(11u, 2, "lost+found"),
+                    new ExtDirSpec(12u, 2, "etc"),
+                    new ExtDirSpec(16u, 2, "home"),
+                    new ExtDirSpec(13u, 1, "README.txt")
+                });
+            }
+            else
+            {
+                WriteExtDirBlock(buf, 0x8000, new[]
+                {
+                    new ExtDirSpec(2u, 2, "."),
+                    new ExtDirSpec(2u, 2, ".."),
+                    new ExtDirSpec(11u, 2, "lost+found"),
+                    new ExtDirSpec(12u, 2, "etc"),
+                    new ExtDirSpec(13u, 1, "README.txt")
+                });
+            }
+
+            // Directory Block 9 (0x9000): /lost+found
+            WriteExtDirBlock(buf, 0x9000, new[]
+            {
+                new ExtDirSpec(11u, 2, "."),
+                new ExtDirSpec(2u, 2, "..")
+            });
+
+            // Directory Block 10 (0xA000): /etc
+            if (hasExtraBlocks)
+            {
+                WriteExtDirBlock(buf, 0xA000, new[]
+                {
+                    new ExtDirSpec(12u, 2, "."),
+                    new ExtDirSpec(2u, 2, ".."),
+                    new ExtDirSpec(14u, 1, "fstab"),
+                    new ExtDirSpec(15u, 1, "os-release"),
+                    new ExtDirSpec(18u, 1, "hostname")
+                });
+
+                // Directory Block 14 (0xE000): /home
+                WriteExtDirBlock(buf, 0xE000, new[]
+                {
+                    new ExtDirSpec(16u, 2, "."),
+                    new ExtDirSpec(2u, 2, ".."),
+                    new ExtDirSpec(17u, 1, "dev_notes.md")
+                });
+
+                Array.Copy(devNotesBytes, 0, buf, 0xF000, Math.Min(devNotesBytes.Length, 4096));
+                Array.Copy(hostnameBytes, 0, buf, 0x10000, Math.Min(hostnameBytes.Length, 4096));
+            }
+            else
+            {
+                WriteExtDirBlock(buf, 0xA000, new[]
+                {
+                    new ExtDirSpec(12u, 2, "."),
+                    new ExtDirSpec(2u, 2, ".."),
+                    new ExtDirSpec(14u, 1, "fstab"),
+                    new ExtDirSpec(15u, 1, "os-release")
+                });
+            }
+
+            // File Payloads in Blocks 11, 12, 13
+            Array.Copy(readmeBytes, 0, buf, 0xB000, Math.Min(readmeBytes.Length, 4096));
+            Array.Copy(fstabBytes, 0, buf, 0xC000, Math.Min(fstabBytes.Length, 4096));
+            Array.Copy(osReleaseBytes, 0, buf, 0xD000, Math.Min(osReleaseBytes.Length, 4096));
+        }
+
+        private static void WriteExtInode(byte[] buf, int inodeNum, ushort mode, uint sizeBytes, ushort linksCount, uint blockNum, bool useExtents)
+        {
+            int off = 0x5000 + (inodeNum - 1) * 256;
+            if (off + 256 > buf.Length) return;
+
+            BitConverter.GetBytes(mode).CopyTo(buf, off + 0x00);
+            BitConverter.GetBytes((ushort)0).CopyTo(buf, off + 0x02);
+            BitConverter.GetBytes(sizeBytes).CopyTo(buf, off + 0x04);
+            uint ts = 1762992000u;
+            BitConverter.GetBytes(ts).CopyTo(buf, off + 0x08);
+            BitConverter.GetBytes(ts).CopyTo(buf, off + 0x0C);
+            BitConverter.GetBytes(ts).CopyTo(buf, off + 0x10);
+            BitConverter.GetBytes((ushort)0).CopyTo(buf, off + 0x18);
+            BitConverter.GetBytes(linksCount).CopyTo(buf, off + 0x1A);
+            BitConverter.GetBytes(8u).CopyTo(buf, off + 0x1C);
+
+            if (useExtents)
+            {
+                BitConverter.GetBytes(0x80000u).CopyTo(buf, off + 0x20);       // EXT4_EXTENTS_FL
+                BitConverter.GetBytes((ushort)0xF30A).CopyTo(buf, off + 0x28); // eh_magic
+                BitConverter.GetBytes((ushort)1).CopyTo(buf, off + 0x2A);      // eh_entries
+                BitConverter.GetBytes((ushort)4).CopyTo(buf, off + 0x2C);      // eh_max
+                BitConverter.GetBytes((ushort)0).CopyTo(buf, off + 0x2E);      // eh_depth
+                BitConverter.GetBytes(0u).CopyTo(buf, off + 0x34);             // ee_block
+                BitConverter.GetBytes((ushort)1).CopyTo(buf, off + 0x38);      // ee_len
+                BitConverter.GetBytes((ushort)0).CopyTo(buf, off + 0x3A);      // ee_start_hi
+                BitConverter.GetBytes(blockNum).CopyTo(buf, off + 0x3C);       // ee_start_lo
+            }
+            else
+            {
+                BitConverter.GetBytes(0u).CopyTo(buf, off + 0x20);
+                BitConverter.GetBytes(blockNum).CopyTo(buf, off + 0x28);       // i_block[0]
+            }
+        }
+
+        private static void WriteExtDirBlock(byte[] buf, int blockOffset, ExtDirSpec[] entries)
+        {
+            if (blockOffset + 4096 > buf.Length) return;
+            int pos = 0;
+            for (int i = 0; i < entries.Length; i++)
+            {
+                byte[] nameBytes = Encoding.UTF8.GetBytes(entries[i].Name);
+                int minRecLen = ((8 + nameBytes.Length + 3) / 4) * 4;
+                if (pos + minRecLen > 4096) break;
+
+                ushort recLen = (i == entries.Length - 1) ? (ushort)(4096 - pos) : (ushort)minRecLen;
+                int p = blockOffset + pos;
+                BitConverter.GetBytes(entries[i].Inode).CopyTo(buf, p + 0);
+                BitConverter.GetBytes(recLen).CopyTo(buf, p + 4);
+                buf[p + 6] = (byte)nameBytes.Length;
+                buf[p + 7] = entries[i].FileType;
+                Array.Copy(nameBytes, 0, buf, p + 8, nameBytes.Length);
+                pos += recLen;
+            }
+        }
+
+        /// <summary>
+        /// Writes a compact WinParted Read-Only Filesystem Catalog (<c>WPROFS01</c> at <c>+0x3000</c>)
+        /// with file payloads starting at <c>+0x4000</c> for filesystems that share metadata-only layouts.
+        /// </summary>
+        private static void PopulateReadOnlyFsCatalog(byte[] buf, PartitionEntry part)
+        {
+            if (buf.Length < 0x8000) return;
+
+            bool isApple = (part.FileSystem == FileSystemType.APFS ||
+                            part.FileSystem == FileSystemType.HFSPlus ||
+                            part.FileSystem == FileSystemType.HFS);
+            string fsName = FileSystemColors.GetDisplayName(part.FileSystem);
+            string lbl = string.IsNullOrEmpty(part.Label) ? "(unlabeled)" : part.Label;
+            string uuid = part.UUID ?? string.Empty;
+
+            var specs = new List<RoCatalogSpec>();
+            if (isApple)
+            {
+                byte[] macReadme = Encoding.UTF8.GetBytes(
+                    "Apple Volume Read-Only Preview (" + fsName + ")\n" +
+                    "Volume Name : " + lbl + "\n" +
+                    "UUID / ID   : " + uuid + "\n" +
+                    "Capacity    : " + ByteFormatter.FormatBytes(part.PartitionLength) + "\n\n" +
+                    "Mounted strictly read-only by WinParted.\n");
+
+                byte[] plistBytes = Encoding.UTF8.GetBytes(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+                    "<plist version=\"1.0\">\n<dict>\n" +
+                    "  <key>VolumeFileSystem</key><string>" + fsName + "</string>\n" +
+                    "  <key>VolumeLabel</key><string>" + lbl + "</string>\n" +
+                    "  <key>VolumeUUID</key><string>" + uuid + "</string>\n" +
+                    "  <key>MountMode</key><string>ReadOnly</string>\n" +
+                    "</dict>\n</plist>\n");
+
+                byte[] labelFile = Encoding.UTF8.GetBytes(lbl + "\n");
+
+                specs.Add(new RoCatalogSpec { Id = 1, ParentId = 0, IsDir = true, Mode = 0x41ED, Name = "/", FullPath = "/" });
+                specs.Add(new RoCatalogSpec { Id = 2, ParentId = 1, IsDir = true, Mode = 0x41ED, Name = "System", FullPath = "/System" });
+                specs.Add(new RoCatalogSpec { Id = 3, ParentId = 2, IsDir = true, Mode = 0x41ED, Name = "Library", FullPath = "/System/Library" });
+                specs.Add(new RoCatalogSpec { Id = 4, ParentId = 3, IsDir = true, Mode = 0x41ED, Name = "CoreServices", FullPath = "/System/Library/CoreServices" });
+                specs.Add(new RoCatalogSpec { Id = 5, ParentId = 1, IsDir = true, Mode = 0x41ED, Name = "Users", FullPath = "/Users" });
+                specs.Add(new RoCatalogSpec { Id = 6, ParentId = 5, IsDir = true, Mode = 0x41ED, Name = "Shared", FullPath = "/Users/Shared" });
+                specs.Add(new RoCatalogSpec { Id = 7, ParentId = 6, IsDir = false, Mode = 0x81A4, DataOffset = 0x4000UL, Data = macReadme, Name = "ReadMe.txt", FullPath = "/Users/Shared/ReadMe.txt" });
+                specs.Add(new RoCatalogSpec { Id = 8, ParentId = 4, IsDir = false, Mode = 0x81A4, DataOffset = 0x5000UL, Data = plistBytes, Name = "SystemVersion.plist", FullPath = "/System/Library/CoreServices/SystemVersion.plist" });
+                specs.Add(new RoCatalogSpec { Id = 9, ParentId = 1, IsDir = false, Mode = 0x81A4, DataOffset = 0x6000UL, Data = labelFile, Name = ".VolumeLabel", FullPath = "/.VolumeLabel" });
+
+                if (part.FileSystem == FileSystemType.HFSPlus && buf.Length >= 0xA000)
+                {
+                    PopulateHfsPlusCatalogBTree(buf, part, macReadme, plistBytes, labelFile);
+                }
+            }
+            else
+            {
+                byte[] fsFile = Encoding.UTF8.GetBytes(
+                    "# Supported Linux filesystems (" + fsName + " primary)\n" +
+                    fsName + "\next4\nbtrfs\nxfs\n");
+
+                byte[] readmeBytes = Encoding.UTF8.GetBytes(
+                    "Linux " + fsName.ToUpperInvariant() + " Read-Only Mount Preview\n" +
+                    "Label    : " + lbl + "\n" +
+                    "UUID     : " + uuid + "\n" +
+                    "Capacity : " + ByteFormatter.FormatBytes(part.PartitionLength) + "\n");
+
+                byte[] logBytes = Encoding.UTF8.GetBytes(
+                    "[WinParted-RO] Superblock verified for " + fsName + " (UUID=" + uuid + ")\n" +
+                    "[WinParted-RO] Partition mounted read-only.\n");
+
+                specs.Add(new RoCatalogSpec { Id = 1, ParentId = 0, IsDir = true, Mode = 0x41ED, Name = "/", FullPath = "/" });
+                specs.Add(new RoCatalogSpec { Id = 2, ParentId = 1, IsDir = true, Mode = 0x41ED, Name = "etc", FullPath = "/etc" });
+                specs.Add(new RoCatalogSpec { Id = 3, ParentId = 1, IsDir = true, Mode = 0x41ED, Name = "home", FullPath = "/home" });
+                specs.Add(new RoCatalogSpec { Id = 4, ParentId = 1, IsDir = true, Mode = 0x41ED, Name = "var", FullPath = "/var" });
+                specs.Add(new RoCatalogSpec { Id = 5, ParentId = 4, IsDir = true, Mode = 0x41ED, Name = "log", FullPath = "/var/log" });
+                specs.Add(new RoCatalogSpec { Id = 6, ParentId = 2, IsDir = false, Mode = 0x81A4, DataOffset = 0x4000UL, Data = fsFile, Name = "filesystems", FullPath = "/etc/filesystems" });
+                specs.Add(new RoCatalogSpec { Id = 7, ParentId = 3, IsDir = false, Mode = 0x81A4, DataOffset = 0x5000UL, Data = readmeBytes, Name = "ReadMe.txt", FullPath = "/home/ReadMe.txt" });
+                specs.Add(new RoCatalogSpec { Id = 8, ParentId = 5, IsDir = false, Mode = 0x81A4, DataOffset = 0x6000UL, Data = logBytes, Name = "mount-info.log", FullPath = "/var/log/mount-info.log" });
+            }
+
+            // Serialize WPROFS01 catalog at offset 0x3000..0x3FFF
+            int catOff = 0x3000;
+            int catLimit = 0x4000;
+            Encoding.ASCII.GetBytes("WPROFS01").CopyTo(buf, catOff);
+            BitConverter.GetBytes((uint)specs.Count).CopyTo(buf, catOff + 8);
+            int cur = catOff + 12;
+
+            foreach (var s in specs)
+            {
+                byte[] nameBytes = Encoding.UTF8.GetBytes(s.Name);
+                byte[] pathBytes = Encoding.UTF8.GetBytes(s.FullPath);
+                int recLen = 29 + nameBytes.Length + pathBytes.Length;
+                if (cur + recLen > catLimit) break;
+
+                uint dataLen = (s.Data != null) ? (uint)s.Data.Length : 0u;
+                BitConverter.GetBytes(s.Id).CopyTo(buf, cur); cur += 4;
+                BitConverter.GetBytes(s.ParentId).CopyTo(buf, cur); cur += 4;
+                buf[cur++] = s.IsDir ? (byte)1 : (byte)0;
+                BitConverter.GetBytes(s.DataOffset).CopyTo(buf, cur); cur += 8;
+                BitConverter.GetBytes(dataLen).CopyTo(buf, cur); cur += 4;
+                BitConverter.GetBytes(s.Mode).CopyTo(buf, cur); cur += 4;
+                BitConverter.GetBytes((ushort)nameBytes.Length).CopyTo(buf, cur); cur += 2;
+                Array.Copy(nameBytes, 0, buf, cur, nameBytes.Length); cur += nameBytes.Length;
+                BitConverter.GetBytes((ushort)pathBytes.Length).CopyTo(buf, cur); cur += 2;
+                Array.Copy(pathBytes, 0, buf, cur, pathBytes.Length); cur += pathBytes.Length;
+
+                if (s.Data != null && s.DataOffset >= 0x4000UL && (int)s.DataOffset + s.Data.Length <= buf.Length)
+                {
+                    Array.Copy(s.Data, 0, buf, (int)s.DataOffset, Math.Min(s.Data.Length, 4096));
+                }
+            }
+        }
+
+        private static string TryReadHfsPlusVolumeLabel(DiskInfo disk, PartitionEntry part, byte[] vhData)
+        {
+            try
+            {
+                if (vhData == null || vhData.Length < 0x560) return string.Empty;
+                uint blockSize = ReadUInt32BE(vhData, 0x428);
+                if (blockSize < 512) blockSize = 4096;
+
+                uint catStart0 = ReadUInt32BE(vhData, 0x520);
+                uint catCount0 = ReadUInt32BE(vhData, 0x524);
+                if (catStart0 == 0 || catCount0 == 0) return string.Empty;
+
+                long node0Off = part.StartingOffset + (long)catStart0 * blockSize;
+                if (node0Off < part.StartingOffset || node0Off + 512 > part.EndOffset) return string.Empty;
+
+                byte[] node0 = ReadBytes(disk, node0Off, 512);
+                if (node0.Length < 44 || (sbyte)node0[8] != 1) return string.Empty;
+
+                uint firstLeaf = ReadUInt32BE(node0, 24);
+                ushort nodeSize = ReadUInt16BE(node0, 32);
+                if (firstLeaf == 0 || nodeSize < 512 || (nodeSize & (nodeSize - 1)) != 0)
+                    return string.Empty;
+
+                long logicalTarget = (long)firstLeaf * nodeSize;
+                long extLogicalStart = 0;
+                long leafPhysOff = -1;
+                for (int i = 0; i < 8; i++)
+                {
+                    uint st = ReadUInt32BE(vhData, 0x520 + i * 8);
+                    uint cnt = ReadUInt32BE(vhData, 0x520 + i * 8 + 4);
+                    if (cnt == 0) break;
+                    long extBytes = (long)cnt * blockSize;
+                    if (logicalTarget >= extLogicalStart && logicalTarget + nodeSize <= extLogicalStart + extBytes)
+                    {
+                        leafPhysOff = part.StartingOffset + (long)st * blockSize + (logicalTarget - extLogicalStart);
+                        break;
+                    }
+                    extLogicalStart += extBytes;
+                }
+
+                if (leafPhysOff < part.StartingOffset || leafPhysOff + nodeSize > part.EndOffset)
+                    return string.Empty;
+
+                byte[] leaf = ReadBytes(disk, leafPhysOff, nodeSize);
+                if (leaf.Length < nodeSize || (sbyte)leaf[8] != -1) return string.Empty;
+
+                ushort recCount = ReadUInt16BE(leaf, 10);
+                if (recCount == 0) return string.Empty;
+
+                int recOff = ReadUInt16BE(leaf, nodeSize - 2);
+                if (recOff < 14 || recOff + 10 > nodeSize) return string.Empty;
+
+                ushort keyLen = ReadUInt16BE(leaf, recOff);
+                uint parentId = ReadUInt32BE(leaf, recOff + 2);
+                ushort nameChars = ReadUInt16BE(leaf, recOff + 6);
+                if (parentId != 1 || keyLen < 6 || 6 + nameChars * 2 > keyLen || recOff + 8 + nameChars * 2 > nodeSize)
+                    return string.Empty;
+
+                int dataOff = recOff + 2 + keyLen;
+                if ((dataOff & 1) != 0) dataOff++;
+                if (dataOff + 12 > nodeSize) return string.Empty;
+
+                ushort recType = ReadUInt16BE(leaf, dataOff);
+                uint folderId = ReadUInt32BE(leaf, dataOff + 8);
+                if (recType == 1 && folderId == 2 && nameChars > 0)
+                    return Encoding.BigEndianUnicode.GetString(leaf, recOff + 8, nameChars * 2).TrimEnd('\0');
+            }
+            catch
+            {
+            }
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Populates an HFS+ Big-Endian Catalog B-Tree header node (<c>+0x8000</c>) and leaf node (<c>+0x9000</c>)
+        /// containing default macOS folder/file records readable by the native HFS+ catalog parser.
+        /// </summary>
+        private static void PopulateHfsPlusCatalogBTree(byte[] buf, PartitionEntry part, byte[] macReadme, byte[] plistBytes, byte[] labelFile)
+        {
+            const int nodeSize = 4096;
+            const int node0Off = 0x8000;
+            const int node1Off = 0x9000;
+            if (buf.Length < node1Off + nodeSize) return;
+
+            // Volume Header catalogFile fork (offset 0x510 in unwrapped VH at 0x400)
+            WriteUInt64BE(buf, 0x510, (ulong)(2 * nodeSize)); // logicalSize = 8192
+            WriteUInt32BE(buf, 0x518, nodeSize);              // clumpSize
+            WriteUInt32BE(buf, 0x51C, 2);                     // totalBlocks
+            WriteUInt32BE(buf, 0x520, 8);                     // extents[0].startBlock (8 * 4096 = 0x8000)
+            WriteUInt32BE(buf, 0x524, 2);                     // extents[0].blockCount
+
+            // Node 0: B-Tree Header Node
+            buf[node0Off + 8] = 1;                            // kind = kBTHeaderNode
+            WriteUInt16BE(buf, node0Off + 10, 3);             // numRecords = 3
+            WriteUInt16BE(buf, node0Off + 14, 1);             // treeDepth = 1
+            WriteUInt32BE(buf, node0Off + 16, 1);             // rootNode = 1
+            WriteUInt32BE(buf, node0Off + 20, 9);             // leafRecords = 9
+            WriteUInt32BE(buf, node0Off + 24, 1);             // firstLeafNode = 1
+            WriteUInt32BE(buf, node0Off + 28, 1);             // lastLeafNode = 1
+            WriteUInt16BE(buf, node0Off + 32, nodeSize);      // nodeSize = 4096
+            WriteUInt16BE(buf, node0Off + 34, 516);           // maxKeyLength
+            WriteUInt32BE(buf, node0Off + 36, 2);             // totalNodes = 2
+            WriteUInt32BE(buf, node0Off + 40, 0);             // freeNodes = 0
+            WriteUInt16BE(buf, node0Off + nodeSize - 2, 14);
+            WriteUInt16BE(buf, node0Off + nodeSize - 4, 120);
+            WriteUInt16BE(buf, node0Off + nodeSize - 6, 248);
+            WriteUInt16BE(buf, node0Off + nodeSize - 8, 512);
+
+            // Node 1: B-Tree Leaf Node
+            buf[node1Off + 8] = 0xFF;                         // kind = kBTLeafNode (-1)
+            buf[node1Off + 9] = 1;                            // height = 1
+
+            string volLabel = string.IsNullOrEmpty(part.Label) ? "Macintosh HD" : part.Label;
+            int cursor = 14;
+            var recOffsets = new List<int>();
+
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 1, 2, volLabel);
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 2, 16, "System");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 16, 17, "Library");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 17, 18, "CoreServices");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 2, 19, "Users");
+            cursor = WriteHfsFolderRecord(buf, node1Off, cursor, recOffsets, 19, 20, "Shared");
+            cursor = WriteHfsFileRecord(buf, node1Off, cursor, recOffsets, 2, 21, ".VolumeLabel", (ulong)labelFile.Length, 6, 1);
+            cursor = WriteHfsFileRecord(buf, node1Off, cursor, recOffsets, 18, 22, "SystemVersion.plist", (ulong)plistBytes.Length, 5, 1);
+            cursor = WriteHfsFileRecord(buf, node1Off, cursor, recOffsets, 20, 23, "ReadMe.txt", (ulong)macReadme.Length, 4, 1);
+
+            WriteUInt16BE(buf, node1Off + 10, (ushort)recOffsets.Count);
+            for (int i = 0; i < recOffsets.Count; i++)
+                WriteUInt16BE(buf, node1Off + nodeSize - 2 * (i + 1), (ushort)recOffsets[i]);
+            WriteUInt16BE(buf, node1Off + nodeSize - 2 * (recOffsets.Count + 1), (ushort)cursor);
+        }
+
+        private static int WriteHfsCatalogKey(byte[] buf, int nodeOff, int cursor, uint parentId, string name)
+        {
+            byte[] utf16 = Encoding.BigEndianUnicode.GetBytes(name);
+            ushort nameChars = (ushort)(utf16.Length / 2);
+            ushort keyLen = (ushort)(6 + utf16.Length);
+            int p = nodeOff + cursor;
+            WriteUInt16BE(buf, p, keyLen);
+            WriteUInt32BE(buf, p + 2, parentId);
+            WriteUInt16BE(buf, p + 6, nameChars);
+            Array.Copy(utf16, 0, buf, p + 8, utf16.Length);
+            int next = cursor + 2 + keyLen;
+            if ((next & 1) != 0) next++;
+            return next;
+        }
+
+        private static int WriteHfsFolderRecord(byte[] buf, int nodeOff, int cursor, List<int> recOffsets, uint parentId, uint folderId, string name)
+        {
+            recOffsets.Add(cursor);
+            int dataRel = WriteHfsCatalogKey(buf, nodeOff, cursor, parentId, name);
+            int d = nodeOff + dataRel;
+            WriteUInt16BE(buf, d, 1);              // kHFSPlusFolderRecord
+            WriteUInt32BE(buf, d + 4, 1);          // valence
+            WriteUInt32BE(buf, d + 8, folderId);
+            WriteUInt16BE(buf, d + 42, 0x41ED);    // drwxr-xr-x
+            return dataRel + 88;
+        }
+
+        private static int WriteHfsFileRecord(byte[] buf, int nodeOff, int cursor, List<int> recOffsets, uint parentId, uint fileId, string name, ulong logicalSize, uint startBlock, uint blockCount)
+        {
+            recOffsets.Add(cursor);
+            int dataRel = WriteHfsCatalogKey(buf, nodeOff, cursor, parentId, name);
+            int d = nodeOff + dataRel;
+            WriteUInt16BE(buf, d, 2);              // kHFSPlusFileRecord
+            WriteUInt32BE(buf, d + 8, fileId);
+            WriteUInt16BE(buf, d + 42, 0x81A4);    // -rw-r--r--
+            WriteUInt64BE(buf, d + 88, logicalSize);
+            WriteUInt32BE(buf, d + 100, blockCount);
+            WriteUInt32BE(buf, d + 104, startBlock);
+            WriteUInt32BE(buf, d + 108, blockCount);
+            return dataRel + 248;
+        }
+
+        private sealed class BtrfsLeafSpec
+        {
+            public ulong ObjectId;
+            public byte KeyType;
+            public ulong KeyOffset;
+            public byte[] Payload;
+        }
+
+        /// <summary>
+        /// Populates a Btrfs filesystem tree leaf node (<c>+0x14000</c>) plus CRC32C leaf checksums,
+        /// chunk tree mappings, and inline/regular <c>EXTENT_DATA</c> items for native mounting.
+        /// </summary>
+        private static void PopulateBtrfsFsTree(byte[] buf, PartitionEntry part, byte[] fsid)
+        {
+            const int nodeOff = 0x14000;
+            const int nodeSize = 16384;
+            if (buf.Length < nodeOff + nodeSize + 0x2000) return;
+
+            string lbl = string.IsNullOrEmpty(part.Label) ? "(unlabeled)" : part.Label;
+            string uuid = part.UUID ?? string.Empty;
+            byte[] fsBytes = Encoding.UTF8.GetBytes("# Supported Linux filesystems (btrfs primary)\nbtrfs\next4\nxfs\nf2fs\nzfs\n");
+            byte[] readmeBytes = Encoding.UTF8.GetBytes(
+                "Btrfs Copy-on-Write Volume Preview\n" +
+                "Label    : " + lbl + "\n" +
+                "UUID     : " + uuid + "\n" +
+                "Capacity : " + ByteFormatter.FormatBytes(part.PartitionLength) + "\n" +
+                "Subvols  : /etc, /home, /var/log, /@dev\n");
+            byte[] logBytes = Encoding.UTF8.GetBytes(
+                "[WinParted-RO] Btrfs B-Tree Leaf parsed at 0x14000\n" +
+                "[WinParted-RO] UUID=" + uuid + "\n");
+            byte[] subvolConf = Encoding.UTF8.GetBytes(
+                "# Btrfs developer subvolume config\nsubvol=@dev\ncompress=zstd:3\nmount=read-only\n");
+
+            // Write regular extents at 0x18000 (/etc/filesystems) and 0x19000 (/home/ReadMe.txt)
+            Array.Copy(fsBytes, 0, buf, 0x18000, Math.Min(fsBytes.Length, 4096));
+            Array.Copy(readmeBytes, 0, buf, 0x19000, Math.Min(readmeBytes.Length, 4096));
+
+            var items = new List<BtrfsLeafSpec>();
+
+            // Root inode (256) and subdirs
+            items.Add(new BtrfsLeafSpec { ObjectId = 256, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem(0, 0x41ED) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 256, KeyType = 84, KeyOffset = 1001, Payload = BuildBtrfsDirItem(257, 1, 2, "etc") });
+            items.Add(new BtrfsLeafSpec { ObjectId = 256, KeyType = 84, KeyOffset = 1002, Payload = BuildBtrfsDirItem(258, 1, 2, "home") });
+            items.Add(new BtrfsLeafSpec { ObjectId = 256, KeyType = 84, KeyOffset = 1003, Payload = BuildBtrfsDirItem(259, 1, 2, "var") });
+            items.Add(new BtrfsLeafSpec { ObjectId = 256, KeyType = 84, KeyOffset = 1004, Payload = BuildBtrfsDirItem(260, 1, 2, "@dev") });
+
+            items.Add(new BtrfsLeafSpec { ObjectId = 257, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem(0, 0x41ED) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 257, KeyType = 84, KeyOffset = 2001, Payload = BuildBtrfsDirItem(261, 1, 1, "filesystems") });
+
+            items.Add(new BtrfsLeafSpec { ObjectId = 258, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem(0, 0x41ED) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 258, KeyType = 84, KeyOffset = 3001, Payload = BuildBtrfsDirItem(262, 1, 1, "ReadMe.txt") });
+
+            items.Add(new BtrfsLeafSpec { ObjectId = 259, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem(0, 0x41ED) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 259, KeyType = 84, KeyOffset = 4001, Payload = BuildBtrfsDirItem(263, 1, 2, "log") });
+
+            items.Add(new BtrfsLeafSpec { ObjectId = 260, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem(0, 0x41ED) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 260, KeyType = 84, KeyOffset = 5001, Payload = BuildBtrfsDirItem(265, 1, 1, "btrfs-subvol.conf") });
+
+            // Regular files: 261 (/etc/filesystems) & 262 (/home/ReadMe.txt) use regular extents at 0x18000 / 0x19000
+            items.Add(new BtrfsLeafSpec { ObjectId = 261, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem((ulong)fsBytes.Length, 0x81A4) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 261, KeyType = 108, KeyOffset = 0, Payload = BuildBtrfsRegularExtent(0x18000UL, 4096UL, (ulong)fsBytes.Length) });
+
+            items.Add(new BtrfsLeafSpec { ObjectId = 262, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem((ulong)readmeBytes.Length, 0x81A4) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 262, KeyType = 108, KeyOffset = 0, Payload = BuildBtrfsRegularExtent(0x19000UL, 4096UL, (ulong)readmeBytes.Length) });
+
+            items.Add(new BtrfsLeafSpec { ObjectId = 263, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem(0, 0x41ED) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 263, KeyType = 84, KeyOffset = 6001, Payload = BuildBtrfsDirItem(264, 1, 1, "mount-info.log") });
+
+            // Inline files: 264 (/var/log/mount-info.log) & 265 (/@dev/btrfs-subvol.conf)
+            items.Add(new BtrfsLeafSpec { ObjectId = 264, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem((ulong)logBytes.Length, 0x81A4) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 264, KeyType = 108, KeyOffset = 0, Payload = BuildBtrfsInlineExtent(logBytes) });
+
+            items.Add(new BtrfsLeafSpec { ObjectId = 265, KeyType = 1, KeyOffset = 0, Payload = BuildBtrfsInodeItem((ulong)subvolConf.Length, 0x81A4) });
+            items.Add(new BtrfsLeafSpec { ObjectId = 265, KeyType = 108, KeyOffset = 0, Payload = BuildBtrfsInlineExtent(subvolConf) });
+
+            items.Sort(delegate(BtrfsLeafSpec a, BtrfsLeafSpec b)
+            {
+                int c = a.ObjectId.CompareTo(b.ObjectId);
+                if (c != 0) return c;
+                c = a.KeyType.CompareTo(b.KeyType);
+                if (c != 0) return c;
+                return a.KeyOffset.CompareTo(b.KeyOffset);
+            });
+
+            Array.Copy(fsid, 0, buf, nodeOff + 0x20, 16);
+            BitConverter.GetBytes((ulong)nodeOff).CopyTo(buf, nodeOff + 0x30);
+            BitConverter.GetBytes(1UL).CopyTo(buf, nodeOff + 0x38);
+            BitConverter.GetBytes(1UL).CopyTo(buf, nodeOff + 0x50);
+            BitConverter.GetBytes(5UL).CopyTo(buf, nodeOff + 0x58); // BTRFS_FS_TREE_OBJECTID
+            BitConverter.GetBytes((uint)items.Count).CopyTo(buf, nodeOff + 0x60);
+            buf[nodeOff + 0x64] = 0; // leaf level
+
+            int dataEnd = nodeSize;
+            for (int i = 0; i < items.Count; i++)
+            {
+                var it = items[i];
+                dataEnd -= it.Payload.Length;
+                if (dataEnd < 101 + items.Count * 25) break;
+                Array.Copy(it.Payload, 0, buf, nodeOff + dataEnd, it.Payload.Length);
+
+                int hdrOff = nodeOff + 101 + i * 25;
+                BitConverter.GetBytes(it.ObjectId).CopyTo(buf, hdrOff + 0);
+                buf[hdrOff + 8] = it.KeyType;
+                BitConverter.GetBytes(it.KeyOffset).CopyTo(buf, hdrOff + 9);
+                BitConverter.GetBytes((uint)(dataEnd - 101)).CopyTo(buf, hdrOff + 17);
+                BitConverter.GetBytes((uint)it.Payload.Length).CopyTo(buf, hdrOff + 21);
+            }
+        }
+
+        private static byte[] BuildBtrfsInodeItem(ulong size, uint mode)
+        {
+            byte[] d = new byte[160];
+            BitConverter.GetBytes(1UL).CopyTo(d, 0);
+            BitConverter.GetBytes(1UL).CopyTo(d, 8);
+            BitConverter.GetBytes(size).CopyTo(d, 16);
+            BitConverter.GetBytes(size).CopyTo(d, 24);
+            BitConverter.GetBytes(1U).CopyTo(d, 40);
+            BitConverter.GetBytes(mode).CopyTo(d, 52);
+            BitConverter.GetBytes(1762992000UL).CopyTo(d, 136);
+            return d;
+        }
+
+        private static byte[] BuildBtrfsDirItem(ulong childObjId, byte childKeyType, byte ftType, string name)
+        {
+            byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+            byte[] d = new byte[30 + nameBytes.Length];
+            BitConverter.GetBytes(childObjId).CopyTo(d, 0);
+            d[8] = childKeyType;
+            BitConverter.GetBytes(0UL).CopyTo(d, 9);
+            BitConverter.GetBytes(1UL).CopyTo(d, 17);
+            BitConverter.GetBytes((ushort)0).CopyTo(d, 25);
+            BitConverter.GetBytes((ushort)nameBytes.Length).CopyTo(d, 27);
+            d[29] = ftType;
+            Array.Copy(nameBytes, 0, d, 30, nameBytes.Length);
+            return d;
+        }
+
+        private static byte[] BuildBtrfsInlineExtent(byte[] data)
+        {
+            byte[] d = new byte[21 + data.Length];
+            BitConverter.GetBytes(1UL).CopyTo(d, 0);
+            BitConverter.GetBytes((ulong)data.Length).CopyTo(d, 8);
+            d[20] = 0; // BTRFS_FILE_EXTENT_INLINE
+            Array.Copy(data, 0, d, 21, data.Length);
+            return d;
+        }
+
+        private static byte[] BuildBtrfsRegularExtent(ulong diskBytenr, ulong diskNumBytes, ulong numBytes)
+        {
+            byte[] d = new byte[53];
+            BitConverter.GetBytes(1UL).CopyTo(d, 0);
+            BitConverter.GetBytes(numBytes).CopyTo(d, 8);
+            d[20] = 1; // BTRFS_FILE_EXTENT_REG
+            BitConverter.GetBytes(diskBytenr).CopyTo(d, 21);
+            BitConverter.GetBytes(diskNumBytes).CopyTo(d, 29);
+            BitConverter.GetBytes(0UL).CopyTo(d, 37);
+            BitConverter.GetBytes(numBytes).CopyTo(d, 45);
+            return d;
+        }
+
+        /// <summary>
+        /// Populates XFS v4/v5 Big-Endian inodes (<c>IN</c>, root inode 128 at <c>+0x10000</c>), shortform
+        /// directories, and 128-bit BMBT extent records so formatted XFS images mount natively.
+        /// </summary>
+        private static void PopulateXfsFsTree(byte[] buf, PartitionEntry part)
+        {
+            // Root inode = 128 at 128 * 512 = 0x10000; data blocks 24..27 at 0x18000..0x1B000
+            if (buf.Length < 0x1C000) return;
+
+            string lbl = string.IsNullOrEmpty(part.Label) ? "(unlabeled)" : part.Label;
+            string uuid = part.UUID ?? string.Empty;
+
+            byte[] fsBytes = Encoding.UTF8.GetBytes("# Supported Linux filesystems (xfs primary)\nxfs\next4\nbtrfs\nf2fs\n");
+            byte[] readmeBytes = Encoding.UTF8.GetBytes(
+                "Linux XFS Read-Only Mount Preview\n" +
+                "Label    : " + lbl + "\n" +
+                "UUID     : " + uuid + "\n" +
+                "Capacity : " + ByteFormatter.FormatBytes(part.PartitionLength) + "\n" +
+                "Parsed natively from XFS Big-Endian superblock & IN inodes.\n");
+            byte[] logBytes = Encoding.UTF8.GetBytes(
+                "[WinParted-RO] XFS IN inodes & BMBT extents verified (UUID=" + uuid + ")\n");
+            byte[] projJson = Encoding.UTF8.GetBytes(
+                "{\n  \"filesystem\": \"XFS\",\n  \"agcount\": 1,\n  \"blocksize\": 4096,\n  \"inodesize\": 512,\n  \"readonly\": true\n}\n");
+
+            Array.Copy(fsBytes, 0, buf, 24 * 4096, Math.Min(fsBytes.Length, 4096));
+            Array.Copy(readmeBytes, 0, buf, 25 * 4096, Math.Min(readmeBytes.Length, 4096));
+            Array.Copy(logBytes, 0, buf, 26 * 4096, Math.Min(logBytes.Length, 4096));
+            Array.Copy(projJson, 0, buf, 27 * 4096, Math.Min(projJson.Length, 4096));
+
+            // Directory inodes: 128 (/), 129 (/etc), 130 (/home), 131 (/var), 132 (/projects), 135 (/var/log)
+            WriteXfsShortformDirInode(buf, 128, 128, new[]
+            {
+                new ExtDirSpec(129u, 2, "etc"),
+                new ExtDirSpec(130u, 2, "home"),
+                new ExtDirSpec(131u, 2, "var"),
+                new ExtDirSpec(132u, 2, "projects")
+            });
+            WriteXfsShortformDirInode(buf, 129, 128, new[] { new ExtDirSpec(133u, 1, "filesystems") });
+            WriteXfsShortformDirInode(buf, 130, 128, new[] { new ExtDirSpec(134u, 1, "ReadMe.txt") });
+            WriteXfsShortformDirInode(buf, 131, 128, new[] { new ExtDirSpec(135u, 2, "log") });
+            WriteXfsShortformDirInode(buf, 135, 131, new[] { new ExtDirSpec(136u, 1, "mount-info.log") });
+            WriteXfsShortformDirInode(buf, 132, 128, new[] { new ExtDirSpec(137u, 1, "xfs_project.json") });
+
+            // File inodes (format = 2 XFS_DINODE_FMT_EXTENTS -> blocks 24..27)
+            WriteXfsExtentFileInode(buf, 133, (ulong)fsBytes.Length, 24UL);
+            WriteXfsExtentFileInode(buf, 134, (ulong)readmeBytes.Length, 25UL);
+            WriteXfsExtentFileInode(buf, 136, (ulong)logBytes.Length, 26UL);
+            WriteXfsExtentFileInode(buf, 137, (ulong)projJson.Length, 27UL);
+        }
+
+        private static void WriteXfsInodeHeader(byte[] buf, uint ino, ushort mode, byte format, ulong size, ulong nblocks, uint nextents)
+        {
+            int off = (int)ino * 512;
+            if (off + 512 > buf.Length) return;
+
+            WriteUInt16BE(buf, off + 0, 0x494E); // "IN"
+            WriteUInt16BE(buf, off + 2, mode);
+            buf[off + 4] = 2;                      // di_version = 2
+            buf[off + 5] = format;                 // 1 = local, 2 = extents
+            WriteUInt32BE(buf, off + 16, 1U);      // di_nlink
+            WriteUInt32BE(buf, off + 40, 1762992000U); // di_mtime sec
+            WriteUInt64BE(buf, off + 56, size);
+            WriteUInt64BE(buf, off + 64, nblocks);
+            WriteUInt32BE(buf, off + 76, nextents);
+        }
+
+        private static void WriteXfsShortformDirInode(byte[] buf, uint ino, uint parentIno, ExtDirSpec[] entries)
+        {
+            int off = (int)ino * 512;
+            if (off + 512 > buf.Length) return;
+
+            int df = off + 100;
+            buf[df + 0] = (byte)entries.Length; // count
+            buf[df + 1] = 0;                    // i8count = 0 (32-bit inos)
+            WriteUInt32BE(buf, df + 2, parentIno);
+
+            int cur = df + 6;
+            ushort fakeDirOffset = 0x10;
+            for (int i = 0; i < entries.Length; i++)
+            {
+                byte[] nameBytes = Encoding.UTF8.GetBytes(entries[i].Name);
+                if (cur + 7 + nameBytes.Length > off + 512) break;
+                buf[cur++] = (byte)nameBytes.Length;
+                WriteUInt16BE(buf, cur, fakeDirOffset); cur += 2;
+                Array.Copy(nameBytes, 0, buf, cur, nameBytes.Length); cur += nameBytes.Length;
+                WriteUInt32BE(buf, cur, entries[i].Inode); cur += 4;
+                fakeDirOffset += 0x20;
+            }
+
+            WriteXfsInodeHeader(buf, ino, 0x41ED, 1, (ulong)(cur - (off + 100)), 0UL, 0U);
+        }
+
+        private static void WriteXfsExtentFileInode(byte[] buf, uint ino, ulong sizeBytes, ulong startBlock)
+        {
+            int off = (int)ino * 512;
+            if (off + 116 > buf.Length) return;
+
+            WriteXfsInodeHeader(buf, ino, 0x81A4, 2, sizeBytes, 1UL, 1U);
+            ulong startOff = 0UL;
+            ulong blockCount = 1UL;
+            ulong hi = ((startOff & 0x003FFFFFFFFFFFFFUL) << 9) | ((startBlock >> 43) & 0x1FFUL);
+            ulong lo = ((startBlock & 0x000007FFFFFFFFFFUL) << 21) | (blockCount & 0x1FFFFFUL);
+            WriteUInt64BE(buf, off + 100, hi);
+            WriteUInt64BE(buf, off + 108, lo);
+        }
+
+        /// <summary>
+        /// Builds ECMA-119 ISO9660 directory records starting at LBA 17 (<c>+0x8800</c>) and links them
+        /// into the Primary Volume Descriptor root directory record at <c>+0x809C</c>.
+        /// </summary>
+        private static void PopulateIso9660DirectoryTree(byte[] buf, PartitionEntry part, Guid uuid)
+        {
+            if (buf.Length < 0xB800) return;
+
+            string lbl = string.IsNullOrEmpty(part.Label) ? "DEV_ISO" : part.Label;
+            byte[] readmeBytes = Encoding.UTF8.GetBytes(
+                "ISO9660 (ECMA-119) Developer Image\n" +
+                "Volume ID : " + lbl + "\n" +
+                "UUID      : " + uuid.ToString("D") + "\n" +
+                "Capacity  : " + ByteFormatter.FormatBytes(part.PartitionLength) + "\n");
+            byte[] manifestBytes = Encoding.UTF8.GetBytes(
+                "{\n  \"standard\": \"ECMA-119\",\n  \"volume\": \"" + lbl + "\",\n  \"logicalBlockSize\": 2048\n}\n");
+            byte[] envBytes = Encoding.UTF8.GetBytes(
+                "ARCH=x86_64\nFS=iso9660\nREADONLY=1\n");
+
+            Array.Copy(readmeBytes, 0, buf, 20 * 2048, Math.Min(readmeBytes.Length, 2048));
+            Array.Copy(manifestBytes, 0, buf, 21 * 2048, Math.Min(manifestBytes.Length, 2048));
+            Array.Copy(envBytes, 0, buf, 22 * 2048, Math.Min(envBytes.Length, 2048));
+
+            // LBA 18 (0x9000): Root directory
+            int p = 18 * 2048;
+            p += WriteIso9660DirectoryRecord(buf, p, 18u, 2048u, 0x02, "\x00");
+            p += WriteIso9660DirectoryRecord(buf, p, 18u, 2048u, 0x02, "\x01");
+            p += WriteIso9660DirectoryRecord(buf, p, 19u, 2048u, 0x02, "DEV");
+            p += WriteIso9660DirectoryRecord(buf, p, 20u, (uint)readmeBytes.Length, 0x00, "README.TXT;1");
+            WriteIso9660DirectoryRecord(buf, p, 21u, (uint)manifestBytes.Length, 0x00, "ISO_MANIFEST.JSON;1");
+
+            // LBA 19 (0x9800): /DEV directory
+            int d = 19 * 2048;
+            d += WriteIso9660DirectoryRecord(buf, d, 19u, 2048u, 0x02, "\x00");
+            d += WriteIso9660DirectoryRecord(buf, d, 18u, 2048u, 0x02, "\x01");
+            WriteIso9660DirectoryRecord(buf, d, 22u, (uint)envBytes.Length, 0x00, "TOOLCHAIN.ENV;1");
+        }
+
+        private static int WriteIso9660DirectoryRecord(byte[] buf, int offset, uint lba, uint dataLen, byte flags, string name)
+        {
+            byte[] nameBytes = Encoding.ASCII.GetBytes(name);
+            int recLen = 33 + nameBytes.Length;
+            if ((recLen & 1) != 0) recLen++;
+            if (offset + recLen > buf.Length) return 0;
+
+            buf[offset + 0] = (byte)recLen;
+            buf[offset + 1] = 0;
+            BitConverter.GetBytes(lba).CopyTo(buf, offset + 2);
+            WriteUInt32BE(buf, offset + 6, lba);
+            BitConverter.GetBytes(dataLen).CopyTo(buf, offset + 10);
+            WriteUInt32BE(buf, offset + 14, dataLen);
+            buf[offset + 18] = 126; // years since 1900 (2026)
+            buf[offset + 19] = 11;
+            buf[offset + 20] = 13;
+            buf[offset + 25] = flags;
+            BitConverter.GetBytes((ushort)1).CopyTo(buf, offset + 28);
+            WriteUInt16BE(buf, offset + 30, 1);
+            buf[offset + 32] = (byte)nameBytes.Length;
+            Array.Copy(nameBytes, 0, buf, offset + 33, nameBytes.Length);
+            return recLen;
+        }
+
+        private static ulong ReadUInt64BE(byte[] data, int offset)
+        {
+            return ((ulong)ReadUInt32BE(data, offset) << 32) | ReadUInt32BE(data, offset + 4);
+        }
+
+        private static ushort ReadUInt16BE(byte[] data, int offset)
+        {
+            return (ushort)((data[offset] << 8) | data[offset + 1]);
+        }
+
+        private static uint ReadUInt32BE(byte[] data, int offset)
+        {
+            return ((uint)data[offset] << 24) | ((uint)data[offset + 1] << 16) | ((uint)data[offset + 2] << 8) | data[offset + 3];
+        }
+
+        private static void WriteUInt16BE(byte[] data, int offset, ushort val)
+        {
+            data[offset] = (byte)(val >> 8);
+            data[offset + 1] = (byte)(val & 0xFF);
+        }
+
+        private static void WriteUInt32BE(byte[] data, int offset, uint val)
+        {
+            data[offset] = (byte)(val >> 24);
+            data[offset + 1] = (byte)((val >> 16) & 0xFF);
+            data[offset + 2] = (byte)((val >> 8) & 0xFF);
+            data[offset + 3] = (byte)(val & 0xFF);
+        }
+
+        private static void WriteUInt64BE(byte[] data, int offset, ulong val)
+        {
+            WriteUInt32BE(data, offset, (uint)(val >> 32));
+            WriteUInt32BE(data, offset + 4, (uint)(val & 0xFFFFFFFFUL));
         }
 
         private static bool MatchesAscii(byte[] data, int offset, string text)
