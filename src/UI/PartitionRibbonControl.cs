@@ -37,8 +37,9 @@ namespace WinParted.UI
         {
             DoubleBuffered = true;
             ResizeRedraw = true;
-            MinimumSize = new Size(300, 136);
-            Height = 142;
+            MinimumSize = new Size(ThemeManager.F377, ThemeManager.F144);
+            Size = new Size(890, ThemeManager.F144);
+            Height = ThemeManager.F144;
             BackColor = ThemeManager.BackPrimary;
             _toolTip.AutoPopDelay = 8000;
             _toolTip.InitialDelay = 300;
@@ -79,14 +80,18 @@ namespace WinParted.UI
 
             _sliceRects.Clear();
 
-            Rectangle outer = new Rectangle(8, 8, Width - 16, Math.Max(44, Height - 36));
-            if (outer.Width <= 20 || outer.Height <= 20) return;
+            int legendH = ThemeManager.F34;
+            int outerH = Math.Max(ThemeManager.F55, Height - ThemeManager.F8 - ThemeManager.F5 - legendH - ThemeManager.F8);
+            Rectangle outer = new Rectangle(ThemeManager.F13, ThemeManager.F8, Width - ThemeManager.F13 * 2, outerH);
+            if (outer.Width <= ThemeManager.F21 || outer.Height <= ThemeManager.F21) return;
 
+            RectangleF outerF = new RectangleF(outer.X, outer.Y, outer.Width, outer.Height);
+            using (GraphicsPath outerPath = ThemeManager.CreateRoundedRectPath(outerF, ThemeManager.F8))
             using (var bgBrush = new SolidBrush(ThemeManager.BackSurface))
-            using (var bgPen = new Pen(ThemeManager.BorderColor, 1))
+            using (var bgPen = new Pen(ThemeManager.BorderColor, 1f))
             {
-                g.FillRectangle(bgBrush, outer);
-                g.DrawRectangle(bgPen, outer);
+                g.FillPath(bgBrush, outerPath);
+                g.DrawPath(bgPen, outerPath);
             }
 
             if (_layout.Count == 0)
@@ -107,9 +112,10 @@ namespace WinParted.UI
                 totalWeight += w;
             }
 
-            float innerPad = 6f;
+            float innerPad = ThemeManager.F8;
+            float gap = ThemeManager.F5;
             float availWidth = outer.Width - innerPad * 2f;
-            float minSliceWidth = Math.Min(96f, availWidth / Math.Max(1, _layout.Count));
+            float minSliceWidth = Math.Min(89f, availWidth / Math.Max(1, _layout.Count));
 
             float[] widths = new float[_layout.Count];
             float sumWidths = 0;
@@ -130,12 +136,13 @@ namespace WinParted.UI
             float curX = outer.Left + innerPad;
             float sliceTop = outer.Top + innerPad;
             float sliceH = outer.Height - innerPad * 2f;
+            float halfGap = gap / 2f;
 
             for (int i = 0; i < _layout.Count; i++)
             {
                 PartitionEntry part = _layout[i];
                 float w = (i == _layout.Count - 1) ? Math.Max(10f, (outer.Right - innerPad) - curX) : widths[i];
-                RectangleF rect = new RectangleF(curX + 1.5f, sliceTop, Math.Max(6f, w - 3f), sliceH);
+                RectangleF rect = new RectangleF(curX + halfGap, sliceTop, Math.Max(6f, w - gap), sliceH);
                 _sliceRects.Add(rect);
 
                 bool isSelected = _selectedPartition != null &&
@@ -149,7 +156,7 @@ namespace WinParted.UI
                 curX += w;
             }
 
-            DrawLegendStrip(g, new Rectangle(outer.Left, outer.Bottom + 4, outer.Width, Math.Max(16, Height - outer.Bottom - 6)));
+            DrawLegendStrip(g, new Rectangle(outer.Left, outer.Bottom + ThemeManager.F5, outer.Width, Math.Max(ThemeManager.F21, Height - outer.Bottom - ThemeManager.F13)));
         }
 
         private void DrawLegendStrip(Graphics g, Rectangle bounds)
@@ -165,27 +172,55 @@ namespace WinParted.UI
             }
 
             using (var legendFont = new Font("Segoe UI", 8.2f, FontStyle.Regular))
-            using (var textBr = new SolidBrush(ThemeManager.TextSecondary))
+            using (var phiFont = new Font("Segoe UI", 8.0f, FontStyle.Bold))
             using (var borderPen = new Pen(ThemeManager.BorderColor, 1f))
             {
-                int x = bounds.Left + 2;
+                // Reserve right side for Golden Ratio scale badge when width suffices
+                int badgeReserve = 0;
+                if (bounds.Width >= ThemeManager.F377)
+                {
+                    string scaleLabel = _smartScale ? "\u03C6 Golden Scale" : "\u03C6 Linear Scale";
+                    Size scaleSize = TextRenderer.MeasureText(scaleLabel, phiFont);
+                    int spirW = ThemeManager.F21;
+                    int spirH = ThemeManager.F13;
+                    int totalBadgeW = spirW + ThemeManager.F5 + scaleSize.Width + ThemeManager.F8;
+                    int bx = bounds.Right - totalBadgeW;
+                    int byMid = bounds.Top + bounds.Height / 2;
+
+                    ThemeManager.DrawGoldenSpiralBadge(
+                        g,
+                        new Rectangle(bx, byMid - spirH / 2, spirW, spirH),
+                        ThemeManager.BorderColor,
+                        ThemeManager.AccentGold);
+
+                    Rectangle scaleRect = new Rectangle(bx + spirW + ThemeManager.F5, bounds.Top, scaleSize.Width + 2, bounds.Height);
+                    TextRenderer.DrawText(g, scaleLabel, phiFont, scaleRect, ThemeManager.AccentGold,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
+                    badgeReserve = totalBadgeW + ThemeManager.F13;
+                }
+
+                int x = bounds.Left + ThemeManager.F3;
+                int maxRight = bounds.Right - badgeReserve;
                 int yMid = bounds.Top + bounds.Height / 2;
-                int swatchSize = 10;
+                int swatchSize = ThemeManager.F13;
 
                 foreach (FileSystemType fs in seen)
                 {
                     string label = FileSystemColors.GetDisplayName(fs);
                     Size textSize = TextRenderer.MeasureText(label, legendFont);
-                    int itemWidth = swatchSize + 5 + textSize.Width + 14;
-                    if (x + swatchSize + 5 + textSize.Width > bounds.Right)
+                    int itemWidth = swatchSize + ThemeManager.F5 + textSize.Width + ThemeManager.F21;
+                    if (x + swatchSize + ThemeManager.F5 + textSize.Width > maxRight)
                         break;
 
-                    Rectangle swatch = new Rectangle(x, yMid - swatchSize / 2, swatchSize, swatchSize);
+                    RectangleF swatchF = new RectangleF(x, yMid - swatchSize / 2f, swatchSize, swatchSize);
+                    using (GraphicsPath sp = ThemeManager.CreateRoundedRectPath(swatchF, ThemeManager.F3))
                     using (var fill = new SolidBrush(FileSystemColors.GetBorderColor(fs)))
-                        g.FillRectangle(fill, swatch);
-                    g.DrawRectangle(borderPen, swatch);
+                    {
+                        g.FillPath(fill, sp);
+                        g.DrawPath(borderPen, sp);
+                    }
 
-                    Rectangle textRect = new Rectangle(x + swatchSize + 5, bounds.Top, textSize.Width + 2, bounds.Height);
+                    Rectangle textRect = new Rectangle(x + swatchSize + ThemeManager.F5, bounds.Top, textSize.Width + 2, bounds.Height);
                     TextRenderer.DrawText(g, label, legendFont, textRect, ThemeManager.TextSecondary,
                         TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
 
@@ -200,12 +235,12 @@ namespace WinParted.UI
             Color fillColor = FileSystemColors.GetFillColor(part.FileSystem);
             Color usedColor = FileSystemColors.GetUsedColor(part.FileSystem);
 
-            using (GraphicsPath path = CreateRoundedRect(rect, 5f))
+            using (GraphicsPath path = ThemeManager.CreateRoundedRectPath(rect, ThemeManager.F8))
             {
                 if (part.IsUnallocated)
                 {
                     Color hatchFore = ThemeManager.IsDarkMode ? Color.FromArgb(62, 71, 89) : Color.FromArgb(203, 213, 225);
-                    Color hatchBack = ThemeManager.IsDarkMode ? Color.FromArgb(36, 41, 52) : Color.FromArgb(241, 245, 249);
+                    Color hatchBack = ThemeManager.IsDarkMode ? Color.FromArgb(30, 35, 45) : Color.FromArgb(241, 245, 249);
                     using (var hatch = new HatchBrush(HatchStyle.BackwardDiagonal, hatchFore, hatchBack))
                         g.FillPath(hatch, path);
                 }
@@ -214,7 +249,7 @@ namespace WinParted.UI
                     using (var fillBr = new SolidBrush(fillColor))
                         g.FillPath(fillBr, path);
 
-                    // Used-space fill inside block (classic GParted style)
+                    // Used-space fill inside block + bottom F5 accent bar
                     double usedFrac = part.UsedFraction;
                     if (usedFrac > 0.005)
                     {
@@ -223,20 +258,31 @@ namespace WinParted.UI
                         g.SetClip(path);
                         using (var usedBr = new SolidBrush(usedColor))
                             g.FillRectangle(usedBr, rect.X, rect.Y, usedW, rect.Height);
+                        using (var goldUsedBr = new SolidBrush(Color.FromArgb(190, ThemeManager.AccentGold)))
+                            g.FillRectangle(goldUsedBr, rect.X, rect.Bottom - ThemeManager.F5, usedW, ThemeManager.F5);
                         g.Clip = prevClip;
+                    }
+
+                    // Subtle top-to-bottom luxury sheen
+                    using (var sheen = new LinearGradientBrush(
+                        new RectangleF(rect.X, rect.Y, rect.Width, rect.Height),
+                        Color.FromArgb(ThemeManager.IsDarkMode ? 24 : 50, Color.White),
+                        Color.FromArgb(ThemeManager.IsDarkMode ? 18 : 8, Color.Black),
+                        LinearGradientMode.Vertical))
+                    {
+                        g.FillPath(sheen, path);
                     }
                 }
 
                 if (isHovered && !isSelected)
                 {
-                    Color hoverColor = ThemeManager.IsDarkMode ? Color.FromArgb(28, 255, 255, 255) : Color.FromArgb(24, 15, 23, 42);
+                    Color hoverColor = ThemeManager.IsDarkMode ? Color.FromArgb(32, 255, 255, 255) : Color.FromArgb(24, 15, 23, 42);
                     using (var hoverBr = new SolidBrush(hoverColor))
                         g.FillPath(hoverBr, path);
                 }
 
-                float penWidth = isSelected ? 2.8f : 1.6f;
-                Color selectedPenCol = ThemeManager.IsDarkMode ? Color.FromArgb(248, 250, 252) : Color.FromArgb(15, 23, 42);
-                Color penCol = isSelected ? selectedPenCol : borderColor;
+                float penWidth = isSelected ? 2.6f : 1.5f;
+                Color penCol = isSelected ? ThemeManager.AccentGold : borderColor;
                 using (var pen = new Pen(penCol, penWidth))
                 {
                     if (part.IsUnallocated)
@@ -247,11 +293,11 @@ namespace WinParted.UI
                 if (isSelected)
                 {
                     RectangleF innerGlow = RectangleF.Inflate(rect, -2.5f, -2.5f);
-                    if (innerGlow.Width > 4 && innerGlow.Height > 4)
+                    if (innerGlow.Width > 6f && innerGlow.Height > 6f)
                     {
                         Color glowCol = ThemeManager.IsDarkMode ? ThemeManager.AccentBlue : Color.White;
-                        using (var innerPen = new Pen(glowCol, 1.5f))
-                        using (var innerPath = CreateRoundedRect(innerGlow, 3f))
+                        using (var innerPen = new Pen(glowCol, 1.4f))
+                        using (var innerPath = ThemeManager.CreateRoundedRectPath(innerGlow, ThemeManager.F5))
                             g.DrawPath(innerPen, innerPath);
                     }
                 }
@@ -299,7 +345,7 @@ namespace WinParted.UI
                                     midText = midText.Substring(0, parenIdx);
                             }
 
-                            bool showMid = rect.Width >= 64 && rect.Height >= (h1 + h2 + h3 + 12f);
+                            bool showMid = rect.Width >= 64 && rect.Height >= (h1 + h2 + h3 + 10f);
                             float totalH = showMid ? (h1 + h2 + h3 + 4f) : (h1 + h3 + 3f);
                             float startY = rect.Y + Math.Max(4f, (rect.Height - totalH) / 2f);
 
@@ -311,8 +357,8 @@ namespace WinParted.UI
                             RectangleF pillRect = new RectangleF(rect.X + (rect.Width - widest) / 2f, Math.Max(rect.Y + 4f, startY - 3f), widest, pillH);
                             if (pillRect.Width > 18f && pillRect.Height > 14f)
                             {
-                                using (var pillPath = CreateRoundedRect(pillRect, 4f))
-                                using (var pillBr = new SolidBrush(Color.FromArgb(ThemeManager.IsDarkMode ? 155 : 205, fillColor)))
+                                using (var pillPath = ThemeManager.CreateRoundedRectPath(pillRect, ThemeManager.F5))
+                                using (var pillBr = new SolidBrush(Color.FromArgb(ThemeManager.IsDarkMode ? 165 : 210, fillColor)))
                                     g.FillPath(pillBr, pillPath);
                             }
 
@@ -331,24 +377,24 @@ namespace WinParted.UI
                                 RectangleF r3 = new RectangleF(rect.X + 5f, startY + h1 + 3f, maxTextAreaW, h3);
                                 g.DrawString(botText, subFont, darkBr, r3, sf);
                             }
+
+                            if (isSelected && rect.Width >= ThemeManager.F89)
+                            {
+                                using (var phiBadgeFont = new Font("Segoe UI", 7.5f, FontStyle.Bold))
+                                {
+                                    TextRenderer.DrawText(
+                                        g,
+                                        "\u03C6",
+                                        phiBadgeFont,
+                                        new Rectangle((int)rect.Right - ThemeManager.F21, (int)rect.Y + ThemeManager.F3, ThemeManager.F21, ThemeManager.F13),
+                                        ThemeManager.AccentGold,
+                                        TextFormatFlags.Right | TextFormatFlags.Top | TextFormatFlags.NoPrefix);
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-
-        private static GraphicsPath CreateRoundedRect(RectangleF r, float radius)
-        {
-            float d = radius * 2f;
-            var path = new GraphicsPath();
-            if (r.Width < d) d = r.Width;
-            if (r.Height < d) d = r.Height;
-            path.AddArc(r.X, r.Y, d, d, 180, 90);
-            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            return path;
         }
 
         private PartitionEntry HitTest(Point pt)

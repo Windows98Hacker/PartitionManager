@@ -92,40 +92,36 @@ namespace WinParted.UI
 
             BuildIconLists();
 
-            // 1. Top M3 Navigation & Command Header
+            // 1. Top Golden Ratio Navigation & Command Header
             _topBar = new Panel
             {
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Padding = new Padding(10, 6, 10, 6),
+                Padding = new Padding(ThemeManager.F13, ThemeManager.F8, ThemeManager.F13, ThemeManager.F8),
                 Tag = "ElevatedPanel"
             };
 
             // Row 1: Volume Status + Mount/Refresh + Preview Pane toggle
-            var row1 = new Panel { Dock = DockStyle.Top, Height = 32 };
+            var row1 = new Panel { Dock = DockStyle.Top, Height = ThemeManager.F34 };
             _btnTogglePreview = new Button
             {
                 Dock = DockStyle.Right,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(122, 28),
-                Padding = new Padding(10, 0, 10, 0),
+                Width = ThemeManager.F144,
+                Height = ThemeManager.F34,
                 Text = "Preview Pane",
                 Tag = "TonalButton",
-                Margin = new Padding(6, 0, 0, 0)
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0)
             };
             _btnTogglePreview.Click += (s, e) => TogglePreviewPane();
 
-            var spacerR1 = new Panel { Dock = DockStyle.Right, Width = 6, Tag = "ElevatedPanel" };
+            var spacerR1 = new Panel { Dock = DockStyle.Right, Width = ThemeManager.F8, Tag = "ElevatedPanel" };
 
             _btnMountNow = new Button
             {
                 Dock = DockStyle.Right,
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(138, 28),
-                Padding = new Padding(10, 0, 10, 0),
+                Width = ThemeManager.F144,
+                Height = ThemeManager.F34,
                 Text = "Mount (Read-Only)",
                 Tag = "PrimaryButton",
                 Visible = false
@@ -145,25 +141,25 @@ namespace WinParted.UI
             row1.Controls.Add(_lblVolumeBanner);
             row1.Controls.Add(spacerR1);
             row1.Controls.Add(_btnMountNow);
-            row1.Controls.Add(new Panel { Dock = DockStyle.Right, Width = 6, Tag = "ElevatedPanel" });
+            row1.Controls.Add(new Panel { Dock = DockStyle.Right, Width = ThemeManager.F8, Tag = "ElevatedPanel" });
             row1.Controls.Add(_btnTogglePreview);
 
-            // Row 2: Explorer Navigation (Back / Forward / Up / Address Bar / Search / View Mode)
+            // Row 2: Explorer Navigation (Back / Forward / Up / Address Bar 61.8% / Search 38.2% / View Mode)
             var row2 = new TableLayoutPanel
             {
                 Dock = DockStyle.Top,
-                Height = 38,
+                Height = ThemeManager.F34,
                 ColumnCount = 10,
                 RowCount = 1,
-                Margin = new Padding(0, 4, 0, 2),
-                Padding = new Padding(0, 4, 0, 4)
+                Margin = new Padding(0, ThemeManager.F5, 0, ThemeManager.F3),
+                Padding = new Padding(0, ThemeManager.F3, 0, ThemeManager.F3)
             };
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // Back
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // Forward
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // Up
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // "Path:"
-            row2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58f)); // Address Bar
-            row2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42f)); // Search Box
+            row2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 61.8f)); // Address Bar (\u03C6 Major)
+            row2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38.2f)); // Search Box (\u03C6 Minor)
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // Search btn
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // Clear btn
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // "View:"
@@ -222,11 +218,8 @@ namespace WinParted.UI
             _btnSearch = new Button
             {
                 Text = "Search",
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(74, 28),
-                Padding = new Padding(8, 0, 8, 0),
-                Margin = new Padding(0, 1, 4, 1),
+                Size = new Size(ThemeManager.F89, 26),
+                Margin = new Padding(0, 0, ThemeManager.F5, 0),
                 Tag = "TonalButton",
                 Enabled = false
             };
@@ -235,11 +228,8 @@ namespace WinParted.UI
             _btnClearSearch = new Button
             {
                 Text = "Clear",
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(68, 28),
-                Padding = new Padding(8, 0, 8, 0),
-                Margin = new Padding(0, 1, 8, 1),
+                Size = new Size(68, 26),
+                Margin = new Padding(0, 0, ThemeManager.F8, 0),
                 Enabled = false
             };
             _btnClearSearch.Click += (s, e) => ClearSearch();
@@ -273,7 +263,7 @@ namespace WinParted.UI
             row2.Controls.Add(lblView, 8, 0);
             row2.Controls.Add(_cmbViewMode, 9, 0);
 
-            // Row 3: Export Actions
+            // Row 3: Export Actions (Golden Ratio buttons)
             var row3 = new FlowLayoutPanel
             {
                 Dock = DockStyle.Top,
@@ -281,17 +271,14 @@ namespace WinParted.UI
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = true,
-                Padding = new Padding(0, 4, 0, 2)
+                Padding = new Padding(0, ThemeManager.F5, 0, ThemeManager.F3)
             };
 
             _btnCopySelectedToHost = new Button
             {
                 Text = "Copy Selected to Host...",
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(188, 30),
-                Padding = new Padding(10, 0, 10, 0),
-                Margin = new Padding(0, 1, 6, 1),
+                Size = new Size(196, ThemeManager.F34),
+                Margin = new Padding(0, 0, ThemeManager.F8, 0),
                 Tag = "PrimaryButton",
                 Enabled = false
             };
@@ -300,11 +287,8 @@ namespace WinParted.UI
             _btnCopyFolderToHost = new Button
             {
                 Text = "Export Current Folder...",
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(180, 30),
-                Padding = new Padding(10, 0, 10, 0),
-                Margin = new Padding(0, 1, 6, 1),
+                Size = new Size(196, ThemeManager.F34),
+                Margin = new Padding(0, 0, ThemeManager.F8, 0),
                 Tag = "TonalButton",
                 Enabled = false
             };
@@ -321,8 +305,8 @@ namespace WinParted.UI
             _experimentalPanel = new Panel
             {
                 Dock = DockStyle.Right,
-                Width = 290,
-                Padding = new Padding(10),
+                Width = 288,
+                Padding = new Padding(ThemeManager.F13),
                 Visible = false,
                 Tag = "ExperimentalPanel"
             };
@@ -331,8 +315,8 @@ namespace WinParted.UI
             var expHeader = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 32,
-                Padding = new Padding(6, 4, 6, 4),
+                Height = ThemeManager.F34,
+                Padding = new Padding(ThemeManager.F8, ThemeManager.F5, ThemeManager.F8, ThemeManager.F5),
                 Tag = "ExperimentalHeaderPanel"
             };
             expHeader.Controls.Add(new Label
@@ -350,7 +334,7 @@ namespace WinParted.UI
                 Dock = DockStyle.Top,
                 AutoSize = true,
                 MaximumSize = new Size(256, 0),
-                Padding = new Padding(0, 6, 0, 8),
+                Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8),
                 Text = "EXPERIMENTAL: Writing files or folders to non-Microsoft partitions may risk data loss. Off by default.",
                 Font = new Font("Segoe UI", 8.2f, FontStyle.Bold),
                 Tag = "ExperimentalLabel"
@@ -358,13 +342,13 @@ namespace WinParted.UI
             _experimentalPanel.ClientSizeChanged += (s, e) =>
             {
                 if (!_experimentalPanel.IsDisposed && !lblExpWarn.IsDisposed)
-                    lblExpWarn.MaximumSize = new Size(Math.Max(150, _experimentalPanel.ClientSize.Width - 24), 0);
+                    lblExpWarn.MaximumSize = new Size(Math.Max(ThemeManager.F144, _experimentalPanel.ClientSize.Width - ThemeManager.F21 - ThemeManager.F5), 0);
             };
 
             _chkExperimentalWrite = new CheckBox
             {
                 Dock = DockStyle.Top,
-                Height = 38,
+                Height = ThemeManager.F34,
                 Appearance = Appearance.Button,
                 TextAlign = ContentAlignment.MiddleCenter,
                 Text = "Experimental Write: OFF",
@@ -409,28 +393,28 @@ namespace WinParted.UI
             _statusBar = new Panel
             {
                 Dock = DockStyle.Bottom,
-                Height = 32,
-                Padding = new Padding(10, 4, 10, 4),
+                Height = ThemeManager.F34,
+                Padding = new Padding(ThemeManager.F13, ThemeManager.F5, ThemeManager.F13, ThemeManager.F5),
                 Tag = "StatusBar"
             };
             _btnCancelCopy = new Button
             {
                 Dock = DockStyle.Right,
-                Width = 72,
-                Height = 22,
+                Width = ThemeManager.F89,
+                Height = 26,
                 Text = "Cancel",
                 Visible = false,
                 Tag = "DangerButton"
             };
             _btnCancelCopy.Click += (s, e) => { _copyCancelRequested = true; _btnCancelCopy.Enabled = false; };
 
-            var copySpacer = new Panel { Dock = DockStyle.Right, Width = 8, Tag = "StatusBar" };
+            var copySpacer = new Panel { Dock = DockStyle.Right, Width = ThemeManager.F8, Tag = "StatusBar" };
 
             _copyProgressBar = new ProgressBar
             {
                 Dock = DockStyle.Right,
                 Width = 170,
-                Height = 16,
+                Height = ThemeManager.F21,
                 Minimum = 0,
                 Maximum = 1000,
                 Visible = false
@@ -450,17 +434,17 @@ namespace WinParted.UI
             _statusBar.Controls.Add(_copyProgressBar);
             _statusBar.Controls.Add(_btnCancelCopy);
 
-            // 4. Center Directory Tree + File Explorer View + Collapsible Preview Pane
+            // 4. Center Directory Tree + File Explorer View + Collapsible Preview Pane (Golden Ratio Splitters)
             _mainSplit = new SplitContainer
             {
-                Size = new Size(700, 420),
+                Size = new Size(760, 470),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Vertical,
-                Panel1MinSize = 25,
-                Panel2MinSize = 25,
-                SplitterWidth = 5
+                Panel1MinSize = ThemeManager.F144,
+                Panel2MinSize = ThemeManager.F233,
+                SplitterWidth = ThemeManager.F8
             };
-            SetSplitterDistanceSafe(_mainSplit, 210);
+            SetSplitterDistanceSafe(_mainSplit, ThemeManager.F233);
 
             _treeDirs = new TreeView
             {
@@ -479,14 +463,15 @@ namespace WinParted.UI
 
             _rightSplit = new SplitContainer
             {
-                Size = new Size(700, 420),
+                Size = new Size(700, 433),
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
-                Panel1MinSize = 25,
-                Panel2MinSize = 25,
-                SplitterWidth = 5
+                Panel1MinSize = ThemeManager.F144,
+                Panel2MinSize = ThemeManager.F89,
+                SplitterWidth = ThemeManager.F8
             };
-            SetSplitterDistanceSafe(_rightSplit, 240);
+            ThemeManager.ApplyGoldenSplitter(_rightSplit, true, ThemeManager.F144, ThemeManager.F89);
+            _rightSplit.Resize += (s, e) => ThemeManager.ApplyGoldenSplitter(_rightSplit, true, ThemeManager.F144, ThemeManager.F89);
             _mainSplit.Panel2.Controls.Add(_rightSplit);
 
             _entryContextMenu = BuildEntryContextMenu();
@@ -583,8 +568,8 @@ namespace WinParted.UI
 
             Load += (s, e) =>
             {
-                SetSplitterDistanceSafe(_mainSplit, 210);
-                SetSplitterDistanceSafe(_rightSplit, 250);
+                SetSplitterDistanceSafe(_mainSplit, ThemeManager.F233);
+                ThemeManager.ApplyGoldenSplitter(_rightSplit, true, ThemeManager.F144, ThemeManager.F89);
                 AutoSizeEntryColumns();
             };
 
@@ -632,9 +617,9 @@ namespace WinParted.UI
             var btn = new Button
             {
                 Text = symbol,
-                Width = 32,
-                Height = 28,
-                Margin = new Padding(0, 1, 3, 1),
+                Width = 42,
+                Height = 26,
+                Margin = new Padding(0, 0, ThemeManager.F5, 0),
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold)
             };
             _toolTip.SetToolTip(btn, tip);
@@ -650,9 +635,9 @@ namespace WinParted.UI
             if (avail < 320) return;
 
             int fixedW = 86 + 74 + 134 + 106 + 48; // Type + Size + Modified + Permissions + ID = 448
-            int flex = Math.Max(200, avail - fixedW - 4);
-            int colName = Math.Max(115, (flex * 56) / 100);
-            int colPath = Math.Max(85, flex - colName);
+            int flex = Math.Max(ThemeManager.F233, avail - fixedW - ThemeManager.F5);
+            int colName = Math.Max(ThemeManager.F144, ThemeManager.GoldenMajor(flex)); // 61.8% Name
+            int colPath = Math.Max(ThemeManager.F89, flex - colName);                 // 38.2% Path
 
             _lvEntries.Columns[0].Width = colName;
             _lvEntries.Columns[1].Width = 86;
@@ -810,11 +795,11 @@ namespace WinParted.UI
             return new Button
             {
                 Text = text,
-                Width = 250,
-                Height = 32,
-                Margin = new Padding(0, 0, 0, 6),
+                Width = 258,
+                Height = ThemeManager.F34,
+                Margin = new Padding(0, 0, 0, ThemeManager.F8),
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(6, 0, 4, 0),
+                Padding = new Padding(ThemeManager.F8, 0, ThemeManager.F5, 0),
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 Tag = "DangerButton",
                 Enabled = false
@@ -1813,8 +1798,8 @@ namespace WinParted.UI
             using (var dlg = new Form
             {
                 Text = title,
-                Size = new Size(400, 190),
-                MinimumSize = new Size(360, 180),
+                Size = new Size(ThemeManager.F377, ThemeManager.F233),
+                MinimumSize = new Size(ThemeManager.F377, ThemeManager.F233),
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterParent,
                 MaximizeBox = false,
@@ -1822,35 +1807,29 @@ namespace WinParted.UI
                 Font = new Font("Segoe UI", 9f)
             })
             {
-                var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+                var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F21) };
                 dlg.Controls.Add(root);
 
                 var btnFlow = new FlowLayoutPanel
                 {
                     Dock = DockStyle.Bottom,
-                    Height = 56,
+                    Height = ThemeManager.F55,
                     FlowDirection = FlowDirection.RightToLeft,
-                    Padding = new Padding(0, 8, 0, 8)
+                    Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
                 };
                 var btnCancel = new Button
                 {
                     Text = "Cancel",
                     DialogResult = DialogResult.Cancel,
-                    AutoSize = true,
-                    AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                    MinimumSize = new Size(96, 34),
-                    Padding = new Padding(12, 2, 12, 2),
-                    Margin = new Padding(8, 2, 0, 2)
+                    Size = new Size(ThemeManager.F89, ThemeManager.F34),
+                    Margin = new Padding(ThemeManager.F8, 0, 0, 0)
                 };
                 var btnOk = new Button
                 {
                     Text = "Create",
                     DialogResult = DialogResult.OK,
-                    AutoSize = true,
-                    AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                    MinimumSize = new Size(104, 34),
-                    Padding = new Padding(14, 2, 14, 2),
-                    Margin = new Padding(0, 2, 0, 2),
+                    Size = new Size(110, ThemeManager.F34),
+                    Margin = new Padding(0),
                     Tag = "DangerButton"
                 };
                 btnFlow.Controls.Add(btnCancel);
@@ -1862,8 +1841,8 @@ namespace WinParted.UI
                     FlowDirection = FlowDirection.TopDown,
                     WrapContents = false
                 };
-                var lbl = new Label { Text = prompt, AutoSize = true, MaximumSize = new Size(350, 0), Margin = new Padding(0, 0, 0, 8) };
-                var txt = new TextBox { Width = 350, Margin = new Padding(0, 0, 0, 6) };
+                var lbl = new Label { Text = prompt, AutoSize = true, MaximumSize = new Size(320, 0), Margin = new Padding(0, 0, 0, ThemeManager.F8) };
+                var txt = new TextBox { Width = 320, Margin = new Padding(0, 0, 0, ThemeManager.F8) };
                 content.Controls.Add(lbl);
                 content.Controls.Add(txt);
 

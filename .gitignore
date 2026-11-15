@@ -1,3 +1,6 @@
+*.img
+*.vhd
+*.bin
 bin/*.img
 *.ptbak
 *.user
