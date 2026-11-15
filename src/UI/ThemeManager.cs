@@ -147,6 +147,68 @@ namespace WinParted.UI
             }
 
             ApplyControlRecursive(root);
+            root.Invalidate(true);
+            root.Update();
+        }
+
+        private static readonly DrawListViewColumnHeaderEventHandler s_lvDrawHeader = OnListViewDrawColumnHeader;
+        private static readonly DrawListViewItemEventHandler s_lvDrawItem = OnListViewDrawItem;
+        private static readonly DrawListViewSubItemEventHandler s_lvDrawSubItem = OnListViewDrawSubItem;
+
+        public static void ApplyListViewHeaderTheme(ListView lv)
+        {
+            if (lv == null) return;
+            lv.DrawColumnHeader -= s_lvDrawHeader;
+            lv.DrawItem -= s_lvDrawItem;
+            lv.DrawSubItem -= s_lvDrawSubItem;
+
+            if (lv.View == View.Details)
+            {
+                lv.OwnerDraw = true;
+                lv.DrawColumnHeader += s_lvDrawHeader;
+                lv.DrawItem += s_lvDrawItem;
+                lv.DrawSubItem += s_lvDrawSubItem;
+            }
+            else
+            {
+                lv.OwnerDraw = false;
+            }
+            lv.Invalidate();
+        }
+
+        private static void OnListViewDrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
+        {
+            using (var bg = new SolidBrush(BackElevated))
+                e.Graphics.FillRectangle(bg, e.Bounds);
+
+            using (var pen = new Pen(BorderColor, 1f))
+            {
+                e.Graphics.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+                e.Graphics.DrawLine(pen, e.Bounds.Right - 1, e.Bounds.Top + 4, e.Bounds.Right - 1, e.Bounds.Bottom - 5);
+            }
+
+            Font baseFont = e.Font ?? Control.DefaultFont;
+            using (var headerFont = new Font(baseFont.FontFamily, 8.5f, FontStyle.Bold))
+            {
+                Rectangle textRect = new Rectangle(e.Bounds.X + 6, e.Bounds.Y, Math.Max(4, e.Bounds.Width - 10), e.Bounds.Height);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    e.Header != null ? e.Header.Text : string.Empty,
+                    headerFont,
+                    textRect,
+                    TextSecondary,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            }
+        }
+
+        private static void OnListViewDrawItem(object sender, DrawListViewItemEventArgs e)
+        {
+            e.DrawDefault = true;
+        }
+
+        private static void OnListViewDrawSubItem(object sender, DrawListViewSubItemEventArgs e)
+        {
+            e.DrawDefault = true;
         }
 
         private static void ApplyControlRecursive(Control c)
@@ -192,6 +254,7 @@ namespace WinParted.UI
                 var lv = (ListView)c;
                 lv.BackColor = BackSurface;
                 lv.ForeColor = TextPrimary;
+                ApplyListViewHeaderTheme(lv);
             }
             else if (c is TreeView)
             {

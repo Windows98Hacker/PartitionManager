@@ -37,8 +37,8 @@ namespace WinParted.UI
         {
             DoubleBuffered = true;
             ResizeRedraw = true;
-            MinimumSize = new Size(300, 128);
-            Height = 136;
+            MinimumSize = new Size(300, 136);
+            Height = 142;
             BackColor = ThemeManager.BackPrimary;
             _toolTip.AutoPopDelay = 8000;
             _toolTip.InitialDelay = 300;
@@ -79,7 +79,7 @@ namespace WinParted.UI
 
             _sliceRects.Clear();
 
-            Rectangle outer = new Rectangle(8, 10, Width - 16, Height - 20);
+            Rectangle outer = new Rectangle(8, 8, Width - 16, Math.Max(44, Height - 36));
             if (outer.Width <= 20 || outer.Height <= 20) return;
 
             using (var bgBrush = new SolidBrush(ThemeManager.BackSurface))
@@ -148,6 +148,50 @@ namespace WinParted.UI
                 DrawPartitionSlice(g, rect, part, isSelected, isHovered);
                 curX += w;
             }
+
+            DrawLegendStrip(g, new Rectangle(outer.Left, outer.Bottom + 4, outer.Width, Math.Max(16, Height - outer.Bottom - 6)));
+        }
+
+        private void DrawLegendStrip(Graphics g, Rectangle bounds)
+        {
+            if (bounds.Height < 14 || bounds.Width < 60 || _layout.Count == 0) return;
+
+            var seen = new List<FileSystemType>();
+            for (int i = 0; i < _layout.Count; i++)
+            {
+                FileSystemType fs = _layout[i].FileSystem;
+                if (!seen.Contains(fs))
+                    seen.Add(fs);
+            }
+
+            using (var legendFont = new Font("Segoe UI", 8.2f, FontStyle.Regular))
+            using (var textBr = new SolidBrush(ThemeManager.TextSecondary))
+            using (var borderPen = new Pen(ThemeManager.BorderColor, 1f))
+            {
+                int x = bounds.Left + 2;
+                int yMid = bounds.Top + bounds.Height / 2;
+                int swatchSize = 10;
+
+                foreach (FileSystemType fs in seen)
+                {
+                    string label = FileSystemColors.GetDisplayName(fs);
+                    Size textSize = TextRenderer.MeasureText(label, legendFont);
+                    int itemWidth = swatchSize + 5 + textSize.Width + 14;
+                    if (x + swatchSize + 5 + textSize.Width > bounds.Right)
+                        break;
+
+                    Rectangle swatch = new Rectangle(x, yMid - swatchSize / 2, swatchSize, swatchSize);
+                    using (var fill = new SolidBrush(FileSystemColors.GetBorderColor(fs)))
+                        g.FillRectangle(fill, swatch);
+                    g.DrawRectangle(borderPen, swatch);
+
+                    Rectangle textRect = new Rectangle(x + swatchSize + 5, bounds.Top, textSize.Width + 2, bounds.Height);
+                    TextRenderer.DrawText(g, label, legendFont, textRect, ThemeManager.TextSecondary,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
+
+                    x += itemWidth;
+                }
+            }
         }
 
         private void DrawPartitionSlice(Graphics g, RectangleF rect, PartitionEntry part, bool isSelected, bool isHovered)
@@ -215,42 +259,78 @@ namespace WinParted.UI
                 // Draw labels if wide enough using dynamic font height measurement
                 if (rect.Width >= 52)
                 {
-                    string topText = part.IsUnallocated
-                        ? "Unallocated"
-                        : (!string.IsNullOrEmpty(part.DriveLetter)
-                            ? part.DriveLetter + " " + part.Label
-                            : (!string.IsNullOrEmpty(part.Label) ? part.Label : "Part #" + part.PartitionNumber));
-                    topText = topText.Trim();
-
-                    string midText = FileSystemColors.GetDisplayName(part.FileSystem);
-                    string botText = ByteFormatter.FormatBytes(part.PartitionLength);
-
                     using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
                     using (var titleFont = new Font("Segoe UI", 9f, FontStyle.Bold))
                     using (var subFont = new Font("Segoe UI", 8.2f, FontStyle.Regular))
                     using (var darkBr = new SolidBrush(ThemeManager.TextPrimary))
                     using (var mutedBr = new SolidBrush(ThemeManager.TextSecondary))
                     {
-                        float h1 = Math.Max(20f, titleFont.GetHeight(g) + 4f);
-                        float h2 = Math.Max(18f, subFont.GetHeight(g) + 3f);
+                        float maxTextAreaW = rect.Width - 10f;
+                        string botText = ByteFormatter.FormatBytes(part.PartitionLength);
+                        float h1 = Math.Max(18f, titleFont.GetHeight(g) + 2f);
+                        float h2 = Math.Max(16f, subFont.GetHeight(g) + 2f);
                         float h3 = h2;
-                        float totalH = (rect.Width >= 64) ? (h1 + h2 + h3 + 4f) : (h1 + h3 + 4f);
-                        float startY = rect.Y + Math.Max(4f, (rect.Height - totalH) / 2f);
 
-                        RectangleF r1 = new RectangleF(rect.X + 5, startY, rect.Width - 10, h1);
-                        g.DrawString(topText, titleFont, darkBr, r1, sf);
-
-                        if (rect.Width >= 64)
+                        if (part.IsUnallocated)
                         {
-                            RectangleF r2 = new RectangleF(rect.X + 5, startY + h1 + 2f, rect.Width - 10, h2);
-                            RectangleF r3 = new RectangleF(rect.X + 5, startY + h1 + h2 + 4f, rect.Width - 10, h3);
-                            g.DrawString(midText, subFont, mutedBr, r2, sf);
-                            g.DrawString(botText, subFont, darkBr, r3, sf);
+                            string topText = "Unallocated";
+                            if (g.MeasureString(topText, titleFont).Width > maxTextAreaW)
+                                topText = "Free";
+
+                            float totalH = h1 + h3 + 4f;
+                            float startY = rect.Y + Math.Max(4f, (rect.Height - totalH) / 2f);
+                            RectangleF r1 = new RectangleF(rect.X + 5f, startY, maxTextAreaW, h1);
+                            RectangleF r3 = new RectangleF(rect.X + 5f, startY + h1 + 3f, maxTextAreaW, h3);
+                            g.DrawString(topText, titleFont, darkBr, r1, sf);
+                            g.DrawString(botText, subFont, mutedBr, r3, sf);
                         }
                         else
                         {
-                            RectangleF r3 = new RectangleF(rect.X + 5, startY + h1 + 2f, rect.Width - 10, h3);
-                            g.DrawString(botText, subFont, darkBr, r3, sf);
+                            string topText = !string.IsNullOrEmpty(part.DriveLetter)
+                                ? (string.IsNullOrEmpty(part.Label) ? part.DriveLetter : part.DriveLetter + " " + part.Label)
+                                : (!string.IsNullOrEmpty(part.Label) ? part.Label : "Part #" + part.PartitionNumber);
+                            topText = topText.Trim();
+
+                            string midText = FileSystemColors.GetDisplayName(part.FileSystem);
+                            if (g.MeasureString(midText, subFont).Width > maxTextAreaW)
+                            {
+                                int parenIdx = midText.IndexOf(" (");
+                                if (parenIdx > 0)
+                                    midText = midText.Substring(0, parenIdx);
+                            }
+
+                            bool showMid = rect.Width >= 64 && rect.Height >= (h1 + h2 + h3 + 12f);
+                            float totalH = showMid ? (h1 + h2 + h3 + 4f) : (h1 + h3 + 3f);
+                            float startY = rect.Y + Math.Max(4f, (rect.Height - totalH) / 2f);
+
+                            float w1 = g.MeasureString(topText, titleFont).Width;
+                            float w2 = showMid ? g.MeasureString(midText, subFont).Width : 0f;
+                            float w3 = g.MeasureString(botText, subFont).Width;
+                            float widest = Math.Min(maxTextAreaW, Math.Max(w1, Math.Max(w2, w3)) + 12f);
+                            float pillH = Math.Min(rect.Height - 8f, totalH + 6f);
+                            RectangleF pillRect = new RectangleF(rect.X + (rect.Width - widest) / 2f, Math.Max(rect.Y + 4f, startY - 3f), widest, pillH);
+                            if (pillRect.Width > 18f && pillRect.Height > 14f)
+                            {
+                                using (var pillPath = CreateRoundedRect(pillRect, 4f))
+                                using (var pillBr = new SolidBrush(Color.FromArgb(ThemeManager.IsDarkMode ? 155 : 205, fillColor)))
+                                    g.FillPath(pillBr, pillPath);
+                            }
+
+                            RectangleF r1 = new RectangleF(rect.X + 5f, startY, maxTextAreaW, h1);
+                            g.DrawString(topText, titleFont, darkBr, r1, sf);
+
+                            if (showMid)
+                            {
+                                RectangleF r2 = new RectangleF(rect.X + 5f, startY + h1 + 2f, maxTextAreaW, h2);
+                                RectangleF r3 = new RectangleF(rect.X + 5f, startY + h1 + h2 + 4f, maxTextAreaW, h3);
+                                g.DrawString(midText, subFont, mutedBr, r2, sf);
+                                g.DrawString(botText, subFont, darkBr, r3, sf);
+                            }
+                            else
+                            {
+                                RectangleF r3 = new RectangleF(rect.X + 5f, startY + h1 + 3f, maxTextAreaW, h3);
+                                g.DrawString(botText, subFont, darkBr, r3, sf);
+                            }
                         }
                     }
                 }
