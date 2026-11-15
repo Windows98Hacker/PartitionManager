@@ -103,12 +103,14 @@ namespace WinParted.UI
             };
 
             // Row 1: Volume Status + Mount/Refresh + Preview Pane toggle
-            var row1 = new Panel { Dock = DockStyle.Top, Height = 28 };
+            var row1 = new Panel { Dock = DockStyle.Top, Height = 32 };
             _btnTogglePreview = new Button
             {
                 Dock = DockStyle.Right,
-                Width = 104,
-                Height = 26,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(122, 28),
+                Padding = new Padding(10, 0, 10, 0),
                 Text = "Preview Pane",
                 Tag = "TonalButton",
                 Margin = new Padding(6, 0, 0, 0)
@@ -120,8 +122,10 @@ namespace WinParted.UI
             _btnMountNow = new Button
             {
                 Dock = DockStyle.Right,
-                Width = 138,
-                Height = 26,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(138, 28),
+                Padding = new Padding(10, 0, 10, 0),
                 Text = "Mount (Read-Only)",
                 Tag = "PrimaryButton",
                 Visible = false
@@ -148,11 +152,11 @@ namespace WinParted.UI
             var row2 = new TableLayoutPanel
             {
                 Dock = DockStyle.Top,
-                Height = 32,
+                Height = 38,
                 ColumnCount = 10,
                 RowCount = 1,
                 Margin = new Padding(0, 4, 0, 2),
-                Padding = new Padding(0, 4, 0, 0)
+                Padding = new Padding(0, 4, 0, 4)
             };
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // Back
             row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // Forward
@@ -219,7 +223,9 @@ namespace WinParted.UI
             {
                 Text = "Search",
                 AutoSize = true,
-                MinimumSize = new Size(64, 25),
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(74, 28),
+                Padding = new Padding(8, 0, 8, 0),
                 Margin = new Padding(0, 1, 4, 1),
                 Tag = "TonalButton",
                 Enabled = false
@@ -230,7 +236,9 @@ namespace WinParted.UI
             {
                 Text = "Clear",
                 AutoSize = true,
-                MinimumSize = new Size(52, 25),
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(68, 28),
+                Padding = new Padding(8, 0, 8, 0),
                 Margin = new Padding(0, 1, 8, 1),
                 Enabled = false
             };
@@ -247,7 +255,7 @@ namespace WinParted.UI
             _cmbViewMode = new ComboBox
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                Width = 104,
+                Width = 108,
                 Margin = new Padding(0, 2, 0, 2)
             };
             _cmbViewMode.Items.AddRange(new object[] { "Details", "Tiles", "Large Icons", "List" });
@@ -273,14 +281,16 @@ namespace WinParted.UI
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = true,
-                Padding = new Padding(0, 4, 0, 0)
+                Padding = new Padding(0, 4, 0, 2)
             };
 
             _btnCopySelectedToHost = new Button
             {
                 Text = "Copy Selected to Host...",
                 AutoSize = true,
-                MinimumSize = new Size(156, 26),
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(188, 30),
+                Padding = new Padding(10, 0, 10, 0),
                 Margin = new Padding(0, 1, 6, 1),
                 Tag = "PrimaryButton",
                 Enabled = false
@@ -291,7 +301,9 @@ namespace WinParted.UI
             {
                 Text = "Export Current Folder...",
                 AutoSize = true,
-                MinimumSize = new Size(156, 26),
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(180, 30),
+                Padding = new Padding(10, 0, 10, 0),
                 Margin = new Padding(0, 1, 6, 1),
                 Tag = "TonalButton",
                 Enabled = false
@@ -309,7 +321,7 @@ namespace WinParted.UI
             _experimentalPanel = new Panel
             {
                 Dock = DockStyle.Right,
-                Width = 216,
+                Width = 290,
                 Padding = new Padding(10),
                 Visible = false,
                 Tag = "ExperimentalPanel"
@@ -319,7 +331,7 @@ namespace WinParted.UI
             var expHeader = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 30,
+                Height = 32,
                 Padding = new Padding(6, 4, 6, 4),
                 Tag = "ExperimentalHeaderPanel"
             };
@@ -327,7 +339,7 @@ namespace WinParted.UI
             {
                 Dock = DockStyle.Fill,
                 Text = "EXPERIMENTAL WRITE",
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
                 ForeColor = Color.White,
                 TextAlign = ContentAlignment.MiddleCenter,
                 Tag = "KeepForeColor"
@@ -336,17 +348,23 @@ namespace WinParted.UI
             var lblExpWarn = new Label
             {
                 Dock = DockStyle.Top,
-                Height = 64,
-                Padding = new Padding(0, 6, 0, 4),
+                AutoSize = true,
+                MaximumSize = new Size(256, 0),
+                Padding = new Padding(0, 6, 0, 8),
                 Text = "EXPERIMENTAL: Writing files or folders to non-Microsoft partitions may risk data loss. Off by default.",
-                Font = new Font("Segoe UI", 8.0f, FontStyle.Bold),
+                Font = new Font("Segoe UI", 8.2f, FontStyle.Bold),
                 Tag = "ExperimentalLabel"
+            };
+            _experimentalPanel.ClientSizeChanged += (s, e) =>
+            {
+                if (!_experimentalPanel.IsDisposed && !lblExpWarn.IsDisposed)
+                    lblExpWarn.MaximumSize = new Size(Math.Max(150, _experimentalPanel.ClientSize.Width - 24), 0);
             };
 
             _chkExperimentalWrite = new CheckBox
             {
                 Dock = DockStyle.Top,
-                Height = 36,
+                Height = 38,
                 Appearance = Appearance.Button,
                 TextAlign = ContentAlignment.MiddleCenter,
                 Text = "Experimental Write: OFF",
@@ -391,8 +409,8 @@ namespace WinParted.UI
             _statusBar = new Panel
             {
                 Dock = DockStyle.Bottom,
-                Height = 28,
-                Padding = new Padding(10, 3, 10, 3),
+                Height = 32,
+                Padding = new Padding(10, 4, 10, 4),
                 Tag = "StatusBar"
             };
             _btnCancelCopy = new Button
@@ -485,13 +503,14 @@ namespace WinParted.UI
                 MultiSelect = false,
                 ContextMenuStrip = _entryContextMenu
             };
-            _lvEntries.Columns.Add("Name", 240);
-            _lvEntries.Columns.Add("Type", 96);
-            _lvEntries.Columns.Add("Size", 90, HorizontalAlignment.Right);
-            _lvEntries.Columns.Add("Modified (UTC)", 132);
-            _lvEntries.Columns.Add("Permissions", 88);
-            _lvEntries.Columns.Add("Path", 190);
-            _lvEntries.Columns.Add("ID", 64);
+            _lvEntries.Columns.Add("Name", 185);
+            _lvEntries.Columns.Add("Type", 86);
+            _lvEntries.Columns.Add("Size", 74, HorizontalAlignment.Right);
+            _lvEntries.Columns.Add("Modified", 134);
+            _lvEntries.Columns.Add("Permissions", 106);
+            _lvEntries.Columns.Add("Path", 120);
+            _lvEntries.Columns.Add("ID", 48);
+            _lvEntries.Resize += (s, e) => AutoSizeEntryColumns();
             _lvEntries.ListViewItemSorter = new EntryListComparer(this);
             _lvEntries.ColumnClick += OnListViewColumnClick;
             _lvEntries.SelectedIndexChanged += (s, e) => OnEntrySelected();
@@ -517,14 +536,15 @@ namespace WinParted.UI
             var previewBar = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 28,
+                Height = 30,
                 Padding = new Padding(8, 3, 8, 3),
                 Tag = "ElevatedPanel"
             };
             _chkHexView = new CheckBox
             {
                 Dock = DockStyle.Right,
-                Width = 85,
+                AutoSize = true,
+                Padding = new Padding(4, 3, 6, 0),
                 Text = "Hex View",
                 Checked = false
             };
@@ -546,8 +566,8 @@ namespace WinParted.UI
                 Dock = DockStyle.Fill,
                 Multiline = true,
                 ReadOnly = true,
-                ScrollBars = ScrollBars.Both,
-                WordWrap = false,
+                ScrollBars = ScrollBars.Vertical,
+                WordWrap = true,
                 Font = new Font("Consolas", 9.0f),
                 Text = "Select a file above to preview or copy its contents to the host system."
             };
@@ -564,7 +584,8 @@ namespace WinParted.UI
             Load += (s, e) =>
             {
                 SetSplitterDistanceSafe(_mainSplit, 210);
-                SetSplitterDistanceSafe(_rightSplit, 240);
+                SetSplitterDistanceSafe(_rightSplit, 250);
+                AutoSizeEntryColumns();
             };
 
             EnableSmoothRepaint(this);
@@ -611,13 +632,35 @@ namespace WinParted.UI
             var btn = new Button
             {
                 Text = symbol,
-                Width = 30,
-                Height = 25,
+                Width = 32,
+                Height = 28,
                 Margin = new Padding(0, 1, 3, 1),
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold)
             };
             _toolTip.SetToolTip(btn, tip);
             return btn;
+        }
+
+        private void AutoSizeEntryColumns()
+        {
+            if (_lvEntries == null || _lvEntries.IsDisposed || _lvEntries.View != View.Details || _lvEntries.Columns.Count < 7)
+                return;
+
+            int avail = _lvEntries.ClientSize.Width;
+            if (avail < 320) return;
+
+            int fixedW = 86 + 74 + 134 + 106 + 48; // Type + Size + Modified + Permissions + ID = 448
+            int flex = Math.Max(200, avail - fixedW - 4);
+            int colName = Math.Max(115, (flex * 56) / 100);
+            int colPath = Math.Max(85, flex - colName);
+
+            _lvEntries.Columns[0].Width = colName;
+            _lvEntries.Columns[1].Width = 86;
+            _lvEntries.Columns[2].Width = 74;
+            _lvEntries.Columns[3].Width = 134;
+            _lvEntries.Columns[4].Width = 106;
+            _lvEntries.Columns[5].Width = colPath;
+            _lvEntries.Columns[6].Width = 48;
         }
 
         private ContextMenuStrip BuildEntryContextMenu()
@@ -767,11 +810,12 @@ namespace WinParted.UI
             return new Button
             {
                 Text = text,
-                Width = 192,
-                Height = 28,
+                Width = 250,
+                Height = 32,
                 Margin = new Padding(0, 0, 0, 6),
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(6, 0, 6, 0),
+                Padding = new Padding(6, 0, 4, 0),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 Tag = "DangerButton",
                 Enabled = false
             };
@@ -978,6 +1022,8 @@ namespace WinParted.UI
             {
                 _lvEntries.View = View.Details;
             }
+            ThemeManager.ApplyListViewHeaderTheme(_lvEntries);
+            AutoSizeEntryColumns();
         }
 
         private void MountCurrentPartitionInteractive()
