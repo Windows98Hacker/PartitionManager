@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
 using WinParted.Models;
 
@@ -458,6 +459,10 @@ namespace WinParted.Core
             {
                 ParseHfsPlusVolume(disk, part, vol);
             }
+            else if (part.FileSystem == FileSystemType.APFS)
+            {
+                ParseApfsVolume(disk, part, vol);
+            }
             else if (part.FileSystem == FileSystemType.Btrfs)
             {
                 ParseBtrfsVolume(disk, part, vol);
@@ -563,6 +568,23 @@ namespace WinParted.Core
                 {
                     long extOff = fileNode.ContentExtents[i].Key;
                     long extLen = fileNode.ContentExtents[i].Value;
+                    if (extOff == -1L && extLen > 0)
+                    {
+                        long zeroRem = Math.Min(targetTotal - written, extLen);
+                        if (zeroRem > 0)
+                        {
+                            byte[] zeroBuf = new byte[(int)Math.Min(65536L, zeroRem)];
+                            while (zeroRem > 0)
+                            {
+                                int zChunk = (int)Math.Min((long)zeroBuf.Length, zeroRem);
+                                destination.Write(zeroBuf, 0, zChunk);
+                                written += zChunk;
+                                zeroRem -= zChunk;
+                                if (onProgress != null) onProgress(written, targetTotal);
+                            }
+                        }
+                        continue;
+                    }
                     if (extOff < part.StartingOffset || extOff >= part.EndOffset || extLen <= 0) continue;
 
                     long extAvail = Math.Min(extLen, part.EndOffset - extOff);
@@ -1185,6 +1207,11 @@ namespace WinParted.Core
             return false;
         }
 
+        /// <summary>
+        /// Returns ordered candidate relative offsets for the <c>WPRWOVL1</c> experimental overlay table,
+        /// preferring a non-overlapping tail region behind ISO9660/isohybrid images when <c>+0x20000</c>
+        /// would overlap an embedded sub-partition (e.g., ESP).
+        /// </summary>
         private static long[] GetCandidateOverlayTableRelOffsets(DiskInfo disk, PartitionEntry part)
         {
             if (part == null) return new long[] { 0x20000L };
@@ -1786,7 +1813,7 @@ namespace WinParted.Core
             KeyValuePair<long, long> cur = raw[0];
             for (int i = 1; i < raw.Count; i++)
             {
-                if (cur.Key + cur.Value == raw[i].Key)
+                if ((cur.Key == -1L && raw[i].Key == -1L) || (cur.Key >= 0 && cur.Key + cur.Value == raw[i].Key))
                     cur = new KeyValuePair<long, long>(cur.Key, cur.Value + raw[i].Value);
                 else
                 {
@@ -3142,6 +3169,1395 @@ namespace WinParted.Core
 
                 pos += recLen;
             }
+        }
+
+        private sealed class ApfsInodeInfo
+        {
+            public ulong Ino;
+            public ulong ParentId;
+            public ulong PrivateId;
+            public DateTime ModTime;
+            public uint BsdFlags;
+            public ushort Mode;
+            public ulong UncompressedSize;
+            public ulong DstreamSize;
+            public bool HasDstream;
+            public string Name;
+        }
+
+        private sealed class ApfsDirLink
+        {
+            public ulong ParentId;
+            public string Name;
+            public ulong ChildId;
+            public byte DtType;
+            public DateTime DateAdded;
+        }
+
+        private sealed class ApfsExtentEntry
+        {
+            public ulong LogicalAddr;
+            public long LengthBytes;
+            public ulong PhysBlock;
+        }
+
+        private sealed class ApfsParsedVolume
+        {
+            public string VolumeName;
+            public string VolumeUuid;
+            public ulong AllocBlocks;
+            public bool IsEncrypted;
+            public int ParsedInodeCount;
+            public int ParsedDirLinkCount;
+            public VirtualFsNode RootNode;
+        }
+
+        /// <summary>
+        /// Navigates multi-level APFS Object Map (<c>OMAP</c>) B-trees to translate virtual object IDs
+        /// (at or below a checkpoint transaction <c>xid</c>) into physical block addresses.
+        /// </summary>
+        private sealed class ApfsOmapReader
+        {
+            private readonly DiskInfo _disk;
+            private readonly PartitionEntry _part;
+            private readonly int _blockSize;
+            private readonly ulong _totalBlocks;
+            private readonly ulong _rootTreePhys;
+            private readonly Dictionary<ulong, ulong> _bestPaddr = new Dictionary<ulong, ulong>();
+            private readonly Dictionary<ulong, ulong> _bestXid = new Dictionary<ulong, ulong>();
+            private readonly HashSet<ulong> _visitedNodes = new HashSet<ulong>();
+
+            public ApfsOmapReader(DiskInfo disk, PartitionEntry part, int blockSize, ulong totalBlocks, ulong omapPhysBlock)
+            {
+                _disk = disk;
+                _part = part;
+                _blockSize = blockSize;
+                _totalBlocks = totalBlocks;
+                _rootTreePhys = ResolveOmapTreeRoot(omapPhysBlock);
+            }
+
+            public bool HasRoot { get { return _rootTreePhys > 0 && _rootTreePhys < _totalBlocks; } }
+
+            private ulong ResolveOmapTreeRoot(ulong omapPhysBlock)
+            {
+                if (omapPhysBlock == 0 || omapPhysBlock >= _totalBlocks) return 0;
+                byte[] blk = ReadApfsBlock(_disk, _part, omapPhysBlock, _blockSize);
+                if (blk == null || blk.Length < 0x38) return 0;
+                uint objType = BitConverter.ToUInt32(blk, 0x18) & 0xFFFFU;
+                if (objType == 0x000BU)
+                {
+                    ulong treeOid = BitConverter.ToUInt64(blk, 0x30);
+                    return (treeOid > 0 && treeOid < _totalBlocks) ? treeOid : 0;
+                }
+                if (objType == 0x0002U || objType == 0x0003U)
+                    return omapPhysBlock;
+                return 0;
+            }
+
+            public ulong Lookup(ulong targetOid)
+            {
+                if (targetOid == 0) return 0;
+                ulong cached;
+                if (_bestPaddr.TryGetValue(targetOid, out cached))
+                    return cached;
+                if (!HasRoot) return 0;
+                SearchNode(_rootTreePhys, targetOid, 0);
+                return _bestPaddr.TryGetValue(targetOid, out cached) ? cached : 0;
+            }
+
+            private void SearchNode(ulong nodePhys, ulong targetOid, int depth)
+            {
+                if (depth > 10 || nodePhys == 0 || nodePhys >= _totalBlocks) return;
+                byte[] node = ReadApfsBlock(_disk, _part, nodePhys, _blockSize);
+                if (node == null || node.Length < 0x38) return;
+
+                ushort btnFlags = BitConverter.ToUInt16(node, 0x20);
+                ushort btnLevel = BitConverter.ToUInt16(node, 0x22);
+                uint btnNkeys = BitConverter.ToUInt32(node, 0x24);
+                ushort tocOff = BitConverter.ToUInt16(node, 0x28);
+                ushort tocLen = BitConverter.ToUInt16(node, 0x2A);
+
+                bool isRoot = (btnFlags & 0x0001) != 0;
+                bool isFixed = (btnFlags & 0x0004) != 0;
+                int hdrLen = ((btnFlags & 0x0010) != 0) ? 24 : 56;
+                int tocStart = hdrLen + tocOff;
+                int keyAreaStart = tocStart + tocLen;
+                int valAreaEnd = isRoot ? (_blockSize - 40) : _blockSize;
+                if (tocStart < 24 || keyAreaStart > valAreaEnd || valAreaEnd > node.Length) return;
+
+                int tocEntryLen = isFixed ? 4 : 8;
+                int count = (int)Math.Min((long)btnNkeys, (keyAreaStart - tocStart) / tocEntryLen);
+                if (count <= 0) return;
+
+                if (btnLevel == 0)
+                {
+                    if (!_visitedNodes.Add(nodePhys)) return;
+                    for (int i = 0; i < count; i++)
+                    {
+                        int kPos, kLen, vPos, vLen;
+                        if (!ReadApfsTocEntry(node, tocStart + i * tocEntryLen, isFixed, 16, 16, keyAreaStart, valAreaEnd, out kPos, out kLen, out vPos, out vLen))
+                            continue;
+                        if (kLen < 16 || vLen < 16) continue;
+                        ulong okOid = BitConverter.ToUInt64(node, kPos);
+                        ulong okXid = BitConverter.ToUInt64(node, kPos + 8);
+                        uint ovFlags = BitConverter.ToUInt32(node, vPos);
+                        ulong ovPaddr = BitConverter.ToUInt64(node, vPos + 8);
+
+                        ulong prevXid;
+                        bool hasPrev = _bestXid.TryGetValue(okOid, out prevXid);
+                        if (!hasPrev || okXid >= prevXid)
+                        {
+                            _bestXid[okOid] = okXid;
+                            if ((ovFlags & 1U) == 0 && ovPaddr > 0 && ovPaddr < _totalBlocks)
+                                _bestPaddr[okOid] = ovPaddr;
+                            else
+                                _bestPaddr.Remove(okOid);
+                        }
+                    }
+                    return;
+                }
+
+                // Internal OMAP node: select last child whose key.ok_oid <= targetOid
+                int chosen = -1;
+                ulong chosenKeyOid = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    int kPos, kLen, vPos, vLen;
+                    if (!ReadApfsTocEntry(node, tocStart + i * tocEntryLen, isFixed, 16, 8, keyAreaStart, valAreaEnd, out kPos, out kLen, out vPos, out vLen))
+                        continue;
+                    if (kLen < 8 || vLen < 8) continue;
+                    ulong kOid = BitConverter.ToUInt64(node, kPos);
+                    if (kOid <= targetOid)
+                    {
+                        chosen = i;
+                        chosenKeyOid = kOid;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                if (chosen < 0) return;
+
+                ulong childPhys = ReadChildBlockFromToc(node, tocStart + chosen * tocEntryLen, isFixed, keyAreaStart, valAreaEnd);
+                if (childPhys > 0 && childPhys < _totalBlocks)
+                    SearchNode(childPhys, targetOid, depth + 1);
+
+                if (!_bestPaddr.ContainsKey(targetOid) && chosen > 0 && chosenKeyOid == targetOid)
+                {
+                    ulong altPhys = ReadChildBlockFromToc(node, tocStart + (chosen - 1) * tocEntryLen, isFixed, keyAreaStart, valAreaEnd);
+                    if (altPhys > 0 && altPhys < _totalBlocks)
+                        SearchNode(altPhys, targetOid, depth + 1);
+                }
+            }
+
+            private static ulong ReadChildBlockFromToc(byte[] node, int tOff, bool isFixed, int keyAreaStart, int valAreaEnd)
+            {
+                int kPos, kLen, vPos, vLen;
+                if (!ReadApfsTocEntry(node, tOff, isFixed, 16, 8, keyAreaStart, valAreaEnd, out kPos, out kLen, out vPos, out vLen))
+                    return 0;
+                if (vLen < 8 || vPos + 8 > valAreaEnd) return 0;
+                return BitConverter.ToUInt64(node, vPos);
+            }
+        }
+
+        private static byte[] ReadApfsBlock(DiskInfo disk, PartitionEntry part, ulong blockNum, int blockSize)
+        {
+            long relOff = (long)blockNum * blockSize;
+            if (relOff < 0 || relOff + blockSize > part.PartitionLength)
+                return null;
+            byte[] buf = RawDiskEngine.ReadBytes(disk, part.StartingOffset + relOff, blockSize);
+            return (buf != null && buf.Length == blockSize) ? buf : null;
+        }
+
+        private static void AccumulateApfsFletcher64(byte[] buf, int offset, int len, out ulong sum1, out ulong sum2)
+        {
+            sum1 = 0;
+            sum2 = 0;
+            if (buf == null || offset < 0 || len < 16 || offset + len > buf.Length) return;
+            int end = offset + (len & ~3);
+            for (int i = offset + 8; i < end; i += 4)
+            {
+                sum1 = (sum1 + BitConverter.ToUInt32(buf, i)) % 0xFFFFFFFFUL;
+                sum2 = (sum2 + sum1) % 0xFFFFFFFFUL;
+            }
+        }
+
+        internal static ulong ComputeApfsFletcher64(byte[] buf, int offset, int len)
+        {
+            if (buf == null || offset < 0 || len < 16 || offset + len > buf.Length) return 0;
+            ulong sum1, sum2;
+            AccumulateApfsFletcher64(buf, offset, len, out sum1, out sum2);
+            ulong ck0 = 0xFFFFFFFFUL - ((sum1 + sum2) % 0xFFFFFFFFUL);
+            ulong ck1 = 0xFFFFFFFFUL - ((sum1 + ck0) % 0xFFFFFFFFUL);
+            return (ck1 << 32) | ck0;
+        }
+
+        internal static void WriteApfsFletcher64(byte[] buf, int offset, int len)
+        {
+            ulong cksum = ComputeApfsFletcher64(buf, offset, len);
+            BitConverter.GetBytes(cksum).CopyTo(buf, offset);
+        }
+
+        internal static bool VerifyApfsFletcher64(byte[] buf, int len)
+        {
+            if (buf == null || len < 16 || len > buf.Length) return false;
+            ulong stored = BitConverter.ToUInt64(buf, 0);
+            ulong sum1, sum2;
+            AccumulateApfsFletcher64(buf, 0, len, out sum1, out sum2);
+            if (stored == 0 && (sum1 != 0 || sum2 != 0)) return false;
+            ulong ck0 = stored & 0xFFFFFFFFUL;
+            ulong ck1 = stored >> 32;
+            return ((sum1 + ck0 + ck1) % 0xFFFFFFFFUL) == 0 &&
+                   ((sum2 + sum1 + ck0) % 0xFFFFFFFFUL) == 0;
+        }
+
+        private static bool ReadApfsTocEntry(
+            byte[] node, int tOff, bool isFixed, int fixedKeyLen, int fixedValLen,
+            int keyAreaStart, int valAreaEnd,
+            out int kPos, out int kLen, out int vPos, out int vLen)
+        {
+            kPos = kLen = vPos = vLen = 0;
+            if (tOff < 0 || tOff + (isFixed ? 4 : 8) > keyAreaStart) return false;
+
+            ushort kRel = BitConverter.ToUInt16(node, tOff);
+            ushort vRel;
+            if (isFixed)
+            {
+                vRel = BitConverter.ToUInt16(node, tOff + 2);
+                kLen = fixedKeyLen;
+                vLen = fixedValLen;
+            }
+            else
+            {
+                kLen = BitConverter.ToUInt16(node, tOff + 2);
+                vRel = BitConverter.ToUInt16(node, tOff + 4);
+                vLen = BitConverter.ToUInt16(node, tOff + 6);
+            }
+
+            if (kRel == 0xFFFF || vRel == 0xFFFF || vRel == 0) return false;
+            kPos = keyAreaStart + kRel;
+            vPos = valAreaEnd - vRel;
+            if (kPos < keyAreaStart || kPos + kLen > valAreaEnd) return false;
+            if (vPos < keyAreaStart || vPos + vLen > valAreaEnd) return false;
+            return true;
+        }
+
+        private static DateTime FromUnixNanoseconds(ulong ns)
+        {
+            if (ns == 0)
+                return new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            try
+            {
+                return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddTicks((long)(ns / 100UL));
+            }
+            catch
+            {
+                return new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            }
+        }
+
+        /// <summary>
+        /// Parses an Apple APFS Container (<c>NXSB</c>) or Volume (<c>APSB</c>), resolving checkpoints,
+        /// Container/Volume OMAP B-trees, File-System B-trees, multi-extent file runs, and inline <c>decmpfs</c>.
+        /// </summary>
+        private static void ParseApfsVolume(DiskInfo disk, PartitionEntry part, MountedReadOnlyVolume vol)
+        {
+            if (part.PartitionLength < 4096L)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            byte[] blk0 = RawDiskEngine.ReadBytes(disk, part.StartingOffset, 4096);
+            if (blk0.Length < 0x100)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            bool isContainer = MatchesAscii(blk0, 0x20, "NXSB");
+            bool isDirectVol = MatchesAscii(blk0, 0x20, "APSB");
+            if (!isContainer && !isDirectVol)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            int blockSize = 4096;
+            if (isContainer)
+            {
+                uint rawBs = BitConverter.ToUInt32(blk0, 0x24);
+                if (rawBs >= 4096U && rawBs <= 65536U && (rawBs & (rawBs - 1U)) == 0U)
+                    blockSize = (int)rawBs;
+                if (blockSize > blk0.Length && part.PartitionLength >= blockSize)
+                    blk0 = RawDiskEngine.ReadBytes(disk, part.StartingOffset, blockSize);
+            }
+
+            vol.BlockSize = blockSize;
+            ulong totalBlocks = (ulong)(part.PartitionLength / blockSize);
+            if (totalBlocks == 0)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            if (isDirectVol)
+            {
+                byte[] directBlk = (blk0.Length >= blockSize) ? blk0 : ReadApfsBlock(disk, part, 0, blockSize);
+                if (directBlk == null)
+                {
+                    ParseCatalogOrMetadataVolume(disk, part, vol);
+                    return;
+                }
+                var parsedDirect = ParseSingleApfsVolume(disk, part, directBlk, blockSize, totalBlocks);
+                if (parsedDirect == null || parsedDirect.RootNode == null)
+                {
+                    ParseCatalogOrMetadataVolume(disk, part, vol);
+                    return;
+                }
+                FinalizeMountedApfsTree(vol, part, blockSize, totalBlocks, new List<ApfsParsedVolume> { parsedDirect });
+                return;
+            }
+
+            // Collect NXSB checkpoint superblocks sorted by descending o_xid, falling back to blk0
+            var nxsbCandidates = CollectApfsNxsbCandidates(disk, part, blk0, blockSize, totalBlocks);
+            List<ApfsParsedVolume> parsedVolumes = null;
+
+            for (int c = 0; c < nxsbCandidates.Count; c++)
+            {
+                byte[] nxsb = nxsbCandidates[c];
+                ulong nxBlockCount = BitConverter.ToUInt64(nxsb, 0x28);
+                if (nxBlockCount > 0 && nxBlockCount < totalBlocks)
+                    vol.TotalBlocks = (long)nxBlockCount;
+                else
+                    vol.TotalBlocks = (long)totalBlocks;
+
+                var candidateVols = ResolveApfsVolumesFromContainer(disk, part, nxsb, blockSize, totalBlocks);
+                if (candidateVols.Count == 0) continue;
+
+                bool anyTree = false;
+                for (int v = 0; v < candidateVols.Count; v++)
+                {
+                    if (candidateVols[v].ParsedInodeCount > 0 || candidateVols[v].ParsedDirLinkCount > 0)
+                    {
+                        anyTree = true;
+                        break;
+                    }
+                }
+                if (anyTree || parsedVolumes == null)
+                {
+                    parsedVolumes = candidateVols;
+                    if (anyTree) break;
+                }
+            }
+
+            if (parsedVolumes == null || parsedVolumes.Count == 0)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                return;
+            }
+
+            bool hasAnyContent = false;
+            bool anyEncrypted = false;
+            for (int v = 0; v < parsedVolumes.Count; v++)
+            {
+                if (parsedVolumes[v].RootNode != null && (parsedVolumes[v].ParsedInodeCount > 0 || parsedVolumes[v].ParsedDirLinkCount > 0))
+                    hasAnyContent = true;
+                if (parsedVolumes[v].IsEncrypted)
+                    anyEncrypted = true;
+            }
+
+            if (!hasAnyContent)
+            {
+                ParseCatalogOrMetadataVolume(disk, part, vol);
+                if (anyEncrypted)
+                    vol.SuperblockSummary = "Apple APFS Encrypted Container (FileVault / Hardware Crypto) | Read-Only Metadata";
+                return;
+            }
+
+            FinalizeMountedApfsTree(vol, part, blockSize, totalBlocks, parsedVolumes);
+        }
+
+        private static List<byte[]> CollectApfsNxsbCandidates(DiskInfo disk, PartitionEntry part, byte[] blk0, int blockSize, ulong totalBlocks)
+        {
+            var candidates = new List<byte[]>();
+            var seenXid = new HashSet<ulong>();
+
+            uint descBlocksRaw = BitConverter.ToUInt32(blk0, 0x68);
+            ulong descBase = (ulong)BitConverter.ToInt64(blk0, 0x70);
+            uint descCount = descBlocksRaw & 0x7FFFFFFFU;
+
+            if ((descBlocksRaw & 0x80000000U) == 0 && descBase > 0 && descBase < totalBlocks && descCount > 0)
+            {
+                ulong scanBlocks = Math.Min((ulong)descCount, Math.Min(512UL, totalBlocks - descBase));
+                const int batchBlocks = 64;
+                for (ulong offset = 0; offset < scanBlocks; offset += batchBlocks)
+                {
+                    int n = (int)Math.Min(batchBlocks, scanBlocks - offset);
+                    long diskOff = part.StartingOffset + (long)((descBase + offset) * (ulong)blockSize);
+                    byte[] batch = RawDiskEngine.ReadBytes(disk, diskOff, n * blockSize);
+                    for (int b = 0; b < n && (b + 1) * blockSize <= batch.Length; b++)
+                    {
+                        int off = b * blockSize;
+                        if (!MatchesAscii(batch, off + 0x20, "NXSB")) continue;
+                        byte[] single = new byte[blockSize];
+                        Array.Copy(batch, off, single, 0, blockSize);
+                        if (!VerifyApfsFletcher64(single, blockSize)) continue;
+                        ulong xid = BitConverter.ToUInt64(single, 0x10);
+                        if (seenXid.Add(xid))
+                            candidates.Add(single);
+                    }
+                }
+            }
+
+            ulong blk0Xid = BitConverter.ToUInt64(blk0, 0x10);
+            if (seenXid.Add(blk0Xid))
+                candidates.Add(blk0);
+
+            candidates.Sort(delegate(byte[] a, byte[] b)
+            {
+                ulong xa = BitConverter.ToUInt64(a, 0x10);
+                ulong xb = BitConverter.ToUInt64(b, 0x10);
+                return xb.CompareTo(xa);
+            });
+            return candidates;
+        }
+
+        /// <summary>
+        /// Inspects an APFS container (<c>NXSB</c>) or volume (<c>APSB</c>) to extract the preferred
+        /// non-System-internal volume label, UUID, and allocated container used bytes for UI display.
+        /// </summary>
+        internal static bool TryReadApfsVolumeMetadata(
+            DiskInfo disk, PartitionEntry part, byte[] header0,
+            out string volLabel, out string volUuid, out long volUsedBytes)
+        {
+            volLabel = string.Empty;
+            volUuid = string.Empty;
+            volUsedBytes = -1;
+            if (disk == null || part == null || header0 == null || header0.Length < 0x100) return false;
+
+            try
+            {
+                bool isContainer = MatchesAscii(header0, 0x20, "NXSB");
+                bool isDirectVol = MatchesAscii(header0, 0x20, "APSB");
+                if (!isContainer && !isDirectVol) return false;
+
+                int blockSize = 4096;
+                if (isContainer)
+                {
+                    uint rawBs = BitConverter.ToUInt32(header0, 0x24);
+                    if (rawBs >= 4096U && rawBs <= 65536U && (rawBs & (rawBs - 1U)) == 0U)
+                        blockSize = (int)rawBs;
+                }
+
+                ulong totalBlocks = (ulong)(part.PartitionLength / blockSize);
+                if (totalBlocks == 0) return false;
+
+                List<byte[]> apsbBlocks;
+                if (isDirectVol)
+                {
+                    byte[] direct = (header0.Length >= blockSize) ? header0 : ReadApfsBlock(disk, part, 0, blockSize);
+                    apsbBlocks = (direct != null) ? new List<byte[]> { direct } : new List<byte[]>();
+                }
+                else
+                {
+                    byte[] blk0 = (header0.Length >= blockSize) ? header0 : RawDiskEngine.ReadBytes(disk, part.StartingOffset, (int)Math.Min((long)blockSize, part.PartitionLength));
+                    if (blk0.Length < blockSize) return false;
+                    var nxsbCandidates = CollectApfsNxsbCandidates(disk, part, blk0, blockSize, totalBlocks);
+                    apsbBlocks = new List<byte[]>();
+                    for (int c = 0; c < nxsbCandidates.Count; c++)
+                    {
+                        apsbBlocks = FindApfsVolumeSuperblocks(disk, part, nxsbCandidates[c], blockSize, totalBlocks);
+                        if (apsbBlocks.Count > 0) break;
+                    }
+                }
+
+                if (apsbBlocks.Count == 0) return false;
+
+                ulong sumAlloc = 0;
+                string preferredLabel = string.Empty;
+                string preferredUuid = string.Empty;
+                bool preferredIsSysVol = true;
+                for (int i = 0; i < apsbBlocks.Count; i++)
+                {
+                    byte[] apsb = apsbBlocks[i];
+                    if (apsb == null || apsb.Length < 0x3C0) continue;
+                    sumAlloc += BitConverter.ToUInt64(apsb, 0x58);
+
+                    int end = 0x2C0;
+                    while (end < 0x3C0 && apsb[end] != 0) end++;
+                    string name = (end > 0x2C0) ? Encoding.UTF8.GetString(apsb, 0x2C0, end - 0x2C0).Trim() : string.Empty;
+
+                    byte[] uBytes = new byte[16];
+                    Array.Copy(apsb, 0xF0, uBytes, 0, 16);
+                    bool nonZeroUuid = false;
+                    for (int k = 0; k < 16; k++)
+                    {
+                        if (uBytes[k] != 0) { nonZeroUuid = true; break; }
+                    }
+                    string uuid = nonZeroUuid ? FormatRfcUuidFromBytes(uBytes) : string.Empty;
+
+                    bool isSysVol =
+                        string.Equals(name, "Preboot", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "Recovery", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "VM", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(name, "Update", StringComparison.OrdinalIgnoreCase);
+
+                    if (!string.IsNullOrEmpty(name) && (string.IsNullOrEmpty(preferredLabel) || (preferredIsSysVol && !isSysVol)))
+                    {
+                        preferredLabel = name;
+                        preferredIsSysVol = isSysVol;
+                        if (!string.IsNullOrEmpty(uuid)) preferredUuid = uuid;
+                    }
+                    if (string.IsNullOrEmpty(preferredUuid) && !string.IsNullOrEmpty(uuid))
+                        preferredUuid = uuid;
+                }
+
+                volLabel = preferredLabel;
+                volUuid = preferredUuid;
+                if (sumAlloc > 0)
+                {
+                    long used = (long)(sumAlloc * (ulong)blockSize);
+                    if (used > 0 && used <= part.PartitionLength)
+                        volUsedBytes = used;
+                }
+                return !string.IsNullOrEmpty(volLabel) || !string.IsNullOrEmpty(volUuid) || volUsedBytes >= 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static List<byte[]> FindApfsVolumeSuperblocks(
+            DiskInfo disk, PartitionEntry part, byte[] nxsb, int blockSize, ulong totalBlocks)
+        {
+            var apsbBlocks = new List<byte[]>();
+            var seenVolOid = new HashSet<ulong>();
+
+            ulong nxOmapOid = BitConverter.ToUInt64(nxsb, 0xA0);
+            var containerOmap = new ApfsOmapReader(disk, part, blockSize, totalBlocks, nxOmapOid);
+
+            uint maxFs = BitConverter.ToUInt32(nxsb, 0xB4);
+            if (maxFs == 0 || maxFs > 100U) maxFs = 100U;
+            int maxSlot = Math.Min((int)maxFs, (nxsb.Length - 0xB8) / 8);
+
+            for (int i = 0; i < maxSlot; i++)
+            {
+                ulong fsOid = BitConverter.ToUInt64(nxsb, 0xB8 + i * 8);
+                if (fsOid == 0) continue;
+
+                ulong fsPaddr = containerOmap.Lookup(fsOid);
+                if (fsPaddr == 0 && fsOid < totalBlocks)
+                    fsPaddr = fsOid;
+                if (fsPaddr == 0 || fsPaddr >= totalBlocks) continue;
+
+                byte[] apsb = ReadApfsBlock(disk, part, fsPaddr, blockSize);
+                if (apsb != null && MatchesAscii(apsb, 0x20, "APSB") && seenVolOid.Add(fsOid))
+                    apsbBlocks.Add(apsb);
+            }
+
+            // Fallback scan of checkpoint data area / early container blocks if container OMAP yielded nothing
+            if (apsbBlocks.Count == 0)
+            {
+                ulong dataBase = (ulong)BitConverter.ToInt64(nxsb, 0x78);
+                uint dataBlocksRaw = BitConverter.ToUInt32(nxsb, 0x6C);
+                var bestByOid = new Dictionary<ulong, byte[]>();
+                var ranges = new List<KeyValuePair<ulong, ulong>>();
+                if ((dataBlocksRaw & 0x80000000U) == 0 && dataBase > 0 && dataBase < totalBlocks)
+                    ranges.Add(new KeyValuePair<ulong, ulong>(dataBase, Math.Min(256UL, totalBlocks - dataBase)));
+                ranges.Add(new KeyValuePair<ulong, ulong>(1UL, Math.Min(128UL, totalBlocks - 1UL)));
+
+                foreach (var rng in ranges)
+                {
+                    const int batchBlocks = 64;
+                    for (ulong offset = 0; offset < rng.Value; offset += batchBlocks)
+                    {
+                        int n = (int)Math.Min(batchBlocks, rng.Value - offset);
+                        long diskOff = part.StartingOffset + (long)((rng.Key + offset) * (ulong)blockSize);
+                        byte[] batch = RawDiskEngine.ReadBytes(disk, diskOff, n * blockSize);
+                        for (int b = 0; b < n && (b + 1) * blockSize <= batch.Length; b++)
+                        {
+                            int off = b * blockSize;
+                            if (!MatchesAscii(batch, off + 0x20, "APSB")) continue;
+                            byte[] single = new byte[blockSize];
+                            Array.Copy(batch, off, single, 0, blockSize);
+                            if (!VerifyApfsFletcher64(single, blockSize)) continue;
+                            ulong oOid = BitConverter.ToUInt64(single, 0x08);
+                            ulong oXid = BitConverter.ToUInt64(single, 0x10);
+                            byte[] existing;
+                            if (!bestByOid.TryGetValue(oOid, out existing) || oXid >= BitConverter.ToUInt64(existing, 0x10))
+                                bestByOid[oOid] = single;
+                        }
+                    }
+                    if (bestByOid.Count > 0) break;
+                }
+
+                foreach (var kv in bestByOid)
+                    apsbBlocks.Add(kv.Value);
+            }
+
+            return apsbBlocks;
+        }
+
+        private static List<ApfsParsedVolume> ResolveApfsVolumesFromContainer(
+            DiskInfo disk, PartitionEntry part, byte[] nxsb, int blockSize, ulong totalBlocks)
+        {
+            var volumes = new List<ApfsParsedVolume>();
+            var apsbBlocks = FindApfsVolumeSuperblocks(disk, part, nxsb, blockSize, totalBlocks);
+            for (int i = 0; i < apsbBlocks.Count; i++)
+            {
+                var parsed = ParseSingleApfsVolume(disk, part, apsbBlocks[i], blockSize, totalBlocks);
+                if (parsed != null)
+                    volumes.Add(parsed);
+            }
+            return volumes;
+        }
+
+        private static ApfsParsedVolume ParseSingleApfsVolume(
+            DiskInfo disk, PartitionEntry part, byte[] apsb, int blockSize, ulong totalBlocks)
+        {
+            if (apsb == null || apsb.Length < 0x3C0 || !MatchesAscii(apsb, 0x20, "APSB"))
+                return null;
+
+            int nameEnd = 0x2C0;
+            while (nameEnd < 0x3C0 && nameEnd < apsb.Length && apsb[nameEnd] != 0)
+                nameEnd++;
+            string volName = (nameEnd > 0x2C0)
+                ? Encoding.UTF8.GetString(apsb, 0x2C0, nameEnd - 0x2C0).Trim()
+                : string.Empty;
+
+            byte[] uuidBytes = new byte[16];
+            Array.Copy(apsb, 0xF0, uuidBytes, 0, 16);
+            string volUuid = FormatRfcUuidFromBytes(uuidBytes);
+
+            ulong allocBlocks = BitConverter.ToUInt64(apsb, 0x58);
+            ulong apfsOmapOid = BitConverter.ToUInt64(apsb, 0x80);
+            ulong rootTreeOid = BitConverter.ToUInt64(apsb, 0x88);
+            ulong fsFlags = BitConverter.ToUInt64(apsb, 0x108);
+            bool isEncrypted = (fsFlags & 1UL) == 0;
+
+            var parsed = new ApfsParsedVolume
+            {
+                VolumeName = volName,
+                VolumeUuid = volUuid,
+                AllocBlocks = allocBlocks,
+                IsEncrypted = isEncrypted
+            };
+
+            var volOmap = new ApfsOmapReader(disk, part, blockSize, totalBlocks, apfsOmapOid);
+            ulong rootTreePhys = volOmap.Lookup(rootTreeOid);
+            if (rootTreePhys == 0 && rootTreeOid > 0 && rootTreeOid < totalBlocks)
+                rootTreePhys = rootTreeOid;
+            if (rootTreePhys == 0 || rootTreePhys >= totalBlocks)
+                return parsed;
+
+            var inodes = new Dictionary<ulong, ApfsInodeInfo>();
+            var dirLinks = new List<ApfsDirLink>();
+            var extentsByPrivId = new Dictionary<ulong, List<ApfsExtentEntry>>();
+            var symlinksByIno = new Dictionary<ulong, string>();
+            var inlineByIno = new Dictionary<ulong, byte[]>();
+            var decmpfsSizeByIno = new Dictionary<ulong, ulong>();
+            var visitedTreeNodes = new HashSet<ulong>();
+
+            CollectApfsFsTreeNodes(
+                disk, part, volOmap, rootTreePhys, blockSize, totalBlocks, false,
+                inodes, dirLinks, extentsByPrivId, symlinksByIno, inlineByIno, decmpfsSizeByIno,
+                visitedTreeNodes, 0);
+
+            parsed.ParsedInodeCount = inodes.Count;
+            parsed.ParsedDirLinkCount = dirLinks.Count;
+            if (inodes.Count == 0 && dirLinks.Count == 0)
+                return parsed;
+
+            parsed.RootNode = AssembleApfsVolumeTree(
+                part, blockSize, inodes, dirLinks, extentsByPrivId, symlinksByIno, inlineByIno, decmpfsSizeByIno);
+            return parsed;
+        }
+
+        private static string FormatRfcUuidFromBytes(byte[] b)
+        {
+            if (b == null || b.Length < 16) return string.Empty;
+            return string.Format("{0:x2}{1:x2}{2:x2}{3:x2}-{4:x2}{5:x2}-{6:x2}{7:x2}-{8:x2}{9:x2}-{10:x2}{11:x2}{12:x2}{13:x2}{14:x2}{15:x2}",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+        }
+
+        private static void CollectApfsFsTreeNodes(
+            DiskInfo disk, PartitionEntry part, ApfsOmapReader volOmap,
+            ulong nodePhys, int blockSize, ulong totalBlocks, bool inheritedHashed,
+            Dictionary<ulong, ApfsInodeInfo> inodes,
+            List<ApfsDirLink> dirLinks,
+            Dictionary<ulong, List<ApfsExtentEntry>> extentsByPrivId,
+            Dictionary<ulong, string> symlinksByIno,
+            Dictionary<ulong, byte[]> inlineByIno,
+            Dictionary<ulong, ulong> decmpfsSizeByIno,
+            HashSet<ulong> visitedNodes, int depth)
+        {
+            if (depth > 12 || visitedNodes.Count >= 16384 || nodePhys == 0 || nodePhys >= totalBlocks) return;
+            if (!visitedNodes.Add(nodePhys)) return;
+
+            byte[] node = ReadApfsBlock(disk, part, nodePhys, blockSize);
+            if (node == null || node.Length < 0x38) return;
+
+            ushort btnFlags = BitConverter.ToUInt16(node, 0x20);
+            ushort btnLevel = BitConverter.ToUInt16(node, 0x22);
+            uint btnNkeys = BitConverter.ToUInt32(node, 0x24);
+            ushort tocOff = BitConverter.ToUInt16(node, 0x28);
+            ushort tocLen = BitConverter.ToUInt16(node, 0x2A);
+
+            bool isRoot = (btnFlags & 0x0001) != 0;
+            bool isFixed = (btnFlags & 0x0004) != 0;
+            bool isHashed = inheritedHashed || ((btnFlags & 0x0008) != 0);
+            int hdrLen = ((btnFlags & 0x0010) != 0) ? 24 : 56;
+            int tocStart = hdrLen + tocOff;
+            int keyAreaStart = tocStart + tocLen;
+            int valAreaEnd = isRoot ? (blockSize - 40) : blockSize;
+            if (tocStart < 24 || keyAreaStart > valAreaEnd || valAreaEnd > node.Length) return;
+
+            int tocEntryLen = isFixed ? 4 : 8;
+            int count = (int)Math.Min((long)btnNkeys, (keyAreaStart - tocStart) / tocEntryLen);
+            if (count <= 0) return;
+
+            if (btnLevel > 0)
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    int kPos, kLen, vPos, vLen;
+                    if (!ReadApfsTocEntry(node, tocStart + i * tocEntryLen, isFixed, 8, 8, keyAreaStart, valAreaEnd, out kPos, out kLen, out vPos, out vLen))
+                        continue;
+                    if (vLen < 8) continue;
+                    ulong childOid = BitConverter.ToUInt64(node, vPos);
+                    ulong childPhys = (volOmap != null) ? volOmap.Lookup(childOid) : 0;
+                    if (childPhys == 0 && childOid > 0 && childOid < totalBlocks)
+                    {
+                        byte[] probe = ReadApfsBlock(disk, part, childOid, blockSize);
+                        if (probe != null && VerifyApfsFletcher64(probe, blockSize))
+                        {
+                            uint ot = BitConverter.ToUInt32(probe, 0x18) & 0xFFFFU;
+                            if (ot == 2U || ot == 3U) childPhys = childOid;
+                        }
+                    }
+                    if (childPhys > 0 && childPhys < totalBlocks)
+                    {
+                        CollectApfsFsTreeNodes(
+                            disk, part, volOmap, childPhys, blockSize, totalBlocks, isHashed,
+                            inodes, dirLinks, extentsByPrivId, symlinksByIno, inlineByIno, decmpfsSizeByIno,
+                            visitedNodes, depth + 1);
+                    }
+                }
+                return;
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                int kPos, kLen, vPos, vLen;
+                if (!ReadApfsTocEntry(node, tocStart + i * tocEntryLen, isFixed, 8, 8, keyAreaStart, valAreaEnd, out kPos, out kLen, out vPos, out vLen))
+                    continue;
+                if (kLen < 8) continue;
+
+                ulong hdr = BitConverter.ToUInt64(node, kPos);
+                ulong objId = hdr & 0x0FFFFFFFFFFFFFFFUL;
+                int recType = (int)(hdr >> 60);
+
+                if (recType == 3 && vLen >= 92)
+                {
+                    ParseApfsInodeRecord(node, objId, vPos, vLen, inodes);
+                }
+                else if (recType == 9 && kLen >= 11 && vLen >= 18)
+                {
+                    ParseApfsDirRecord(node, objId, kPos, kLen, vPos, isHashed, dirLinks);
+                }
+                else if (recType == 8 && kLen >= 16 && vLen >= 24)
+                {
+                    ParseApfsFileExtentRecord(node, objId, kPos, vPos, extentsByPrivId);
+                }
+                else if (recType == 4 && kLen >= 11 && vLen >= 4)
+                {
+                    ParseApfsXattrRecord(node, objId, kPos, kLen, vPos, vLen, symlinksByIno, inlineByIno, decmpfsSizeByIno);
+                }
+            }
+        }
+
+        private static void ParseApfsInodeRecord(
+            byte[] node, ulong objId, int vPos, int vLen, Dictionary<ulong, ApfsInodeInfo> inodes)
+        {
+            ulong parentId = BitConverter.ToUInt64(node, vPos + 0x00);
+            ulong privateId = BitConverter.ToUInt64(node, vPos + 0x08);
+            ulong modNs = BitConverter.ToUInt64(node, vPos + 0x18);
+            uint bsdFlags = BitConverter.ToUInt32(node, vPos + 0x44);
+            ushort mode = BitConverter.ToUInt16(node, vPos + 0x50);
+            ulong uncompSize = BitConverter.ToUInt64(node, vPos + 0x54);
+
+            var info = new ApfsInodeInfo
+            {
+                Ino = objId,
+                ParentId = parentId,
+                PrivateId = privateId != 0 ? privateId : objId,
+                ModTime = FromUnixNanoseconds(modNs),
+                BsdFlags = bsdFlags,
+                Mode = mode,
+                UncompressedSize = uncompSize
+            };
+
+            if (vLen >= 96)
+            {
+                ushort numExts = BitConverter.ToUInt16(node, vPos + 92);
+                int descBase = vPos + 96;
+                int dataCursor = descBase + numExts * 4;
+                if (numExts <= 64 && dataCursor <= vPos + vLen)
+                {
+                    for (int e = 0; e < numExts; e++)
+                    {
+                        byte xType = node[descBase + e * 4];
+                        ushort xSize = BitConverter.ToUInt16(node, descBase + e * 4 + 2);
+                        if (dataCursor + xSize > vPos + vLen) break;
+
+                        if (xType == 4 && xSize > 0)
+                        {
+                            info.Name = Encoding.UTF8.GetString(node, dataCursor, xSize).TrimEnd('\0');
+                        }
+                        else if (xType == 8 && xSize >= 8)
+                        {
+                            info.DstreamSize = BitConverter.ToUInt64(node, dataCursor);
+                            info.HasDstream = true;
+                        }
+
+                        dataCursor += (xSize + 7) & ~7;
+                    }
+                }
+            }
+
+            inodes[objId] = info;
+        }
+
+        private static void ParseApfsDirRecord(
+            byte[] node, ulong parentId, int kPos, int kLen, int vPos, bool isHashed, List<ApfsDirLink> dirLinks)
+        {
+            int nameOff;
+            int nameLen;
+
+            int hashedLen = (int)(BitConverter.ToUInt32(node, kPos + 8) & 0x3FFU);
+            int unhashedLen = BitConverter.ToUInt16(node, kPos + 8);
+            if (kLen >= 12 && 12 + hashedLen == kLen)
+            {
+                nameOff = kPos + 12;
+                nameLen = hashedLen;
+            }
+            else if (kLen >= 10 && 10 + unhashedLen == kLen)
+            {
+                nameOff = kPos + 10;
+                nameLen = unhashedLen;
+            }
+            else if (isHashed && kLen >= 12)
+            {
+                nameOff = kPos + 12;
+                nameLen = Math.Min(kLen - 12, Math.Max(0, hashedLen));
+            }
+            else
+            {
+                nameOff = kPos + 10;
+                nameLen = Math.Min(kLen - 10, Math.Max(0, unhashedLen));
+            }
+
+            if (nameLen <= 0 || nameOff + nameLen > node.Length) return;
+            string name = Encoding.UTF8.GetString(node, nameOff, nameLen).TrimEnd('\0');
+            if (string.IsNullOrEmpty(name)) return;
+
+            ulong fileId = BitConverter.ToUInt64(node, vPos + 0);
+            ulong dateAdded = BitConverter.ToUInt64(node, vPos + 8);
+            ushort drecFlags = BitConverter.ToUInt16(node, vPos + 16);
+            byte dtType = (byte)(drecFlags & 0x0F);
+
+            dirLinks.Add(new ApfsDirLink
+            {
+                ParentId = parentId,
+                Name = name,
+                ChildId = fileId,
+                DtType = dtType,
+                DateAdded = FromUnixNanoseconds(dateAdded)
+            });
+        }
+
+        private static void ParseApfsFileExtentRecord(
+            byte[] node, ulong privId, int kPos, int vPos, Dictionary<ulong, List<ApfsExtentEntry>> extentsByPrivId)
+        {
+            ulong logicalAddr = BitConverter.ToUInt64(node, kPos + 8);
+            ulong lenAndFlags = BitConverter.ToUInt64(node, vPos + 0);
+            long lenBytes = (long)(lenAndFlags & 0x00FFFFFFFFFFFFFFUL);
+            ulong physBlock = BitConverter.ToUInt64(node, vPos + 8);
+            if (lenBytes <= 0) return;
+
+            List<ApfsExtentEntry> list;
+            if (!extentsByPrivId.TryGetValue(privId, out list))
+            {
+                list = new List<ApfsExtentEntry>();
+                extentsByPrivId[privId] = list;
+            }
+            list.Add(new ApfsExtentEntry
+            {
+                LogicalAddr = logicalAddr,
+                LengthBytes = lenBytes,
+                PhysBlock = physBlock
+            });
+        }
+
+        private static void ParseApfsXattrRecord(
+            byte[] node, ulong ino, int kPos, int kLen, int vPos, int vLen,
+            Dictionary<ulong, string> symlinksByIno,
+            Dictionary<ulong, byte[]> inlineByIno,
+            Dictionary<ulong, ulong> decmpfsSizeByIno)
+        {
+            ushort nameLen = BitConverter.ToUInt16(node, kPos + 8);
+            if (10 + nameLen > kLen) return;
+            string xName = Encoding.UTF8.GetString(node, kPos + 10, nameLen).TrimEnd('\0');
+            ushort flags = BitConverter.ToUInt16(node, vPos + 0);
+            ushort dataLen = BitConverter.ToUInt16(node, vPos + 2);
+            if ((flags & 2) == 0 || vPos + 4 + dataLen > node.Length) return;
+
+            if (xName == "com.apple.fs.symlink" && dataLen > 0)
+            {
+                symlinksByIno[ino] = Encoding.UTF8.GetString(node, vPos + 4, dataLen).TrimEnd('\0');
+            }
+            else if (xName == "com.apple.decmpfs" && dataLen >= 16)
+            {
+                int dOff = vPos + 4;
+                uint magic = BitConverter.ToUInt32(node, dOff);
+                if (magic != 0x636D7066U) return; // 'fpmc'
+                uint compType = BitConverter.ToUInt32(node, dOff + 4);
+                ulong uncompSize = BitConverter.ToUInt64(node, dOff + 8);
+                decmpfsSizeByIno[ino] = uncompSize;
+
+                int payloadOff = dOff + 16;
+                int payloadLen = dataLen - 16;
+                if (compType == 3 && payloadLen >= 1)
+                {
+                    if (node[payloadOff] == 0xFF)
+                    {
+                        int rawLen = (int)Math.Min((ulong)(payloadLen - 1), uncompSize);
+                        byte[] literal = new byte[rawLen];
+                        Array.Copy(node, payloadOff + 1, literal, 0, rawLen);
+                        inlineByIno[ino] = literal;
+                    }
+                    else if (payloadLen >= 3 && node[payloadOff] == 0x78)
+                    {
+                        byte[] decompressed = TryDecompressZlibSlice(node, payloadOff + 2, payloadLen - 2, (int)Math.Min(uncompSize, 16L * 1048576L));
+                        if (decompressed != null)
+                            inlineByIno[ino] = decompressed;
+                    }
+                }
+            }
+        }
+
+        private static byte[] TryDecompressZlibSlice(byte[] buf, int offset, int count, int expectedHint)
+        {
+            if (buf == null || count <= 0 || offset + count > buf.Length) return null;
+            try
+            {
+                using (var src = new MemoryStream(buf, offset, count, false))
+                using (var def = new DeflateStream(src, CompressionMode.Decompress))
+                using (var outMs = new MemoryStream(Math.Max(256, expectedHint)))
+                {
+                    byte[] tmp = new byte[8192];
+                    int r;
+                    while ((r = def.Read(tmp, 0, tmp.Length)) > 0)
+                    {
+                        outMs.Write(tmp, 0, r);
+                        if (outMs.Length > 32L * 1048576L) break;
+                    }
+                    return outMs.ToArray();
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static VirtualFsNode BuildApfsNodeFromInode(
+            PartitionEntry part, int blockSize, ulong ino, string name, byte dtType, DateTime fallbackDate,
+            Dictionary<ulong, ApfsInodeInfo> inodes,
+            Dictionary<ulong, List<ApfsExtentEntry>> extentsByPrivId,
+            Dictionary<ulong, string> symlinksByIno,
+            Dictionary<ulong, byte[]> inlineByIno,
+            Dictionary<ulong, ulong> decmpfsSizeByIno)
+        {
+            ApfsInodeInfo meta;
+            inodes.TryGetValue(ino, out meta);
+
+            bool isDir = (meta != null && meta.Mode != 0)
+                ? ((meta.Mode & 0xF000U) == 0x4000U)
+                : (dtType == 4);
+            bool isSymlink = (meta != null && meta.Mode != 0)
+                ? ((meta.Mode & 0xF000U) == 0xA000U)
+                : (dtType == 10);
+
+            ushort mode = (meta != null && meta.Mode != 0)
+                ? meta.Mode
+                : (isDir ? (ushort)0x41ED : (ushort)0x81A4);
+
+            var node = new VirtualFsNode
+            {
+                Name = name,
+                IsDirectory = isDir,
+                InodeOrObjectId = ino,
+                PermissionsString = isSymlink ? ("l" + FormatUnixMode(mode).Substring(1)) : FormatUnixMode(mode),
+                ModifiedUtc = (meta != null && meta.ModTime.Year > 1971) ? meta.ModTime : fallbackDate
+            };
+
+            if (isDir)
+                return node;
+
+            ulong privId = (meta != null && meta.PrivateId != 0) ? meta.PrivateId : ino;
+            byte[] inlineData;
+            string symTarget;
+            if (inlineByIno.TryGetValue(ino, out inlineData))
+            {
+                node.InlineContent = inlineData;
+                node.SizeBytes = inlineData.Length;
+                node.ContentLength = 0;
+                return node;
+            }
+            if (isSymlink && symlinksByIno.TryGetValue(ino, out symTarget))
+            {
+                byte[] symBytes = Encoding.UTF8.GetBytes(symTarget);
+                node.InlineContent = symBytes;
+                node.SizeBytes = symBytes.Length;
+                node.ContentLength = 0;
+                return node;
+            }
+
+            List<ApfsExtentEntry> exts;
+            if (!extentsByPrivId.TryGetValue(privId, out exts))
+                extentsByPrivId.TryGetValue(ino, out exts);
+
+            long extSum = 0;
+            if (exts != null)
+            {
+                for (int i = 0; i < exts.Count; i++)
+                {
+                    long end = (long)exts[i].LogicalAddr + exts[i].LengthBytes;
+                    if (end > extSum) extSum = end;
+                }
+            }
+
+            ulong decSize = 0;
+            decmpfsSizeByIno.TryGetValue(ino, out decSize);
+
+            long fileSize = 0;
+            if (meta != null && meta.HasDstream)
+                fileSize = (long)meta.DstreamSize;
+            else if (meta != null && meta.UncompressedSize > 0)
+                fileSize = (long)meta.UncompressedSize;
+            else if (decSize > 0)
+                fileSize = (long)decSize;
+            else
+                fileSize = extSum;
+
+            node.SizeBytes = fileSize;
+            node.ContentLength = fileSize;
+
+            if (exts != null && exts.Count > 0 && fileSize > 0)
+            {
+                var sorted = new List<ApfsExtentEntry>(exts);
+                sorted.Sort(delegate(ApfsExtentEntry a, ApfsExtentEntry b)
+                {
+                    return a.LogicalAddr.CompareTo(b.LogicalAddr);
+                });
+
+                var runs = new List<KeyValuePair<long, long>>();
+                long logicalCursor = 0;
+                for (int i = 0; i < sorted.Count && logicalCursor < fileSize; i++)
+                {
+                    long start = (long)sorted[i].LogicalAddr;
+                    long len = sorted[i].LengthBytes;
+                    if (start > logicalCursor)
+                    {
+                        long holeLen = Math.Min(start - logicalCursor, fileSize - logicalCursor);
+                        if (holeLen > 0)
+                        {
+                            runs.Add(new KeyValuePair<long, long>(-1L, holeLen));
+                            logicalCursor += holeLen;
+                        }
+                    }
+
+                    long skip = (start < logicalCursor) ? (logicalCursor - start) : 0;
+                    long avail = Math.Min(len - skip, fileSize - logicalCursor);
+                    if (avail <= 0) continue;
+
+                    if (sorted[i].PhysBlock == 0)
+                    {
+                        runs.Add(new KeyValuePair<long, long>(-1L, avail));
+                    }
+                    else
+                    {
+                        long physOff = part.StartingOffset + (long)(sorted[i].PhysBlock * (ulong)blockSize) + skip;
+                        if (physOff >= part.StartingOffset && physOff < part.EndOffset)
+                        {
+                            long clamped = Math.Min(avail, part.EndOffset - physOff);
+                            if (clamped > 0)
+                                runs.Add(new KeyValuePair<long, long>(physOff, clamped));
+                        }
+                    }
+                    logicalCursor += avail;
+                }
+
+                if (runs.Count > 0)
+                {
+                    var coalesced = CoalesceExtents(runs);
+                    node.ContentExtents = coalesced;
+                    node.ContentOffset = coalesced[0].Key >= 0 ? coalesced[0].Key : 0;
+                }
+            }
+
+            return node;
+        }
+
+        private static VirtualFsNode AssembleApfsVolumeTree(
+            PartitionEntry part, int blockSize,
+            Dictionary<ulong, ApfsInodeInfo> inodes,
+            List<ApfsDirLink> dirLinks,
+            Dictionary<ulong, List<ApfsExtentEntry>> extentsByPrivId,
+            Dictionary<ulong, string> symlinksByIno,
+            Dictionary<ulong, byte[]> inlineByIno,
+            Dictionary<ulong, ulong> decmpfsSizeByIno)
+        {
+            var dirNodes = new Dictionary<ulong, VirtualFsNode>();
+            var root = BuildApfsNodeFromInode(
+                part, blockSize, 2UL, "/", 4, new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                inodes, extentsByPrivId, symlinksByIno, inlineByIno, decmpfsSizeByIno);
+            root.Name = "/";
+            root.FullPath = "/";
+            root.IsDirectory = true;
+            dirNodes[2UL] = root;
+
+            // Pre-create directory nodes from inodes (excluding private-dir 3 and snap-dir 4)
+            foreach (var kv in inodes)
+            {
+                if (kv.Key <= 4UL) continue;
+                if ((kv.Value.Mode & 0xF000U) == 0x4000U)
+                {
+                    string dName = string.IsNullOrEmpty(kv.Value.Name) ? ("dir_" + kv.Key) : kv.Value.Name;
+                    dirNodes[kv.Key] = BuildApfsNodeFromInode(
+                        part, blockSize, kv.Key, dName, 4, kv.Value.ModTime,
+                        inodes, extentsByPrivId, symlinksByIno, inlineByIno, decmpfsSizeByIno);
+                }
+            }
+
+            var attachedDirs = new HashSet<ulong>();
+            attachedDirs.Add(2UL);
+            var attachedNames = new HashSet<string>(StringComparer.Ordinal);
+
+            for (int i = 0; i < dirLinks.Count; i++)
+            {
+                var link = dirLinks[i];
+                if (link.ParentId == 1UL || link.ParentId == 3UL || link.ChildId <= 4UL) continue;
+                if (string.IsNullOrEmpty(link.Name) || link.Name == "." || link.Name == "..") continue;
+
+                VirtualFsNode parentNode;
+                if (!dirNodes.TryGetValue(link.ParentId, out parentNode)) continue;
+
+                string dedup = link.ParentId + ":" + link.Name;
+                if (!attachedNames.Add(dedup)) continue;
+
+                VirtualFsNode childDir;
+                if (dirNodes.TryGetValue(link.ChildId, out childDir))
+                {
+                    if (!attachedDirs.Add(link.ChildId)) continue;
+                    childDir.Name = link.Name;
+                    parentNode.Children.Add(childDir);
+                }
+                else
+                {
+                    var childNode = BuildApfsNodeFromInode(
+                        part, blockSize, link.ChildId, link.Name, link.DtType, link.DateAdded,
+                        inodes, extentsByPrivId, symlinksByIno, inlineByIno, decmpfsSizeByIno);
+                    if (childNode.IsDirectory)
+                    {
+                        dirNodes[link.ChildId] = childNode;
+                        attachedDirs.Add(link.ChildId);
+                    }
+                    parentNode.Children.Add(childNode);
+                }
+            }
+
+            // Fallback: attach any orphan inodes that carry ParentId and INO_EXT_TYPE_NAME
+            foreach (var kv in inodes)
+            {
+                if (kv.Key <= 4UL || kv.Value.ParentId == 1UL || kv.Value.ParentId == 3UL) continue;
+                if (string.IsNullOrEmpty(kv.Value.Name)) continue;
+
+                VirtualFsNode parentNode;
+                if (!dirNodes.TryGetValue(kv.Value.ParentId, out parentNode)) continue;
+
+                string dedup = kv.Value.ParentId + ":" + kv.Value.Name;
+                if (!attachedNames.Add(dedup)) continue;
+
+                VirtualFsNode orphanDir;
+                if (dirNodes.TryGetValue(kv.Key, out orphanDir))
+                {
+                    if (!attachedDirs.Add(kv.Key)) continue;
+                    orphanDir.Name = kv.Value.Name;
+                    parentNode.Children.Add(orphanDir);
+                }
+                else
+                {
+                    var orphanFile = BuildApfsNodeFromInode(
+                        part, blockSize, kv.Key, kv.Value.Name, 8, kv.Value.ModTime,
+                        inodes, extentsByPrivId, symlinksByIno, inlineByIno, decmpfsSizeByIno);
+                    parentNode.Children.Add(orphanFile);
+                }
+            }
+
+            return root;
+        }
+
+        private static VirtualFsNode CloneApfsNodeShallowTree(VirtualFsNode src)
+        {
+            var copy = new VirtualFsNode
+            {
+                Name = src.Name,
+                FullPath = src.FullPath,
+                IsDirectory = src.IsDirectory,
+                SizeBytes = src.SizeBytes,
+                InodeOrObjectId = src.InodeOrObjectId,
+                PermissionsString = src.PermissionsString,
+                ModifiedUtc = src.ModifiedUtc,
+                ContentOffset = src.ContentOffset,
+                ContentLength = src.ContentLength,
+                InlineContent = src.InlineContent,
+                ContentExtents = src.ContentExtents
+            };
+            for (int i = 0; i < src.Children.Count; i++)
+                copy.Children.Add(CloneApfsNodeShallowTree(src.Children[i]));
+            return copy;
+        }
+
+        private static void MergeApfsEmptyDirectories(VirtualFsNode targetDir, VirtualFsNode sourceDir)
+        {
+            if (targetDir == null || sourceDir == null || !targetDir.IsDirectory || !sourceDir.IsDirectory) return;
+            var targetByName = new Dictionary<string, VirtualFsNode>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < targetDir.Children.Count; i++)
+                targetByName[targetDir.Children[i].Name] = targetDir.Children[i];
+
+            for (int i = 0; i < sourceDir.Children.Count; i++)
+            {
+                var srcChild = sourceDir.Children[i];
+                if (srcChild.IsDirectory && (srcChild.Name == "Volumes" || srcChild.Name == ".TempItems")) continue;
+                VirtualFsNode existing;
+                if (!targetByName.TryGetValue(srcChild.Name, out existing))
+                {
+                    targetDir.Children.Add(CloneApfsNodeShallowTree(srcChild));
+                }
+                else if (existing.IsDirectory && srcChild.IsDirectory && existing.Children.Count == 0 && srcChild.Children.Count > 0)
+                {
+                    for (int k = 0; k < srcChild.Children.Count; k++)
+                        existing.Children.Add(CloneApfsNodeShallowTree(srcChild.Children[k]));
+                }
+            }
+        }
+
+        private static void FinalizeMountedApfsTree(
+            MountedReadOnlyVolume vol, PartitionEntry part, int blockSize, ulong totalBlocks, List<ApfsParsedVolume> parsedVolumes)
+        {
+            int primaryIdx = 0;
+            int bestScore = -1;
+            ulong totalAllocBlocks = 0;
+            var volNames = new List<string>();
+
+            for (int i = 0; i < parsedVolumes.Count; i++)
+            {
+                var pv = parsedVolumes[i];
+                totalAllocBlocks += pv.AllocBlocks;
+                if (!string.IsNullOrEmpty(pv.VolumeName))
+                    volNames.Add(pv.VolumeName);
+
+                if (pv.RootNode == null) continue;
+                int score = pv.ParsedInodeCount + pv.ParsedDirLinkCount;
+                bool isSysMetaVol =
+                    string.Equals(pv.VolumeName, "Preboot", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(pv.VolumeName, "Recovery", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(pv.VolumeName, "VM", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(pv.VolumeName, "Update", StringComparison.OrdinalIgnoreCase);
+                if (!isSysMetaVol) score += 100000;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    primaryIdx = i;
+                }
+            }
+
+            var primary = parsedVolumes[primaryIdx];
+            if (string.IsNullOrEmpty(vol.Label) && !string.IsNullOrEmpty(primary.VolumeName))
+                vol.Label = primary.VolumeName;
+            if (string.IsNullOrEmpty(vol.UUID) && !string.IsNullOrEmpty(primary.VolumeUuid))
+                vol.UUID = primary.VolumeUuid;
+            if (vol.TotalBlocks <= 0)
+                vol.TotalBlocks = (long)totalBlocks;
+            if (totalAllocBlocks > 0 && (ulong)vol.TotalBlocks > totalAllocBlocks)
+                vol.FreeBlocks = vol.TotalBlocks - (long)totalAllocBlocks;
+
+            var root = primary.RootNode;
+            if (parsedVolumes.Count > 1)
+            {
+                var volumesDir = new VirtualFsNode
+                {
+                    Name = "Volumes",
+                    IsDirectory = true,
+                    PermissionsString = "drwxr-xr-x",
+                    InodeOrObjectId = 0xFFFFFF00UL
+                };
+                var usedVolDirNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                for (int i = 0; i < parsedVolumes.Count; i++)
+                {
+                    var pv = parsedVolumes[i];
+                    if (pv.RootNode == null) continue;
+                    if (i != primaryIdx)
+                        MergeApfsEmptyDirectories(root, pv.RootNode);
+
+                    string baseName = string.IsNullOrEmpty(pv.VolumeName) ? ("APFS_Volume_" + (i + 1)) : pv.VolumeName;
+                    string cleanName = baseName.Replace('/', '_').Replace('\\', '_');
+                    string uniqueName = cleanName;
+                    int suffix = 2;
+                    while (!usedVolDirNames.Add(uniqueName))
+                        uniqueName = cleanName + "_" + (suffix++);
+
+                    var volMountNode = CloneApfsNodeShallowTree(pv.RootNode);
+                    volMountNode.Name = uniqueName;
+                    volMountNode.IsDirectory = true;
+                    volumesDir.Children.Add(volMountNode);
+                }
+
+                if (volumesDir.Children.Count > 0)
+                {
+                    bool hasVolumesEntry = false;
+                    for (int i = 0; i < root.Children.Count; i++)
+                    {
+                        if (string.Equals(root.Children[i].Name, "Volumes", StringComparison.OrdinalIgnoreCase))
+                        {
+                            hasVolumesEntry = true;
+                            if (root.Children[i].IsDirectory)
+                            {
+                                for (int k = 0; k < volumesDir.Children.Count; k++)
+                                    root.Children[i].Children.Add(volumesDir.Children[k]);
+                            }
+                            break;
+                        }
+                    }
+                    if (!hasVolumesEntry)
+                        root.Children.Add(volumesDir);
+                }
+            }
+
+            SortAndAssignPaths(root, "/");
+            vol.SuperblockSummary = string.Format(
+                "Apple APFS ('{0}') | BlockSize={1} B | Volumes={2} | Inodes={3} | Read-Only",
+                string.IsNullOrEmpty(vol.Label) ? (volNames.Count > 0 ? volNames[0] : "APFS") : vol.Label,
+                blockSize,
+                parsedVolumes.Count,
+                primary.ParsedInodeCount);
+            vol.RootNode = root;
         }
 
         /// <summary>

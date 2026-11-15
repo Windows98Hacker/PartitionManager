@@ -71,6 +71,24 @@ namespace WinParted.UI
             if (SelectedPartitionChanged != null) SelectedPartitionChanged(this, _selectedPartition);
         }
 
+        /// <summary>
+        /// Collects distinct <see cref="FileSystemType"/> values in layout order for the ribbon legend.
+        /// </summary>
+        private List<FileSystemType> CollectLegendTypes()
+        {
+            var seen = new List<FileSystemType>();
+            for (int i = 0; i < _layout.Count; i++)
+            {
+                FileSystemType fs = _layout[i].FileSystem;
+                if (!seen.Contains(fs))
+                    seen.Add(fs);
+            }
+            return seen;
+        }
+
+        /// <summary>
+        /// Renders the proportional partition slices and the adaptive 1-to-2 row filesystem legend strip.
+        /// </summary>
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
@@ -80,9 +98,12 @@ namespace WinParted.UI
 
             _sliceRects.Clear();
 
-            int legendH = ThemeManager.F34;
+            var seen = CollectLegendTypes();
+            int innerOuterW = Width - ThemeManager.F13 * 2;
+            int legendRows = ComputeLegendRowCount(seen, innerOuterW);
+            int legendH = legendRows > 1 ? 38 : ThemeManager.F34;
             int outerH = Math.Max(ThemeManager.F55, Height - ThemeManager.F8 - ThemeManager.F5 - legendH - ThemeManager.F8);
-            Rectangle outer = new Rectangle(ThemeManager.F13, ThemeManager.F8, Width - ThemeManager.F13 * 2, outerH);
+            Rectangle outer = new Rectangle(ThemeManager.F13, ThemeManager.F8, innerOuterW, outerH);
             if (outer.Width <= ThemeManager.F21 || outer.Height <= ThemeManager.F21) return;
 
             RectangleF outerF = new RectangleF(outer.X, outer.Y, outer.Width, outer.Height);
@@ -156,61 +177,101 @@ namespace WinParted.UI
                 curX += w;
             }
 
-            DrawLegendStrip(g, new Rectangle(outer.Left, outer.Bottom + ThemeManager.F5, outer.Width, Math.Max(ThemeManager.F21, Height - outer.Bottom - ThemeManager.F13)));
+            int legendBottomPad = legendRows > 1 ? ThemeManager.F8 : ThemeManager.F13;
+            DrawLegendStrip(g, new Rectangle(outer.Left, outer.Bottom + ThemeManager.F5, outer.Width, Math.Max(ThemeManager.F21, Height - outer.Bottom - legendBottomPad)), seen, legendRows);
         }
 
-        private void DrawLegendStrip(Graphics g, Rectangle bounds)
+        /// <summary>
+        /// Determines whether the filesystem legend fits on a single row or should compress into two rows.
+        /// </summary>
+        private int ComputeLegendRowCount(List<FileSystemType> seen, int width)
         {
-            if (bounds.Height < 14 || bounds.Width < 60 || _layout.Count == 0) return;
-
-            var seen = new List<FileSystemType>();
-            for (int i = 0; i < _layout.Count; i++)
-            {
-                FileSystemType fs = _layout[i].FileSystem;
-                if (!seen.Contains(fs))
-                    seen.Add(fs);
-            }
+            if (seen == null || seen.Count == 0 || width < 60)
+                return 1;
 
             using (var legendFont = new Font("Segoe UI", 8.2f, FontStyle.Regular))
-            using (var phiFont = new Font("Segoe UI", 8.0f, FontStyle.Bold))
+            using (var scaleFont = new Font("Segoe UI", 8.0f, FontStyle.Bold))
+            {
+                int badgeReserve = 0;
+                if (width >= ThemeManager.F377)
+                {
+                    string scaleLabel = _smartScale ? "Smart Scale" : "Linear Scale";
+                    Size scaleSize = TextRenderer.MeasureText(scaleLabel, scaleFont);
+                    badgeReserve = scaleSize.Width + ThemeManager.F8 + ThemeManager.F13;
+                }
+
+                int x = ThemeManager.F3;
+                int maxRight = width - badgeReserve;
+                int swatchSize = ThemeManager.F13;
+                foreach (FileSystemType fs in seen)
+                {
+                    string label = FileSystemColors.GetDisplayName(fs);
+                    Size textSize = TextRenderer.MeasureText(label, legendFont);
+                    if (x + swatchSize + ThemeManager.F5 + textSize.Width > maxRight)
+                        return 2;
+                    x += swatchSize + ThemeManager.F5 + textSize.Width + ThemeManager.F21;
+                }
+            }
+            return 1;
+        }
+
+        /// <summary>
+        /// Draws the filesystem color swatches and labels across one or two horizontal rows.
+        /// </summary>
+        private void DrawLegendStrip(Graphics g, Rectangle bounds, List<FileSystemType> seen, int legendRows)
+        {
+            if (bounds.Height < 14 || bounds.Width < 60 || seen == null || seen.Count == 0) return;
+
+            using (var legendFont = new Font("Segoe UI", 8.2f, FontStyle.Regular))
+            using (var scaleFont = new Font("Segoe UI", 8.0f, FontStyle.Bold))
             using (var borderPen = new Pen(ThemeManager.BorderColor, 1f))
             {
-                // Reserve right side for Golden Ratio scale badge when width suffices
+                int rowH = legendRows > 1 ? Math.Max(14, bounds.Height / 2) : bounds.Height;
+
+                // Reserve right side of row 0 for scale mode label when width suffices
                 int badgeReserve = 0;
                 if (bounds.Width >= ThemeManager.F377)
                 {
-                    string scaleLabel = _smartScale ? "\u03C6 Golden Scale" : "\u03C6 Linear Scale";
-                    Size scaleSize = TextRenderer.MeasureText(scaleLabel, phiFont);
-                    int spirW = ThemeManager.F21;
-                    int spirH = ThemeManager.F13;
-                    int totalBadgeW = spirW + ThemeManager.F5 + scaleSize.Width + ThemeManager.F8;
+                    string scaleLabel = _smartScale ? "Smart Scale" : "Linear Scale";
+                    Size scaleSize = TextRenderer.MeasureText(scaleLabel, scaleFont);
+                    int totalBadgeW = scaleSize.Width + ThemeManager.F8;
                     int bx = bounds.Right - totalBadgeW;
-                    int byMid = bounds.Top + bounds.Height / 2;
 
-                    ThemeManager.DrawGoldenSpiralBadge(
-                        g,
-                        new Rectangle(bx, byMid - spirH / 2, spirW, spirH),
-                        ThemeManager.BorderColor,
-                        ThemeManager.AccentGold);
-
-                    Rectangle scaleRect = new Rectangle(bx + spirW + ThemeManager.F5, bounds.Top, scaleSize.Width + 2, bounds.Height);
-                    TextRenderer.DrawText(g, scaleLabel, phiFont, scaleRect, ThemeManager.AccentGold,
+                    Rectangle scaleRect = new Rectangle(bx, bounds.Top, scaleSize.Width + 2, rowH);
+                    TextRenderer.DrawText(g, scaleLabel, scaleFont, scaleRect, ThemeManager.TextSecondary,
                         TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
                     badgeReserve = totalBadgeW + ThemeManager.F13;
                 }
 
+                int row = 0;
                 int x = bounds.Left + ThemeManager.F3;
                 int maxRight = bounds.Right - badgeReserve;
-                int yMid = bounds.Top + bounds.Height / 2;
-                int swatchSize = ThemeManager.F13;
+                int swatchSize = legendRows > 1 ? Math.Max(10, ThemeManager.F13 - 2) : ThemeManager.F13;
 
                 foreach (FileSystemType fs in seen)
                 {
                     string label = FileSystemColors.GetDisplayName(fs);
                     Size textSize = TextRenderer.MeasureText(label, legendFont);
-                    int itemWidth = swatchSize + ThemeManager.F5 + textSize.Width + ThemeManager.F21;
+                    int itemWidth = swatchSize + ThemeManager.F5 + textSize.Width + (legendRows > 1 ? ThemeManager.F13 : ThemeManager.F21);
+
                     if (x + swatchSize + ThemeManager.F5 + textSize.Width > maxRight)
-                        break;
+                    {
+                        if (row == 0 && legendRows > 1)
+                        {
+                            row = 1;
+                            x = bounds.Left + ThemeManager.F3;
+                            maxRight = bounds.Right - ThemeManager.F3;
+                            if (x + swatchSize + ThemeManager.F5 + textSize.Width > maxRight)
+                                break;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+
+                    int rowTop = bounds.Top + row * rowH;
+                    int yMid = rowTop + rowH / 2;
 
                     RectangleF swatchF = new RectangleF(x, yMid - swatchSize / 2f, swatchSize, swatchSize);
                     using (GraphicsPath sp = ThemeManager.CreateRoundedRectPath(swatchF, ThemeManager.F3))
@@ -220,7 +281,7 @@ namespace WinParted.UI
                         g.DrawPath(borderPen, sp);
                     }
 
-                    Rectangle textRect = new Rectangle(x + swatchSize + ThemeManager.F5, bounds.Top, textSize.Width + 2, bounds.Height);
+                    Rectangle textRect = new Rectangle(x + swatchSize + ThemeManager.F5, rowTop, textSize.Width + 2, rowH);
                     TextRenderer.DrawText(g, label, legendFont, textRect, ThemeManager.TextSecondary,
                         TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
 
@@ -229,6 +290,10 @@ namespace WinParted.UI
             }
         }
 
+        /// <summary>
+        /// Draws a single partition slice (or hatched unallocated block), its used-space bar, selection
+        /// glow, and center label pill fitted to the slice width.
+        /// </summary>
         private void DrawPartitionSlice(Graphics g, RectangleF rect, PartitionEntry part, bool isSelected, bool isHovered)
         {
             Color borderColor = FileSystemColors.GetBorderColor(part.FileSystem);
@@ -376,20 +441,6 @@ namespace WinParted.UI
                             {
                                 RectangleF r3 = new RectangleF(rect.X + 5f, startY + h1 + 3f, maxTextAreaW, h3);
                                 g.DrawString(botText, subFont, darkBr, r3, sf);
-                            }
-
-                            if (isSelected && rect.Width >= ThemeManager.F89)
-                            {
-                                using (var phiBadgeFont = new Font("Segoe UI", 7.5f, FontStyle.Bold))
-                                {
-                                    TextRenderer.DrawText(
-                                        g,
-                                        "\u03C6",
-                                        phiBadgeFont,
-                                        new Rectangle((int)rect.Right - ThemeManager.F21, (int)rect.Y + ThemeManager.F3, ThemeManager.F21, ThemeManager.F13),
-                                        ThemeManager.AccentGold,
-                                        TextFormatFlags.Right | TextFormatFlags.Top | TextFormatFlags.NoPrefix);
-                                }
                             }
                         }
                     }
