@@ -1,6 +1,6 @@
 # WinParted
 
-A GParted-inspired disk and partition manager for **32-bit (x86)** and **64-bit (x64)** Windows, featuring a Google Material Design 3 light/dark UI, non-destructive operation queuing, raw sector inspection, full native Apple/Linux/optical read-only mounting, and an experimental write overlay.
+A GParted-inspired disk and partition manager for **32-bit (x86)** and **64-bit (x64)** Windows, featuring non-destructive operation queuing, raw sector inspection, full native Apple/Linux/optical read-only mounting, and an experimental write overlay.
 
 Entirely experimental and vibe-coded. I don't know a thing about programming, but I do know that I dislike the windows partition manager, and have had great success with gparted on linux. I wanted this to be freely available for windows, but found that my only options were rather terrible and pay to use. I think that sucks. So I told AI to make this in hopes that this creates a better alternative to what is already available.
 
