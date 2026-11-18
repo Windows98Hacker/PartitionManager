@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 using WinParted.Core;
 using WinParted.Interop;
@@ -1118,6 +1121,737 @@ namespace WinParted.UI.Dialogs
                 btnClose.Focus();
             };
             ThemeManager.ApplyTheme(this);
+        }
+    }
+
+    /// <summary>
+    /// Flicker-free custom progress bar supporting deterministic percentage fills and animated indeterminate
+    /// pulses in both Light and Dark themes.
+    /// </summary>
+    internal sealed class SmoothProgressBar : Control
+    {
+        private int _value;
+        private bool _isIndeterminate;
+        private float _pulsePhase;
+        private Color _barColor = Color.Empty;
+        private string _overlayText = string.Empty;
+
+        public SmoothProgressBar()
+        {
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw |
+                ControlStyles.UserPaint,
+                true);
+            DoubleBuffered = true;
+            Height = 24;
+        }
+
+        public int Value
+        {
+            get { return _value; }
+            set
+            {
+                int clamped = Math.Max(0, Math.Min(100, value));
+                if (_value != clamped)
+                {
+                    _value = clamped;
+                    Invalidate();
+                }
+            }
+        }
+
+        public bool IsIndeterminate
+        {
+            get { return _isIndeterminate; }
+            set
+            {
+                if (_isIndeterminate != value)
+                {
+                    _isIndeterminate = value;
+                    Invalidate();
+                }
+            }
+        }
+
+        public Color BarColor
+        {
+            get { return _barColor; }
+            set
+            {
+                if (_barColor != value)
+                {
+                    _barColor = value;
+                    Invalidate();
+                }
+            }
+        }
+
+        public string OverlayText
+        {
+            get { return _overlayText; }
+            set
+            {
+                string next = value ?? string.Empty;
+                if (!string.Equals(_overlayText, next, StringComparison.Ordinal))
+                {
+                    _overlayText = next;
+                    Invalidate();
+                }
+            }
+        }
+
+        public void AdvancePulse()
+        {
+            if (!_isIndeterminate) return;
+            _pulsePhase += 0.065f;
+            if (_pulsePhase > 1.35f)
+                _pulsePhase = -0.35f;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (ClientSize.Width < 4 || ClientSize.Height < 4) return;
+
+            Graphics g = e.Graphics;
+            SmoothingMode prevMode = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            var outerRect = new RectangleF(0.5f, 0.5f, ClientSize.Width - 1f, ClientSize.Height - 1f);
+            Color fillBase = _barColor.IsEmpty ? ThemeManager.AccentBlue : _barColor;
+            RectangleF fillClipRect = RectangleF.Empty;
+
+            using (GraphicsPath trackPath = ThemeManager.CreateRoundedRectPath(outerRect, 6f))
+            using (var trackBrush = new SolidBrush(ThemeManager.BackContainerHigh))
+            using (var borderPen = new Pen(ThemeManager.BorderColor, 1f))
+            {
+                g.FillPath(trackBrush, trackPath);
+
+                Region prevClip = g.Clip;
+                g.SetClip(trackPath);
+
+                if (_isIndeterminate)
+                {
+                    float segW = Math.Max(48f, ClientSize.Width * 0.28f);
+                    float segX = _pulsePhase * ClientSize.Width - segW * 0.3f;
+                    var pulseRect = new RectangleF(segX, 1f, segW, ClientSize.Height - 2f);
+                    using (var pulseBrush = new LinearGradientBrush(
+                        pulseRect,
+                        Color.FromArgb(40, fillBase),
+                        fillBase,
+                        LinearGradientMode.Horizontal))
+                    {
+                        var cb = new ColorBlend(3);
+                        cb.Positions = new float[] { 0f, 0.5f, 1f };
+                        cb.Colors = new Color[]
+                        {
+                            Color.FromArgb(30, fillBase),
+                            fillBase,
+                            Color.FromArgb(30, fillBase)
+                        };
+                        pulseBrush.InterpolationColors = cb;
+                        g.FillRectangle(pulseBrush, pulseRect);
+                    }
+                    fillClipRect = pulseRect;
+                }
+                else if (_value > 0)
+                {
+                    float fillW = Math.Max(4f, (ClientSize.Width - 2f) * (_value / 100f));
+                    fillClipRect = new RectangleF(1f, 1f, fillW, ClientSize.Height - 2f);
+                    Color lighter = ControlPaint.Light(fillBase, 0.16f);
+                    using (var fillBrush = new LinearGradientBrush(
+                        fillClipRect,
+                        lighter,
+                        fillBase,
+                        LinearGradientMode.Vertical))
+                    {
+                        g.FillRectangle(fillBrush, fillClipRect);
+                    }
+                }
+
+                string text = !string.IsNullOrEmpty(_overlayText)
+                    ? _overlayText
+                    : (_isIndeterminate ? "Working..." : string.Format("{0}%", _value));
+
+                Rectangle textBounds = ClientRectangle;
+                using (var textFont = new Font("Segoe UI", 8.5f, FontStyle.Bold))
+                {
+                    TextFormatFlags tff = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+                    TextRenderer.DrawText(g, text, textFont, textBounds, ThemeManager.TextPrimary, tff);
+
+                    if (!fillClipRect.IsEmpty && fillClipRect.Width > 2f)
+                    {
+                        g.SetClip(trackPath);
+                        g.IntersectClip(fillClipRect);
+                        TextRenderer.DrawText(g, text, textFont, textBounds, Color.White, tff);
+                    }
+                }
+
+                g.Clip = prevClip;
+                g.DrawPath(borderPen, trackPath);
+            }
+
+            g.SmoothingMode = prevMode;
+        }
+    }
+
+    /// <summary>
+    /// Non-blocking modal progress monitor that runs queued disk operations on a background thread
+    /// and displays overall progress, active sub-stage, MiB/s throughput, per-operation status,
+    /// and a live execution log without freezing the UI thread.
+    /// </summary>
+    public sealed class ApplyOperationsProgressDialog : Form
+    {
+        private sealed class OperationRowState
+        {
+            public string StatusText;
+            public string PercentText;
+            public string ElapsedText;
+            public DateTime? StartedUtc;
+            public DateTime? FinishedUtc;
+            public bool IsActive;
+            public bool IsDone;
+            public bool IsFailed;
+        }
+
+        private readonly OperationQueueManager _queueManager;
+        private readonly object _sync = new object();
+        private readonly OperationRowState[] _rowStates;
+        private readonly Queue<string> _pendingLogs = new Queue<string>();
+        private readonly Stopwatch _totalSw = new Stopwatch();
+        private readonly System.Windows.Forms.Timer _uiTimer;
+
+        private readonly Label _lblOpHeader;
+        private readonly Label _lblElapsed;
+        private readonly Label _lblStage;
+        private readonly Label _lblByteMetric;
+        private readonly Label _lblBottomHint;
+        private readonly SmoothProgressBar _barOverall;
+        private readonly SmoothProgressBar _barCurrent;
+        private readonly ListView _lvOps;
+        private readonly TextBox _txtLog;
+        private readonly Button _btnCopyLog;
+        private readonly Button _btnClose;
+
+        private OperationProgressReport _latestReport;
+        private volatile bool _isRunning;
+        private volatile bool _workerFinished;
+
+        public List<string> AppliedResults { get; private set; }
+        public Exception ExecutionError { get; private set; }
+        public bool CompletedSuccessfully
+        {
+            get { return !_isRunning && _workerFinished && ExecutionError == null && AppliedResults != null; }
+        }
+
+        public ApplyOperationsProgressDialog(OperationQueueManager queueManager)
+        {
+            if (queueManager == null) throw new ArgumentNullException("queueManager");
+            _queueManager = queueManager;
+
+            int count = _queueManager.Queue.Count;
+            _rowStates = new OperationRowState[count];
+            for (int i = 0; i < count; i++)
+            {
+                _rowStates[i] = new OperationRowState
+                {
+                    StatusText = "Queued",
+                    PercentText = "0%",
+                    ElapsedText = "-"
+                };
+            }
+
+            Text = count == 1
+                ? "Applying 1 Partition Operation"
+                : string.Format("Applying {0} Pending Partition Operations", count);
+            Size = new Size(920, 620);
+            MinimumSize = new Size(720, 480);
+            StartPosition = FormStartPosition.CenterParent;
+            MaximizeBox = true;
+            MinimizeBox = false;
+            Font = new Font("Segoe UI", 9f);
+
+            var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F13) };
+            Controls.Add(root);
+
+            var headerPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 188,
+                Padding = new Padding(ThemeManager.F13),
+                Tag = "SurfacePanel"
+            };
+
+            var titleRow = new Panel { Dock = DockStyle.Top, Height = 28 };
+            _lblElapsed = new Label
+            {
+                Dock = DockStyle.Right,
+                AutoSize = true,
+                Text = "Elapsed: 00:00.0",
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = ThemeManager.AccentGold,
+                TextAlign = ContentAlignment.MiddleRight,
+                Tag = "KeepForeColor"
+            };
+            _lblOpHeader = new Label
+            {
+                Dock = DockStyle.Fill,
+                Text = count > 0
+                    ? string.Format("Preparing {0} pending operation{1}...", count, count == 1 ? "" : "s")
+                    : "No operations queued.",
+                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                UseMnemonic = false
+            };
+            titleRow.Controls.Add(_lblOpHeader);
+            titleRow.Controls.Add(_lblElapsed);
+
+            _lblStage = new Label
+            {
+                Dock = DockStyle.Top,
+                Height = 24,
+                Text = "Initializing partition execution worker...",
+                Font = new Font("Segoe UI", 9f),
+                ForeColor = ThemeManager.TextSecondary,
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                UseMnemonic = false,
+                Tag = "KeepForeColor"
+            };
+
+            var lblOverall = new Label
+            {
+                Dock = DockStyle.Top,
+                Height = 20,
+                Text = "Overall Queue Progress:",
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                TextAlign = ContentAlignment.BottomLeft
+            };
+            _barOverall = new SmoothProgressBar { Dock = DockStyle.Top, Height = 26 };
+
+            var currentHeaderRow = new Panel { Dock = DockStyle.Top, Height = 24 };
+            var lblCurrent = new Label
+            {
+                Dock = DockStyle.Left,
+                AutoSize = true,
+                Text = "Current Operation Progress:",
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                TextAlign = ContentAlignment.BottomLeft
+            };
+            _lblByteMetric = new Label
+            {
+                Dock = DockStyle.Right,
+                AutoSize = true,
+                Text = string.Empty,
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = ThemeManager.TextSecondary,
+                TextAlign = ContentAlignment.BottomRight,
+                UseMnemonic = false,
+                Tag = "KeepForeColor"
+            };
+            currentHeaderRow.Controls.Add(lblCurrent);
+            currentHeaderRow.Controls.Add(_lblByteMetric);
+
+            _barCurrent = new SmoothProgressBar { Dock = DockStyle.Top, Height = 26 };
+
+            // Dock=Top controls stack in reverse Add order cleanly
+            headerPanel.Controls.Add(_barCurrent);
+            headerPanel.Controls.Add(currentHeaderRow);
+            headerPanel.Controls.Add(_barOverall);
+            headerPanel.Controls.Add(lblOverall);
+            headerPanel.Controls.Add(_lblStage);
+            headerPanel.Controls.Add(titleRow);
+
+            var split = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Horizontal,
+                SplitterWidth = 6,
+                Panel1MinSize = 110,
+                Panel2MinSize = 110
+            };
+
+            _lvOps = new ListView
+            {
+                Dock = DockStyle.Fill,
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = false,
+                HideSelection = false,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            _lvOps.Columns.Add("#", 38);
+            _lvOps.Columns.Add("Disk", 96);
+            _lvOps.Columns.Add("Operation", 360);
+            _lvOps.Columns.Add("Status", 128);
+            _lvOps.Columns.Add("Progress", 76);
+            _lvOps.Columns.Add("Time", 76);
+
+            for (int i = 0; i < count; i++)
+            {
+                var op = _queueManager.Queue[i];
+                var d = _queueManager.GetBaselineDisk(op.TargetDiskNumber);
+                string diskTag = (d != null && d.IsVirtualImage)
+                    ? "Virtual #" + op.TargetDiskNumber
+                    : "Disk " + op.TargetDiskNumber;
+
+                var item = new ListViewItem((i + 1).ToString());
+                item.UseItemStyleForSubItems = false;
+                item.SubItems.Add(diskTag);
+                item.SubItems.Add(op.Summary ?? op.Type.ToString());
+                var stSub = item.SubItems.Add("Queued");
+                stSub.ForeColor = ThemeManager.TextSecondary;
+                item.SubItems.Add("0%");
+                item.SubItems.Add("-");
+                _lvOps.Items.Add(item);
+            }
+            split.Panel1.Controls.Add(_lvOps);
+
+            _txtLog = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                WordWrap = false,
+                ScrollBars = ScrollBars.Both,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Consolas", 9f),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.FromArgb(203, 213, 225),
+                Tag = "ConsoleColors"
+            };
+            split.Panel2.Controls.Add(_txtLog);
+
+            var bottomBar = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = ThemeManager.F55,
+                Padding = new Padding(0, ThemeManager.F8, 0, 0)
+            };
+
+            var btnFlow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Right,
+                Width = 250,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(0, 2, 0, 2)
+            };
+            _btnClose = new Button
+            {
+                Text = "Running...",
+                Enabled = false,
+                DialogResult = DialogResult.OK,
+                Size = new Size(105, ThemeManager.F34),
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0),
+                Tag = "PrimaryButton"
+            };
+            _btnCopyLog = new Button
+            {
+                Text = "Copy Log",
+                Size = new Size(105, ThemeManager.F34),
+                Margin = new Padding(0),
+                Tag = "TonalButton"
+            };
+            _btnCopyLog.Click += (s, e) =>
+            {
+                try
+                {
+                    if (!string.IsNullOrEmpty(_txtLog.Text))
+                        Clipboard.SetText(_txtLog.Text);
+                }
+                catch { }
+            };
+            btnFlow.Controls.Add(_btnClose);
+            btnFlow.Controls.Add(_btnCopyLog);
+
+            _lblBottomHint = new Label
+            {
+                Dock = DockStyle.Fill,
+                Text = "Applying changes in background — please wait for all disk operations to finish.",
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = ThemeManager.TextSecondary,
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                UseMnemonic = false,
+                Tag = "KeepForeColor"
+            };
+            bottomBar.Controls.Add(_lblBottomHint);
+            bottomBar.Controls.Add(btnFlow);
+
+            root.Controls.Add(split);
+            root.Controls.Add(headerPanel);
+            root.Controls.Add(bottomBar);
+
+            AcceptButton = _btnClose;
+            CancelButton = _btnClose;
+            ThemeManager.ApplyTheme(this);
+
+            Action autoSizeOpsColumns = () =>
+            {
+                if (_lvOps == null || _lvOps.Columns.Count < 6) return;
+                int fixedW = _lvOps.Columns[0].Width + _lvOps.Columns[1].Width +
+                             _lvOps.Columns[3].Width + _lvOps.Columns[4].Width + _lvOps.Columns[5].Width + 4;
+                int opW = Math.Max(220, _lvOps.ClientSize.Width - fixedW);
+                if (_lvOps.Columns[2].Width != opW)
+                    _lvOps.Columns[2].Width = opW;
+            };
+            _lvOps.SizeChanged += (s, e) => autoSizeOpsColumns();
+
+            _uiTimer = new System.Windows.Forms.Timer { Interval = 75 };
+            _uiTimer.Tick += (s, e) => FlushUiState();
+
+            Shown += (s, e) =>
+            {
+                ThemeManager.ApplyGoldenSplitter(split, false, 110, 110);
+                autoSizeOpsColumns();
+                StartExecutionWorker();
+            };
+
+            FormClosing += (s, e) =>
+            {
+                if (_isRunning && e.CloseReason == CloseReason.UserClosing)
+                {
+                    e.Cancel = true;
+                    System.Media.SystemSounds.Beep.Play();
+                    return;
+                }
+                _uiTimer.Stop();
+            };
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && _uiTimer != null)
+            {
+                _uiTimer.Stop();
+                _uiTimer.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        private void StartExecutionWorker()
+        {
+            if (_isRunning || _workerFinished) return;
+            _isRunning = true;
+            _totalSw.Restart();
+            _uiTimer.Start();
+
+            var worker = new Thread(() =>
+            {
+                try
+                {
+                    AppliedResults = _queueManager.ApplyAll(null, OnWorkerProgress);
+                }
+                catch (Exception ex)
+                {
+                    ExecutionError = ex;
+                    lock (_sync)
+                    {
+                        _pendingLogs.Enqueue("[FATAL] " + ex.Message);
+                    }
+                }
+                finally
+                {
+                    _totalSw.Stop();
+                    _isRunning = false;
+                    _workerFinished = true;
+                    try
+                    {
+                        if (IsHandleCreated && !IsDisposed)
+                            BeginInvoke(new MethodInvoker(FlushUiState));
+                    }
+                    catch { }
+                }
+            });
+            worker.IsBackground = true;
+            worker.Name = "WinParted-OperationWorker";
+            worker.Start();
+        }
+
+        private void OnWorkerProgress(OperationProgressReport report)
+        {
+            if (report == null) return;
+            lock (_sync)
+            {
+                _latestReport = report;
+                if (!string.IsNullOrEmpty(report.LogLine))
+                    _pendingLogs.Enqueue(report.LogLine);
+
+                int idx = report.OperationIndex;
+                if (idx >= 0 && idx < _rowStates.Length)
+                {
+                    OperationRowState rs = _rowStates[idx];
+                    if (!rs.StartedUtc.HasValue)
+                        rs.StartedUtc = DateTime.UtcNow;
+                    rs.IsActive = !report.IsOperationComplete && !report.IsOperationFailed;
+                    rs.PercentText = report.IsIndeterminateStage && !report.IsOperationComplete && !report.IsOperationFailed
+                        ? "..."
+                        : string.Format("{0}%", report.OperationPercent);
+
+                    if (report.IsOperationComplete)
+                    {
+                        rs.IsDone = true;
+                        rs.IsFailed = false;
+                        rs.StatusText = "Completed";
+                        rs.PercentText = "100%";
+                        rs.FinishedUtc = DateTime.UtcNow;
+                    }
+                    else if (report.IsOperationFailed)
+                    {
+                        rs.IsFailed = true;
+                        rs.IsDone = false;
+                        rs.StatusText = "Failed";
+                        rs.FinishedUtc = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        rs.StatusText = "Running";
+                    }
+                }
+            }
+        }
+
+        private void FlushUiState()
+        {
+            OperationProgressReport report;
+            var newLogs = new List<string>();
+            bool finished;
+            Exception err;
+
+            lock (_sync)
+            {
+                report = _latestReport;
+                while (_pendingLogs.Count > 0)
+                    newLogs.Add(_pendingLogs.Dequeue());
+                finished = _workerFinished;
+                err = ExecutionError;
+            }
+
+            TimeSpan totalElapsed = _totalSw.Elapsed;
+            _lblElapsed.Text = string.Format("Elapsed: {0:00}:{1:00}.{2}",
+                (int)totalElapsed.TotalMinutes, totalElapsed.Seconds, totalElapsed.Milliseconds / 100);
+
+            if (report != null)
+            {
+                _lblOpHeader.Text = string.Format("Operation {0} of {1}: {2}",
+                    report.OperationIndex + 1,
+                    Math.Max(1, report.TotalOperations),
+                    report.OperationSummary ?? string.Empty);
+                _lblStage.Text = report.CurrentStage ?? string.Empty;
+                _barOverall.Value = report.OverallPercent;
+                _barCurrent.IsIndeterminate = report.IsIndeterminateStage && !finished;
+                _barCurrent.Value = report.OperationPercent;
+
+                if (report.BytesTotal > 0)
+                {
+                    _lblByteMetric.Text = string.Format("{0} / {1} ({2:F1} MiB/s)",
+                        ByteFormatter.FormatBytes(report.BytesProcessed),
+                        ByteFormatter.FormatBytes(report.BytesTotal),
+                        report.ThroughputMiBPerSec);
+                }
+                else
+                {
+                    _lblByteMetric.Text = report.IsIndeterminateStage ? "External tool active..." : string.Empty;
+                }
+            }
+
+            if (_barCurrent.IsIndeterminate)
+                _barCurrent.AdvancePulse();
+
+            for (int i = 0; i < _rowStates.Length && i < _lvOps.Items.Count; i++)
+            {
+                string statusText;
+                string percentText;
+                string baseElapsedText;
+                DateTime? startedUtc;
+                DateTime? finishedUtc;
+                bool isDone;
+                bool isFailed;
+                bool isActive;
+
+                lock (_sync)
+                {
+                    OperationRowState rs = _rowStates[i];
+                    statusText = rs.StatusText;
+                    percentText = rs.PercentText;
+                    baseElapsedText = rs.ElapsedText;
+                    startedUtc = rs.StartedUtc;
+                    finishedUtc = rs.FinishedUtc;
+                    isDone = rs.IsDone;
+                    isFailed = rs.IsFailed;
+                    isActive = rs.IsActive;
+                }
+
+                string elapsedStr = baseElapsedText;
+                if (startedUtc.HasValue)
+                {
+                    DateTime endT = finishedUtc.HasValue ? finishedUtc.Value : DateTime.UtcNow;
+                    double sec = Math.Max(0.0, (endT - startedUtc.Value).TotalSeconds);
+                    elapsedStr = string.Format("{0:F1}s", sec);
+                }
+
+                ListViewItem item = _lvOps.Items[i];
+                if (item.SubItems[3].Text != statusText)
+                    item.SubItems[3].Text = statusText;
+                if (item.SubItems[4].Text != percentText)
+                    item.SubItems[4].Text = percentText;
+                if (item.SubItems[5].Text != elapsedStr)
+                    item.SubItems[5].Text = elapsedStr;
+
+                Color stColor = isDone
+                    ? ThemeManager.AccentGreen
+                    : (isFailed ? ThemeManager.AccentRed : (isActive ? ThemeManager.AccentGold : ThemeManager.TextSecondary));
+                if (item.SubItems[3].ForeColor != stColor)
+                    item.SubItems[3].ForeColor = stColor;
+            }
+
+            if (newLogs.Count > 0)
+            {
+                var sb = new StringBuilder();
+                foreach (string line in newLogs)
+                    sb.AppendLine(line);
+                _txtLog.AppendText(sb.ToString());
+                _txtLog.SelectionStart = _txtLog.TextLength;
+                _txtLog.ScrollToCaret();
+            }
+
+            if (finished)
+            {
+                _uiTimer.Stop();
+                _barCurrent.IsIndeterminate = false;
+
+                if (err == null)
+                {
+                    _barOverall.BarColor = ThemeManager.AccentGreen;
+                    _barCurrent.BarColor = ThemeManager.AccentGreen;
+                    _barOverall.Value = 100;
+                    _barCurrent.Value = 100;
+                    _barOverall.OverlayText = "100% — Complete";
+                    _barCurrent.OverlayText = "100% — Verified";
+                    _lblOpHeader.Text = "All queued partition operations completed and verified.";
+                    _lblStage.Text = string.Format("Finished {0} operation{1} in {2:F2}s.",
+                        _rowStates.Length, _rowStates.Length == 1 ? "" : "s", totalElapsed.TotalSeconds);
+                    _lblBottomHint.Text = "All operations succeeded. Click Done to return to WinParted.";
+                    _lblBottomHint.ForeColor = ThemeManager.AccentGreen;
+                }
+                else
+                {
+                    _barOverall.BarColor = ThemeManager.AccentRed;
+                    _barCurrent.BarColor = ThemeManager.AccentRed;
+                    _lblOpHeader.Text = "Partition operation halted due to an error.";
+                    _lblStage.Text = err.Message;
+                    _lblBottomHint.Text = "Execution failed — inspect the log output before closing.";
+                    _lblBottomHint.ForeColor = ThemeManager.AccentRed;
+                }
+
+                _btnClose.Text = "Done";
+                _btnClose.Enabled = true;
+                _btnClose.Focus();
+            }
         }
     }
 }

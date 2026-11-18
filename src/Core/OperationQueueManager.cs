@@ -4,11 +4,32 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using WinParted.Interop;
 using WinParted.Models;
 
 namespace WinParted.Core
 {
+    /// <summary>
+    /// Snapshot of progress, throughput, and status log details emitted during queued operation execution.
+    /// </summary>
+    public sealed class OperationProgressReport
+    {
+        public int OperationIndex { get; set; }
+        public int TotalOperations { get; set; }
+        public string OperationSummary { get; set; }
+        public string CurrentStage { get; set; }
+        public int OperationPercent { get; set; }
+        public int OverallPercent { get; set; }
+        public long BytesProcessed { get; set; }
+        public long BytesTotal { get; set; }
+        public double ThroughputMiBPerSec { get; set; }
+        public bool IsIndeterminateStage { get; set; }
+        public string LogLine { get; set; }
+        public bool IsOperationComplete { get; set; }
+        public bool IsOperationFailed { get; set; }
+    }
+
     /// <summary>
     /// Coordinates non-destructive queued partition operations, simulated UI layout previews
     /// (<see cref="GetPreviewDisk"/>), overlap/bounds validation, and transactional execution against
@@ -370,7 +391,7 @@ namespace WinParted.Core
         /// Executes all queued operations sequentially across virtual and physical disks, updating
         /// baseline models as each operation succeeds.
         /// </summary>
-        public List<string> ApplyAll(Action<int, string> progressCallback = null)
+        public List<string> ApplyAll(Action<int, string> progressCallback = null, Action<OperationProgressReport> detailedProgress = null)
         {
             var log = new List<string>();
             if (_queue.Count == 0)
@@ -382,28 +403,54 @@ namespace WinParted.Core
             for (int i = 0; i < total; i++)
             {
                 var op = _queue[i];
-                int pct = (int)((i * 100.0) / total);
-                if (progressCallback != null) progressCallback(pct, "Executing: " + op.Summary);
+                ReportProgress(progressCallback, detailedProgress, i, total, op.Summary, 0,
+                    "Preparing: " + op.Summary,
+                    logLine: string.Format("[{0}/{1}] Starting: {2}", i + 1, total, op.Summary));
 
-                var disk = GetBaselineDisk(op.TargetDiskNumber);
-                if (disk == null)
-                    throw new InvalidOperationException("Target disk #" + op.TargetDiskNumber + " not found.");
-
-                if (disk.IsVirtualImage)
+                try
                 {
-                    ExecuteVirtualDiskOperation(disk, op);
-                    log.Add("[OK] Virtual Disk: " + op.Summary);
-                }
-                else
-                {
-                    ExecutePhysicalDiskOperation(disk, op);
-                    log.Add("[OK] Physical Disk: " + op.Summary);
-                    var freshPhysical = Win32DiskInterop.EnumeratePhysicalDisks();
-                    var virtuals = _baselineDisks.Where(d => d.IsVirtualImage).ToList();
-                    SetBaselineDisks(freshPhysical, virtuals);
-                }
+                    var disk = GetBaselineDisk(op.TargetDiskNumber);
+                    if (disk == null)
+                        throw new InvalidOperationException("Target disk #" + op.TargetDiskNumber + " not found.");
 
-                executed.Add(op);
+                    if (disk.IsVirtualImage)
+                    {
+                        ExecuteVirtualDiskOperation(disk, op, i, total, progressCallback, detailedProgress);
+                        string okLine = "[OK] Virtual Disk: " + op.Summary;
+                        log.Add(okLine);
+                        ReportProgress(progressCallback, detailedProgress, i, total, op.Summary, 100,
+                            "Completed: " + op.Summary,
+                            logLine: okLine,
+                            isComplete: true);
+                    }
+                    else
+                    {
+                        ExecutePhysicalDiskOperation(disk, op, i, total, progressCallback, detailedProgress);
+                        ReportProgress(progressCallback, detailedProgress, i, total, op.Summary, 96,
+                            "Refreshing physical disk layout...",
+                            indeterminate: true);
+                        var freshPhysical = Win32DiskInterop.EnumeratePhysicalDisks();
+                        var virtuals = _baselineDisks.Where(d => d.IsVirtualImage).ToList();
+                        SetBaselineDisks(freshPhysical, virtuals);
+
+                        string okLine = "[OK] Physical Disk: " + op.Summary;
+                        log.Add(okLine);
+                        ReportProgress(progressCallback, detailedProgress, i, total, op.Summary, 100,
+                            "Completed: " + op.Summary,
+                            logLine: okLine,
+                            isComplete: true);
+                    }
+
+                    executed.Add(op);
+                }
+                catch (Exception ex)
+                {
+                    ReportProgress(progressCallback, detailedProgress, i, total, op.Summary, 100,
+                        "Failed: " + ex.Message,
+                        logLine: "[ERR] " + op.Summary + ": " + ex.Message,
+                        isFailed: true);
+                    throw;
+                }
             }
 
             foreach (var done in executed)
@@ -413,12 +460,115 @@ namespace WinParted.Core
             return log;
         }
 
+        private static void ReportProgress(
+            Action<int, string> progressCallback,
+            Action<OperationProgressReport> detailedProgress,
+            int opIndex,
+            int totalOps,
+            string opSummary,
+            int opPct,
+            string stage,
+            long bytesProcessed = 0,
+            long bytesTotal = 0,
+            double speedMiB = 0.0,
+            bool indeterminate = false,
+            string logLine = null,
+            bool isComplete = false,
+            bool isFailed = false)
+        {
+            int clampedOp = Math.Max(0, Math.Min(100, opPct));
+            int overall = totalOps > 0
+                ? (int)Math.Round(((opIndex * 100.0) + clampedOp) / totalOps)
+                : 100;
+            overall = Math.Max(0, Math.Min(100, overall));
+
+            if (progressCallback != null)
+                progressCallback(overall, stage ?? opSummary);
+
+            if (detailedProgress != null)
+            {
+                detailedProgress(new OperationProgressReport
+                {
+                    OperationIndex = opIndex,
+                    TotalOperations = totalOps,
+                    OperationSummary = opSummary,
+                    CurrentStage = stage,
+                    OperationPercent = clampedOp,
+                    OverallPercent = overall,
+                    BytesProcessed = bytesProcessed,
+                    BytesTotal = bytesTotal,
+                    ThroughputMiBPerSec = speedMiB,
+                    IsIndeterminateStage = indeterminate,
+                    LogLine = logLine,
+                    IsOperationComplete = isComplete,
+                    IsOperationFailed = isFailed
+                });
+            }
+        }
+
+        private static Action<long, long> CreateByteProgressCallback(
+            Action<int, string> progressCallback,
+            Action<OperationProgressReport> detailedProgress,
+            int opIndex,
+            int totalOps,
+            string opSummary,
+            int startPct,
+            int endPct,
+            string verb)
+        {
+            var sw = Stopwatch.StartNew();
+            long lastEmitMs = -100;
+            return (done, total) =>
+            {
+                long elapsedMs = sw.ElapsedMilliseconds;
+                bool isBoundary = done <= 0 || (total > 0 && done >= total);
+                if (!isBoundary && elapsedMs - lastEmitMs < 35)
+                    return;
+                lastEmitMs = elapsedMs;
+
+                double ratio = (total > 0) ? Math.Max(0.0, Math.Min(1.0, (double)done / total)) : 1.0;
+                int opPct = startPct + (int)Math.Round((endPct - startPct) * ratio);
+                double secs = sw.Elapsed.TotalSeconds;
+                double speedMiB = (done > 0 && secs > 0.01) ? (done / 1048576.0) / secs : 0.0;
+                string stageText = total > 0
+                    ? string.Format("{0}: {1} / {2} ({3:F1}%) — {4:F1} MiB/s",
+                        verb,
+                        ByteFormatter.FormatBytes(done),
+                        ByteFormatter.FormatBytes(total),
+                        ratio * 100.0,
+                        speedMiB)
+                    : verb;
+
+                ReportProgress(
+                    progressCallback,
+                    detailedProgress,
+                    opIndex,
+                    totalOps,
+                    opSummary,
+                    opPct,
+                    stageText,
+                    bytesProcessed: done,
+                    bytesTotal: total,
+                    speedMiB: speedMiB);
+            };
+        }
+
         /// <summary>
         /// Executes an operation on a virtual <c>.img</c> file with primary/backup GPT+MBR snapshot rollback,
         /// raw payload preservation during Move/Resize/Clone, and post-write CRC32/MBR integrity verification.
         /// </summary>
-        private void ExecuteVirtualDiskOperation(DiskInfo disk, PendingOperation op)
+        private void ExecuteVirtualDiskOperation(
+            DiskInfo disk,
+            PendingOperation op,
+            int opIndex,
+            int totalOps,
+            Action<int, string> progressCallback,
+            Action<OperationProgressReport> detailedProgress)
         {
+            ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 5,
+                "Snapshotting primary & backup GPT/MBR headers...",
+                logLine: "  Snapshotting primary (34 sectors) & backup GPT headers...");
+
             int sec = disk.LogicalSectorSize > 0 ? disk.LogicalSectorSize : 512;
             byte[] primarySnapshot = RawDiskEngine.ReadBytes(disk, 0, 34 * sec);
             byte[] backupSnapshot = (disk.TotalSizeBytes > 34L * sec)
@@ -430,25 +580,41 @@ namespace WinParted.Core
                 switch (op.Type)
                 {
                     case OperationType.CreatePartitionTable:
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 25,
+                            "Purging stale overlays & filesystem cache...",
+                            logLine: "  Purging stale overlays & filesystem cache...");
                         ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 60,
+                            string.Format("Writing new {0} partition table...", op.NewTableStyle));
                         ApplyOperationToModel(disk, op);
                         RawDiskEngine.WritePartitionTable(disk);
                         break;
 
                     case OperationType.CreatePartition:
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 25,
+                            "Updating partition table entries...");
                         ApplyOperationToModel(disk, op);
                         RenumberPartitions(disk);
                         var created = disk.Partitions.First(p => p.StartingOffset == op.StartOffset);
                         RawDiskEngine.WritePartitionTable(disk);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 55,
+                            "Purging overlays & initializing filesystem header...",
+                            logLine: string.Format("  Formatting {0} superblock at offset 0x{1:X}...", op.NewFileSystem, created.StartingOffset));
                         ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, created.StartingOffset, created.PartitionLength, true);
                         RawDiskEngine.WriteFileSystemHeader(disk, created);
                         break;
 
                     case OperationType.DeletePartition:
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 20,
+                            "Purging overlays & clearing filesystem cache...");
                         ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, true);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 55,
+                            "Removing entry from partition table...");
                         ApplyOperationToModel(disk, op);
                         RenumberPartitions(disk);
                         RawDiskEngine.WritePartitionTable(disk);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 75,
+                            "Zeroing vacated partition header sectors...");
                         ZeroVacatedPartitionHeader(disk, op.OriginalStartOffset, op.OriginalLength);
                         break;
 
@@ -456,34 +622,56 @@ namespace WinParted.Core
                         if (op.StartOffset != op.OriginalStartOffset)
                         {
                             long bytesToMove = Math.Min(op.OriginalLength, op.Length);
-                            RawDiskEngine.MovePartitionBytes(disk, op.OriginalStartOffset, op.StartOffset, bytesToMove);
+                            string moveDir = op.StartOffset < op.OriginalStartOffset ? "forward" : "backward overlap-safe";
+                            ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15,
+                                "Moving partition sectors (" + moveDir + ")...",
+                                logLine: string.Format("  Moving {0} ({1})...", ByteFormatter.FormatBytes(bytesToMove), moveDir));
+                            RawDiskEngine.MovePartitionBytes(disk, op.OriginalStartOffset, op.StartOffset, bytesToMove,
+                                CreateByteProgressCallback(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15, 70, "Moving partition data"));
                             ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, false);
                         }
                         ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.OriginalStartOffset);
                         ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.StartOffset);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 76,
+                            "Updating partition table geometry...");
                         ApplyOperationToModel(disk, op);
                         RenumberPartitions(disk);
                         var resizedPart = disk.Partitions.First(p => p.StartingOffset == op.StartOffset);
                         RawDiskEngine.WritePartitionTable(disk);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 84,
+                            "Resizing filesystem metadata in-place...");
                         RawDiskEngine.ResizeFileSystemInPlace(disk, resizedPart, op.OriginalLength);
                         break;
 
                     case OperationType.FormatPartition:
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 20,
+                            "Purging existing overlays & stale superblocks...");
                         ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, true);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 55,
+                            "Updating partition table types...");
                         ApplyOperationToModel(disk, op);
                         var fmtPart = disk.Partitions.First(p => p.StartingOffset == op.OriginalStartOffset);
                         RawDiskEngine.WritePartitionTable(disk);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 78,
+                            string.Format("Writing {0} filesystem structures...", op.NewFileSystem),
+                            logLine: string.Format("  Writing {0} structures (label '{1}')...", op.NewFileSystem, op.NewLabel ?? string.Empty));
                         RawDiskEngine.WriteFileSystemHeader(disk, fmtPart);
                         break;
 
                     case OperationType.ChangeLabel:
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 40,
+                            "Updating partition table name...");
                         ApplyOperationToModel(disk, op);
                         var lblPart = disk.Partitions.First(p => p.StartingOffset == op.OriginalStartOffset);
                         RawDiskEngine.WritePartitionTable(disk);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 75,
+                            "Writing in-place volume label...");
                         RawDiskEngine.UpdateFileSystemLabelInPlace(disk, lblPart);
                         break;
 
                     case OperationType.ChangeFlags:
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 50,
+                            "Updating GPT GUID / attributes or MBR flags...");
                         ApplyOperationToModel(disk, op);
                         RawDiskEngine.WritePartitionTable(disk);
                         break;
@@ -496,30 +684,55 @@ namespace WinParted.Core
                             srcDisk = GetBaselineDisk(op.SourceDiskNumber) ?? disk;
 
                         ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.StartOffset, op.Length, false);
-                        RawDiskEngine.CopyPartitionBytes(srcDisk, op.SourceStartOffset, disk, op.StartOffset, op.SourceLength);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15,
+                            "Cloning partition sectors...",
+                            logLine: string.Format("  Cloning {0} from Disk #{1} to offset 0x{2:X}...", ByteFormatter.FormatBytes(op.SourceLength), srcDisk.DiskNumber, op.StartOffset));
+                        RawDiskEngine.CopyPartitionBytes(srcDisk, op.SourceStartOffset, disk, op.StartOffset, op.SourceLength,
+                            CreateByteProgressCallback(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15, 75, "Cloning partition sectors"));
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 80,
+                            "Updating destination partition table...");
                         ApplyOperationToModel(disk, op);
                         RenumberPartitions(disk);
                         var clonedPart = disk.Partitions.First(p => p.StartingOffset == op.StartOffset);
                         RawDiskEngine.WritePartitionTable(disk);
                         if (op.Length > op.SourceLength)
+                        {
+                            ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 86,
+                                "Expanding cloned filesystem to fill target partition...");
                             RawDiskEngine.ResizeFileSystemInPlace(disk, clonedPart, op.SourceLength);
+                        }
                         break;
 
                     case OperationType.WipePartition:
-                        RawDiskEngine.WipeRange(disk, op.OriginalStartOffset, op.OriginalLength, op.WipePattern);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15,
+                            string.Format("Wiping partition ({0})...", op.WipePattern),
+                            logLine: string.Format("  Wiping {0} using {1}...", ByteFormatter.FormatBytes(op.OriginalLength), op.WipePattern));
+                        RawDiskEngine.WipeRange(disk, op.OriginalStartOffset, op.OriginalLength, op.WipePattern,
+                            CreateByteProgressCallback(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15, 80, "Wiping sectors (" + op.WipePattern + ")"));
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 85,
+                            "Purging cache & updating partition table...");
                         ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, false);
                         ApplyOperationToModel(disk, op);
                         RawDiskEngine.WritePartitionTable(disk);
                         break;
 
                     case OperationType.RestorePartitionTable:
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 30,
+                            "Purging stale overlays & cache...");
                         ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 65,
+                            "Restoring primary & backup partition table sectors...");
                         RawDiskEngine.RestorePartitionTable(disk, op.BackupFilePath);
                         break;
                 }
 
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 90,
+                    "Flushing buffers & reloading virtual image...");
                 // Reload from disk to verify CRC32, Primary+Backup GPT sync, and actual persisted bytes
                 var reloaded = RawDiskEngine.LoadVirtualDisk(disk.BackingFilePath, disk.DiskNumber);
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 96,
+                    "Verifying GPT CRC32 & partition table integrity...",
+                    logLine: "  Verifying GPT CRC32 & partition table integrity...");
                 string integrityReport;
                 if (!RawDiskEngine.VerifyDiskPartitionTableIntegrity(reloaded, out integrityReport))
                     throw new InvalidDataException("Post-operation partition table integrity check failed: " + integrityReport);
@@ -529,6 +742,9 @@ namespace WinParted.Core
             catch
             {
                 // Rollback partition table headers on failure
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 92,
+                    "Rolling back partition table header snapshot...",
+                    logLine: "  [Rollback] Restoring pre-operation GPT/MBR header snapshot...");
                 try
                 {
                     if (primarySnapshot.Length > 0)
@@ -548,8 +764,17 @@ namespace WinParted.Core
         /// uses Win32 volume locking + raw sector writes for non-Microsoft filesystems and <c>diskpart.exe</c>
         /// for native Windows partitioning/formatting.
         /// </summary>
-        private void ExecutePhysicalDiskOperation(DiskInfo disk, PendingOperation op)
+        private void ExecutePhysicalDiskOperation(
+            DiskInfo disk,
+            PendingOperation op,
+            int opIndex,
+            int totalOps,
+            Action<int, string> progressCallback,
+            Action<OperationProgressReport> detailedProgress)
         {
+            ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 5,
+                "Verifying administrator privileges & boot guardrails...");
+
             if (!Win32DiskInterop.IsAdministrator())
                 throw new UnauthorizedAccessException("Administrator privileges are required to modify live physical disks. Relaunch as Administrator or test safely using a Virtual Disk (.img).");
 
@@ -573,15 +798,21 @@ namespace WinParted.Core
             {
                 if (targetPart == null)
                     throw new InvalidOperationException("Target partition was not found for relabeling.");
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 25,
+                    "Preparing volume for label update...");
                 string targetFs = MapDiskPartFs(targetPart.FileSystem);
                 if (!string.IsNullOrEmpty(targetFs) && !string.IsNullOrEmpty(targetPart.DriveLetter))
                 {
+                    ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 60,
+                        "Calling Win32 SetVolumeLabel...");
                     if (!Win32DiskInterop.SetVolumeLabel(targetPart.DriveLetter.TrimEnd('\\') + "\\", op.NewLabel ?? string.Empty))
                         throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(), "SetVolumeLabel failed.");
                 }
                 else
                 {
                     Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, false);
+                    ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 60,
+                        "Updating raw filesystem superblock label...");
                     targetPart.Label = op.NewLabel ?? string.Empty;
                     RawDiskEngine.UpdateFileSystemLabelInPlace(disk, targetPart);
                 }
@@ -592,33 +823,59 @@ namespace WinParted.Core
             {
                 if (targetPart == null)
                     throw new InvalidOperationException("Target partition was not found for wiping.");
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 12,
+                    "Locking & dismounting target partition volume...",
+                    logLine: string.Format("  Locking Disk {0} @ 0x{1:X} ({2})...", disk.DiskNumber, targetPart.StartingOffset, ByteFormatter.FormatBytes(targetPart.PartitionLength)));
                 Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
-                RawDiskEngine.WipeRange(disk, targetPart.StartingOffset, targetPart.PartitionLength, op.WipePattern);
+                RawDiskEngine.WipeRange(disk, targetPart.StartingOffset, targetPart.PartitionLength, op.WipePattern,
+                    CreateByteProgressCallback(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 18, 86, "Wiping physical sectors (" + op.WipePattern + ")"));
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 90,
+                    "Purging overlays & filesystem cache...");
                 ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, targetPart.StartingOffset, targetPart.PartitionLength, false);
                 return;
             }
 
             if (op.Type == OperationType.RestorePartitionTable)
             {
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 20,
+                    "Wiping stale boot & hybrid descriptors...");
                 Win32DiskInterop.WipeDiskBootAndHybridHeaders(disk.DiskNumber, disk.DevicePath, disk.TotalSizeBytes, disk.LogicalSectorSize);
                 ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 60,
+                    "Restoring primary & backup partition table sectors...");
                 RawDiskEngine.RestorePartitionTable(disk, op.BackupFilePath);
                 return;
             }
 
             string script = BuildDiskPartScript(op, disk.PartitionStyle);
+            Action<string> diskPartLineHandler = line =>
+            {
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 55,
+                    "DiskPart: " + line,
+                    indeterminate: true,
+                    logLine: "  [diskpart] " + line);
+            };
 
             if (op.Type == OperationType.CreatePartitionTable)
             {
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15,
+                    "Wiping LBA 0..255, isohybrid descriptors & Backup GPT...",
+                    logLine: "  Wiping MBR/isohybrid/GPT sectors and purging overlays...");
                 // Always wipe LBA 0..255 (+0x8000 isohybrid descriptors, MBR, Primary GPT) and Backup GPT first
                 Win32DiskInterop.WipeDiskBootAndHybridHeaders(disk.DiskNumber, disk.DevicePath, disk.TotalSizeBytes, disk.LogicalSectorSize);
                 ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
                 try
                 {
-                    RunDiskPartScript("rescan\r\n" + script);
+                    ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 35,
+                        "Running DiskPart to initialize partition table...",
+                        indeterminate: true);
+                    RunDiskPartScript("rescan\r\n" + script, diskPartLineHandler);
                 }
                 catch (InvalidOperationException)
                 {
+                    ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 70,
+                        "DiskPart declined; writing clean partition table directly...",
+                        logLine: "  [Fallback] Writing raw GPT/MBR headers directly...");
                     // Fallback: write clean GPT or MBR table directly when DiskPart refuses removable hybrid media
                     ApplyOperationToModel(disk, op);
                     RawDiskEngine.WritePartitionTable(disk);
@@ -628,6 +885,8 @@ namespace WinParted.Core
 
             if (op.Type == OperationType.DeletePartition)
             {
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 15,
+                    "Locking volume & clearing partition superblock headers...");
                 if (targetPart != null && targetPart.StartingOffset >= 65536L && targetPart.PartitionLength >= 4096L)
                 {
                     try
@@ -647,10 +906,16 @@ namespace WinParted.Core
 
                 try
                 {
-                    RunDiskPartScript("rescan\r\n" + script);
+                    ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 35,
+                        "Running DiskPart to delete partition...",
+                        indeterminate: true);
+                    RunDiskPartScript("rescan\r\n" + script, diskPartLineHandler);
                 }
                 catch (InvalidOperationException)
                 {
+                    ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 70,
+                        "DiskPart declined; removing partition via raw table write...",
+                        logLine: "  [Fallback] Updating raw partition table directly...");
                     // Fallback for stubborn EFI / MSR / Recovery / isohybrid overlapping partitions
                     if (targetPart != null)
                     {
@@ -690,6 +955,8 @@ namespace WinParted.Core
 
             if (op.Type == OperationType.FormatPartition && isNonWindowsCreateOrFormat && targetPart != null)
             {
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 20,
+                    string.Format("Locking volume & writing {0} superblock...", op.NewFileSystem));
                 Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
                 targetPart.FileSystem = op.NewFileSystem;
                 targetPart.Label = op.NewLabel ?? string.Empty;
@@ -701,7 +968,10 @@ namespace WinParted.Core
             bool diskPartSucceeded = false;
             try
             {
-                RunDiskPartScript("rescan\r\n" + script);
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 35,
+                    "Running DiskPart script...",
+                    indeterminate: true);
+                RunDiskPartScript("rescan\r\n" + script, diskPartLineHandler);
                 diskPartSucceeded = true;
                 long purgeStart = op.Type == OperationType.CreatePartition
                     ? op.StartOffset
@@ -716,6 +986,9 @@ namespace WinParted.Core
                 if (!isNonWindowsCreateOrFormat || (op.Type != OperationType.CreatePartition && op.Type != OperationType.FormatPartition))
                     throw;
 
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 68,
+                    "DiskPart declined; writing raw table & superblock directly...",
+                    logLine: "  [Fallback] Writing raw partition table and superblock...");
                 // Fallback for non-Windows filesystems when DiskPart cannot update layout directly
                 ApplyOperationToModel(disk, op);
                 RenumberPartitions(disk);
@@ -738,6 +1011,9 @@ namespace WinParted.Core
 
             if (isNonWindowsCreateOrFormat && diskPartSucceeded)
             {
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 84,
+                    string.Format("Verifying & stamping {0} filesystem structures...", op.NewFileSystem),
+                    logLine: string.Format("  Re-scanning Disk {0} & verifying {1} superblock...", disk.DiskNumber, op.NewFileSystem));
                 var liveDisks = Win32DiskInterop.EnumeratePhysicalDisks();
                 var liveDisk = liveDisks.FirstOrDefault(d => d.DiskNumber == disk.DiskNumber) ?? disk;
                 long expectedStart = op.Type == OperationType.CreatePartition
@@ -776,7 +1052,7 @@ namespace WinParted.Core
             }
         }
 
-        private static void RunDiskPartScript(string script)
+        private static void RunDiskPartScript(string script, Action<string> onOutputLine = null)
         {
             string tempScript = Path.Combine(Path.GetTempPath(), "winparted_" + Guid.NewGuid().ToString("N") + ".txt");
             try
@@ -791,11 +1067,49 @@ namespace WinParted.Core
                     RedirectStandardError = true,
                     CreateNoWindow = true
                 };
-                using (var proc = Process.Start(psi))
+                using (var proc = new Process { StartInfo = psi })
+                using (var outDone = new ManualResetEvent(false))
+                using (var errDone = new ManualResetEvent(false))
                 {
-                    string stdout = proc.StandardOutput.ReadToEnd();
-                    string stderr = proc.StandardError.ReadToEnd();
-                    proc.WaitForExit();
+                    var stdout = new StringBuilder();
+                    var stderr = new StringBuilder();
+                    object sync = new object();
+
+                    proc.OutputDataReceived += (s, e) =>
+                    {
+                        if (e.Data == null)
+                        {
+                            outDone.Set();
+                            return;
+                        }
+                        lock (sync) { stdout.AppendLine(e.Data); }
+                        string trimmed = e.Data.Trim();
+                        if (trimmed.Length > 0 && onOutputLine != null)
+                            onOutputLine(trimmed);
+                    };
+                    proc.ErrorDataReceived += (s, e) =>
+                    {
+                        if (e.Data == null)
+                        {
+                            errDone.Set();
+                            return;
+                        }
+                        lock (sync) { stderr.AppendLine(e.Data); }
+                        string trimmed = e.Data.Trim();
+                        if (trimmed.Length > 0 && onOutputLine != null)
+                            onOutputLine(trimmed);
+                    };
+
+                    proc.Start();
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+
+                    while (!proc.WaitForExit(80))
+                    {
+                    }
+                    outDone.WaitOne(2000);
+                    errDone.WaitOne(2000);
+
                     if (proc.ExitCode != 0)
                         throw new InvalidOperationException("DiskPart failed (exit " + proc.ExitCode + "): " + stdout + " " + stderr);
                 }

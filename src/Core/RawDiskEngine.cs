@@ -2268,13 +2268,14 @@ namespace WinParted.Core
         }
 
         /// <summary>Copies raw partition bytes in 1 MiB chunks from source disk/offset to a virtual destination.</summary>
-        public static void CopyPartitionBytes(DiskInfo sourceDisk, long sourceOffset, DiskInfo destDisk, long destOffset, long length)
+        public static void CopyPartitionBytes(DiskInfo sourceDisk, long sourceOffset, DiskInfo destDisk, long destOffset, long length, Action<long, long> progressCallback = null)
         {
             if (!destDisk.IsVirtualImage)
                 throw new InvalidOperationException("Direct partition byte copy requires a virtual disk target unless running elevated raw disk mode.");
 
             const int chunkSize = 1048576; // 1 MiB
             long copied = 0;
+            if (progressCallback != null) progressCallback(0L, length);
 
             using (var destFs = new FileStream(destDisk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
             {
@@ -2287,21 +2288,28 @@ namespace WinParted.Core
                     destFs.Seek(destOffset + copied, SeekOrigin.Begin);
                     destFs.Write(chunk, 0, chunk.Length);
                     copied += chunk.Length;
+                    if (progressCallback != null) progressCallback(copied, length);
                 }
                 destFs.Flush();
             }
+            if (progressCallback != null) progressCallback(length, length);
         }
 
         /// <summary>
         /// Overlap-safe partition data mover: copies chunks forward when moving left and backward
         /// when moving right, then zeroes vacated leading header sectors so stale superblocks cannot linger.
         /// </summary>
-        public static void MovePartitionBytes(DiskInfo disk, long oldOffset, long newOffset, long length)
+        public static void MovePartitionBytes(DiskInfo disk, long oldOffset, long newOffset, long length, Action<long, long> progressCallback = null)
         {
-            if (oldOffset == newOffset || length <= 0) return;
+            if (oldOffset == newOffset || length <= 0)
+            {
+                if (progressCallback != null) progressCallback(length, length);
+                return;
+            }
             if (!disk.IsVirtualImage)
                 throw new InvalidOperationException("Moving partition data on live hardware requires unmounted/offline disk locking.");
 
+            if (progressCallback != null) progressCallback(0L, length);
             const int chunkSize = 1048576;
             using (var fs = new FileStream(disk.BackingFilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
             {
@@ -2319,6 +2327,7 @@ namespace WinParted.Core
                         fs.Seek(newOffset + moved, SeekOrigin.Begin);
                         fs.Write(buf, 0, read);
                         moved += read;
+                        if (progressCallback != null) progressCallback(moved, length);
                     }
                 }
                 else
@@ -2336,6 +2345,7 @@ namespace WinParted.Core
                         fs.Seek(newOffset + pos, SeekOrigin.Begin);
                         fs.Write(buf, 0, read);
                         remaining -= read;
+                        if (progressCallback != null) progressCallback(length - remaining, length);
                     }
 
                     // Clear non-overlapping vacated header sectors at oldOffset so stale superblocks don't linger
@@ -2349,6 +2359,7 @@ namespace WinParted.Core
                 }
                 fs.Flush();
             }
+            if (progressCallback != null) progressCallback(length, length);
         }
 
         /// <summary>Overwrites a byte range with Zero-Fill, Ones-Fill, or PRNG Random data.</summary>
@@ -2370,10 +2381,11 @@ namespace WinParted.Core
             }
         }
 
-        public static void WipeRange(DiskInfo disk, long startOffset, long length, WipePattern pattern)
+        public static void WipeRange(DiskInfo disk, long startOffset, long length, WipePattern pattern, Action<long, long> progressCallback = null)
         {
             if (disk == null || length <= 0) return;
             ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, startOffset, length, false);
+            if (progressCallback != null) progressCallback(0L, length);
 
             const int chunkSize = 1048576;
             byte[] buf = new byte[chunkSize];
@@ -2397,9 +2409,11 @@ namespace WinParted.Core
                         fs.Seek(startOffset + written, SeekOrigin.Begin);
                         fs.Write(buf, 0, n);
                         written += n;
+                        if (progressCallback != null) progressCallback(written, length);
                     }
                     fs.Flush();
                 }
+                if (progressCallback != null) progressCallback(length, length);
                 return;
             }
 
@@ -2418,7 +2432,9 @@ namespace WinParted.Core
                 }
                 WriteBytes(disk, startOffset + rawWritten, slice);
                 rawWritten += n;
+                if (progressCallback != null) progressCallback(rawWritten, length);
             }
+            if (progressCallback != null) progressCallback(length, length);
         }
 
         /// <summary>Saves Primary + Backup partition table sectors into a <c>.gptbak</c>/<c>.ptbak</c> binary file.</summary>

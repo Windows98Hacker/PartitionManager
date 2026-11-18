@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Windows.Forms;
 using WinParted.Core;
 using WinParted.Interop;
@@ -2130,25 +2131,21 @@ namespace WinParted.UI
                 "Apply Pending Operations", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                 return;
 
-            try
+            using (var dlg = new ApplyOperationsProgressDialog(_queueManager))
             {
-                Cursor = Cursors.WaitCursor;
-                var results = _queueManager.ApplyAll((pct, msg) =>
-                {
-                    _lblStatus.Text = string.Format("[{0}%] {1}", pct, msg);
-                    Application.DoEvents();
-                });
-
+                dlg.ShowDialog(this);
                 RefreshAllDisks();
-                MessageBox.Show(this, string.Join("\n", results), "Operations Applied Successfully", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "Operation failed:\n" + ex.Message, "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
+
+                if (dlg.ExecutionError != null)
+                {
+                    _lblStatus.Text = "Operation failed: " + dlg.ExecutionError.Message;
+                    MessageBox.Show(this, "Operation failed:\n" + dlg.ExecutionError.Message, "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                else if (dlg.AppliedResults != null && dlg.AppliedResults.Count > 0)
+                {
+                    _lblStatus.Text = string.Format("Applied and verified {0} operation{1}.",
+                        dlg.AppliedResults.Count, dlg.AppliedResults.Count == 1 ? "" : "s");
+                }
             }
         }
 
@@ -2189,42 +2186,172 @@ namespace WinParted.UI
 
         private void RunStressTestsDialog()
         {
-            var sb = new System.Text.StringBuilder();
-            Cursor = Cursors.WaitCursor;
-            bool ok = false;
-            try
-            {
-                ok = StressTestRunner.RunAll(line => sb.AppendLine(line));
-            }
-            catch (Exception ex)
-            {
-                sb.AppendLine("EXCEPTION: " + ex);
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
-            }
-
             using (var dlg = new Form
             {
-                Text = ok ? "Stress & Data-Safety Test Suite — ALL PASSED" : "Stress & Data-Safety Test Suite — FAILED",
-                Size = new Size(820, 560),
-                StartPosition = FormStartPosition.CenterParent
+                Text = "Stress & Data-Safety Test Suite — Running...",
+                Size = new Size(840, 560),
+                MinimumSize = new Size(640, 420),
+                StartPosition = FormStartPosition.CenterParent,
+                Font = new Font("Segoe UI", 9f)
             })
             {
+                var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F13) };
+                dlg.Controls.Add(root);
+
+                var lblHeader = new Label
+                {
+                    Dock = DockStyle.Top,
+                    Height = 28,
+                    Text = "Running stress & data-safety test suites in background...",
+                    Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    UseMnemonic = false
+                };
+
                 var txt = new TextBox
                 {
                     Dock = DockStyle.Fill,
                     Multiline = true,
                     ReadOnly = true,
                     ScrollBars = ScrollBars.Both,
+                    BorderStyle = BorderStyle.FixedSingle,
                     Font = new Font("Consolas", 9f),
                     BackColor = Color.FromArgb(15, 23, 42),
-                    ForeColor = ok ? Color.FromArgb(134, 239, 172) : Color.FromArgb(252, 165, 165),
-                    Text = sb.ToString()
+                    ForeColor = Color.FromArgb(203, 213, 225),
+                    Tag = "ConsoleColors"
                 };
-                dlg.Controls.Add(txt);
-                dlg.ShowDialog(this);
+
+                var bottomFlow = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Bottom,
+                    Height = ThemeManager.F55,
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
+                };
+                var btnClose = new Button
+                {
+                    Text = "Running...",
+                    Enabled = false,
+                    DialogResult = DialogResult.OK,
+                    Size = new Size(110, ThemeManager.F34),
+                    Tag = "PrimaryButton"
+                };
+                bottomFlow.Controls.Add(btnClose);
+
+                root.Controls.Add(txt);
+                root.Controls.Add(lblHeader);
+                root.Controls.Add(bottomFlow);
+                dlg.AcceptButton = btnClose;
+                dlg.CancelButton = btnClose;
+                ThemeManager.ApplyTheme(dlg);
+
+                object sync = new object();
+                var pendingLines = new Queue<string>();
+                bool isRunning = true;
+                bool finished = false;
+                bool ok = false;
+
+                var timer = new System.Windows.Forms.Timer { Interval = 75 };
+                Action flush = () =>
+                {
+                    var lines = new List<string>();
+                    bool doneNow;
+                    bool passedNow;
+                    lock (sync)
+                    {
+                        while (pendingLines.Count > 0)
+                            lines.Add(pendingLines.Dequeue());
+                        doneNow = finished;
+                        passedNow = ok;
+                    }
+
+                    if (lines.Count > 0)
+                    {
+                        var batch = new System.Text.StringBuilder();
+                        foreach (string line in lines)
+                            batch.AppendLine(line);
+                        txt.AppendText(batch.ToString());
+                        txt.SelectionStart = txt.TextLength;
+                        txt.ScrollToCaret();
+                    }
+
+                    if (doneNow)
+                    {
+                        timer.Stop();
+                        isRunning = false;
+                        dlg.Text = passedNow
+                            ? "Stress & Data-Safety Test Suite — ALL PASSED"
+                            : "Stress & Data-Safety Test Suite — FAILED";
+                        lblHeader.Text = passedNow
+                            ? "All stress & data-safety test suites PASSED."
+                            : "Stress & data-safety test suite encountered failures.";
+                        lblHeader.ForeColor = passedNow ? ThemeManager.AccentGreen : ThemeManager.AccentRed;
+                        lblHeader.Tag = "KeepForeColor";
+                        txt.ForeColor = passedNow ? Color.FromArgb(134, 239, 172) : Color.FromArgb(252, 165, 165);
+                        btnClose.Text = "Close";
+                        btnClose.Enabled = true;
+                        btnClose.Focus();
+                    }
+                };
+
+                timer.Tick += (s, e) => flush();
+                dlg.FormClosing += (s, e) =>
+                {
+                    if (isRunning && e.CloseReason == CloseReason.UserClosing)
+                    {
+                        e.Cancel = true;
+                        System.Media.SystemSounds.Beep.Play();
+                        return;
+                    }
+                    timer.Stop();
+                };
+
+                dlg.Shown += (s, e) =>
+                {
+                    timer.Start();
+                    var t = new Thread(() =>
+                    {
+                        bool result = false;
+                        try
+                        {
+                            result = StressTestRunner.RunAll(line =>
+                            {
+                                lock (sync) { pendingLines.Enqueue(line); }
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            lock (sync) { pendingLines.Enqueue("EXCEPTION: " + ex); }
+                            result = false;
+                        }
+                        finally
+                        {
+                            lock (sync)
+                            {
+                                ok = result;
+                                finished = true;
+                            }
+                            try
+                            {
+                                if (dlg.IsHandleCreated && !dlg.IsDisposed)
+                                    dlg.BeginInvoke(new MethodInvoker(delegate { flush(); }));
+                            }
+                            catch { }
+                        }
+                    });
+                    t.IsBackground = true;
+                    t.Name = "WinParted-StressTestWorker";
+                    t.Start();
+                };
+
+                try
+                {
+                    dlg.ShowDialog(this);
+                }
+                finally
+                {
+                    timer.Dispose();
+                }
             }
         }
     }
