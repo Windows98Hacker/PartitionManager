@@ -668,8 +668,9 @@ namespace WinParted.Core
             if (disk.PartitionStyle == PartitionTableStyle.MBR)
             {
                 byte[] mbr = new byte[sec];
-                uint sig = disk.MbrSignature != 0 ? disk.MbrSignature : 0x12345678u;
-                BitConverter.GetBytes(sig).CopyTo(mbr, 440);
+                if (disk.MbrSignature == 0)
+                    disk.MbrSignature = (uint)(Environment.TickCount ^ Guid.NewGuid().GetHashCode()) | 1u;
+                BitConverter.GetBytes(disk.MbrSignature).CopyTo(mbr, 440);
 
                 var ordered = disk.Partitions.Where(p => !p.IsUnallocated).OrderBy(p => p.StartingOffset).ToList();
                 for (int i = 0; i < ordered.Count; i++)
@@ -813,8 +814,12 @@ namespace WinParted.Core
                 return;
             }
 
-            // Check NTFS ("NTFS    " at +3)
-            if (MatchesAscii(data, 3, "NTFS    "))
+            // Check NTFS ("NTFS    " at +3 with valid BPB sector/cluster geometry)
+            if (MatchesAscii(data, 3, "NTFS    ") &&
+                BitConverter.ToUInt16(data, 0x0B) >= 512 &&
+                data[0x0D] > 0 &&
+                data[0x40] != 0 &&
+                data[0x44] != 0)
             {
                 if (part.GptTypeGuid != GptPartitionTypeGuids.WindowsRecovery)
                     part.FileSystem = FileSystemType.NTFS;
@@ -841,8 +846,54 @@ namespace WinParted.Core
                 part.FileSystem = FileSystemType.exFAT;
                 uint serial = BitConverter.ToUInt32(data, 0x64);
                 part.UUID = string.Format("{0:X4}-{1:X4}", (serial >> 16) & 0xFFFF, serial & 0xFFFF);
-                string customLabel = ReadCustomLabelHint(data, 0x1A0);
-                if (!string.IsNullOrEmpty(customLabel)) part.Label = customLabel;
+
+                // Read native 0x83 Volume Label entry from exFAT Root Directory when valid BPB geometry is present
+                if (data.Length >= 0x70 && data[0x6C] == 9)
+                {
+                    try
+                    {
+                        uint fatOff = BitConverter.ToUInt32(data, 0x50);
+                        uint heapOff = BitConverter.ToUInt32(data, 0x58);
+                        uint clusCount = BitConverter.ToUInt32(data, 0x5C);
+                        uint rootClus = BitConverter.ToUInt32(data, 0x60);
+                        int spcShift = data[0x6D];
+                        if (spcShift <= 20 && fatOff >= 12 && heapOff > fatOff && rootClus >= 2 && rootClus < clusCount + 2u)
+                        {
+                            long clusBytes = Math.Min(131072L, 512L << spcShift);
+                            long rootByteOff = ((long)heapOff + (long)(rootClus - 2u) * (1L << spcShift)) * 512L;
+                            if (rootByteOff + 512L <= part.PartitionLength)
+                            {
+                                byte[] rootData = ReadBytes(disk, part.StartingOffset + rootByteOff, (int)Math.Min(clusBytes, part.PartitionLength - rootByteOff));
+                                for (int eOff = 0; eOff + 32 <= rootData.Length; eOff += 32)
+                                {
+                                    byte eType = rootData[eOff];
+                                    if (eType == 0x00)
+                                        break;
+                                    if (eType == 0x83)
+                                    {
+                                        int chLen = Math.Min(11, (int)rootData[eOff + 1]);
+                                        if (chLen > 0)
+                                        {
+                                            string volLbl = Encoding.Unicode.GetString(rootData, eOff + 2, chLen * 2).TrimEnd('\0', ' ');
+                                            if (!string.IsNullOrEmpty(volLbl))
+                                                part.Label = volLbl;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (string.IsNullOrEmpty(part.Label))
+                {
+                    string customLabel = ReadCustomLabelHint(data, 0x1A0);
+                    if (!string.IsNullOrEmpty(customLabel)) part.Label = customLabel;
+                }
                 long customUsed = ReadCustomUsedHint(data, 0x1C0);
                 if (customUsed >= 0 && customUsed <= part.PartitionLength)
                 {
@@ -1312,8 +1363,14 @@ namespace WinParted.Core
                     BitConverter.GetBytes((ushort)512).CopyTo(buf, 0x0B);
                     buf[0x0D] = 8; // 4K clusters
                     buf[0x15] = 0xF8;
+                    BitConverter.GetBytes((ushort)63).CopyTo(buf, 0x18);
+                    BitConverter.GetBytes((ushort)255).CopyTo(buf, 0x1A);
+                    BitConverter.GetBytes((uint)Math.Min(uint.MaxValue, Math.Max(0L, part.StartingOffset / 512L))).CopyTo(buf, 0x1C);
                     BitConverter.GetBytes((ulong)totalSectors).CopyTo(buf, 0x28);
-                    BitConverter.GetBytes((ulong)(totalSectors / 16)).CopyTo(buf, 0x30); // MFT LCN
+                    BitConverter.GetBytes((ulong)Math.Max(4L, totalSectors / 16L)).CopyTo(buf, 0x30); // $MFT LCN
+                    BitConverter.GetBytes(2UL).CopyTo(buf, 0x38);                                    // $MFTMirr LCN
+                    buf[0x40] = 0xF6;                                                                // 1024-byte FRS (-10)
+                    buf[0x44] = 0x01;                                                                // 4096-byte Index Block
                     ulong ntfsSerial = (ulong)Math.Abs((part.Label + part.StartingOffset).GetHashCode()) << 32 | 0x57494E50UL;
                     BitConverter.GetBytes(ntfsSerial).CopyTo(buf, 0x48);
                     WriteCustomLabelHint(buf, 0x1A0, part.Label);
@@ -1327,15 +1384,22 @@ namespace WinParted.Core
 
                 case FileSystemType.FAT32:
                 case FileSystemType.EfiSystem:
-                    if (part.PartitionLength < 64L * 1048576L) fat32SecPerClus = 1;
+                    if (part.PartitionLength <= 260L * 1048576L) fat32SecPerClus = 1;
                     else if (part.PartitionLength <= 8L * 1073741824L) fat32SecPerClus = 8;
                     else if (part.PartitionLength <= 16L * 1073741824L) fat32SecPerClus = 16;
                     else if (part.PartitionLength <= 32L * 1073741824L) fat32SecPerClus = 32;
                     else fat32SecPerClus = 64;
 
-                    long tmpVal1 = Math.Max(1L, totalSectors - 32L);
-                    long tmpVal2 = (256L * fat32SecPerClus + 2L) / 2L;
-                    fat32Sz = (uint)Math.Max(1L, (tmpVal1 + tmpVal2 - 1L) / tmpVal2);
+                    while (true)
+                    {
+                        long tmpVal1 = Math.Max(1L, totalSectors - 32L);
+                        long tmpVal2 = (256L * fat32SecPerClus + 2L) / 2L;
+                        fat32Sz = (uint)Math.Max(1L, (tmpVal1 + tmpVal2 - 1L) / tmpVal2);
+                        long dataSectorsTmp = Math.Max(0L, totalSectors - (32L + 2L * fat32Sz));
+                        if (dataSectorsTmp / fat32SecPerClus >= 65525L || fat32SecPerClus <= 1)
+                            break;
+                        fat32SecPerClus >>= 1;
+                    }
 
                     buf[0] = 0xEB; buf[1] = 0x58; buf[2] = 0x90;
                     Encoding.ASCII.GetBytes("MSDOS5.0").CopyTo(buf, 3);
@@ -1356,11 +1420,12 @@ namespace WinParted.Core
                     buf[0x42] = 0x29;                                               // BS_BootSig
                     uint fatId = (uint)(0x46415400 ^ (int)part.StartingOffset);
                     BitConverter.GetBytes(fatId).CopyTo(buf, 0x43);
-                    string fatLbl = (string.IsNullOrEmpty(part.Label) ? "NO NAME" : part.Label.ToUpperInvariant()).PadRight(11).Substring(0, 11);
+                    string fatLbl = SanitizeFatLabel(part.Label, false);
                     Encoding.ASCII.GetBytes(fatLbl).CopyTo(buf, 0x47);
                     Encoding.ASCII.GetBytes("FAT32   ").CopyTo(buf, 0x52);
                     long fatUsed = part.UsedBytes ?? (part.FileSystem == FileSystemType.EfiSystem ? (long)(part.PartitionLength * 0.18) : (long)(part.PartitionLength * 0.10));
-                    WriteCustomUsedHint(buf, 0x1C0, fatUsed);
+                    if (disk.IsVirtualImage)
+                        WriteCustomUsedHint(buf, 0x1C0, fatUsed);
                     buf[510] = 0x55; buf[511] = 0xAA;
 
                     // FSInfo sector at LBA 1 (+512..+1023)
@@ -1384,17 +1449,25 @@ namespace WinParted.Core
 
                 case FileSystemType.FAT16:
                     int fat16SecPerClus = 64;
-                    int[] fat16ClusCandidates = new int[] { 4, 8, 16, 32, 64 };
+                    int[] fat16ClusCandidates = new int[] { 1, 2, 4, 8, 16, 32, 64 };
                     for (int ci = 0; ci < fat16ClusCandidates.Length; ci++)
                     {
-                        if (totalSectors / fat16ClusCandidates[ci] <= 65524L)
+                        int cand = fat16ClusCandidates[ci];
+                        long approxClusters = Math.Max(1L, (totalSectors - 33L) / cand);
+                        uint estFatSz = (uint)Math.Max(1L, ((approxClusters + 2L) * 2L + 511L) / 512L);
+                        long dataSectors16 = Math.Max(0L, totalSectors - (33L + 2L * estFatSz));
+                        if (dataSectors16 / cand <= 65524L)
                         {
-                            fat16SecPerClus = fat16ClusCandidates[ci];
+                            fat16SecPerClus = cand;
+                            fat16Sz = (uint)Math.Max(1L, Math.Min(65535L, estFatSz));
                             break;
                         }
                     }
-                    long fat16Clusters = Math.Max(1L, totalSectors / fat16SecPerClus);
-                    fat16Sz = (uint)Math.Max(1L, Math.Min(65535L, ((fat16Clusters + 2L) * 2L + 511L) / 512L));
+                    if (fat16Sz == 0)
+                    {
+                        long fat16Clusters = Math.Max(1L, totalSectors / fat16SecPerClus);
+                        fat16Sz = (uint)Math.Max(1L, Math.Min(65535L, ((fat16Clusters + 2L) * 2L + 511L) / 512L));
+                    }
 
                     buf[0] = 0xEB; buf[1] = 0x3C; buf[2] = 0x90;
                     Encoding.ASCII.GetBytes("MSDOS5.0").CopyTo(buf, 3);
@@ -1416,11 +1489,12 @@ namespace WinParted.Core
                     uint fat16Id = (uint)(0x46313600 ^ (int)part.StartingOffset);
                     buf[0x26] = 0x29;
                     BitConverter.GetBytes(fat16Id).CopyTo(buf, 0x27);
-                    string fat16Lbl = (string.IsNullOrEmpty(part.Label) ? "NO NAME" : part.Label.ToUpperInvariant()).PadRight(11).Substring(0, 11);
+                    string fat16Lbl = SanitizeFatLabel(part.Label, false);
                     Encoding.ASCII.GetBytes(fat16Lbl).CopyTo(buf, 0x2B);
                     Encoding.ASCII.GetBytes("FAT16   ").CopyTo(buf, 0x36);
                     long fat16Used = part.UsedBytes ?? (long)(part.PartitionLength * 0.08);
-                    WriteCustomUsedHint(buf, 0x1C0, fat16Used);
+                    if (disk.IsVirtualImage)
+                        WriteCustomUsedHint(buf, 0x1C0, fat16Used);
                     buf[510] = 0x55; buf[511] = 0xAA;
                     part.UsedBytes = fat16Used;
                     part.FreeBytes = Math.Max(0, part.PartitionLength - fat16Used);
@@ -1449,18 +1523,7 @@ namespace WinParted.Core
                     break;
 
                 case FileSystemType.exFAT:
-                    buf[0] = 0xEB; buf[1] = 0x76; buf[2] = 0x90;
-                    Encoding.ASCII.GetBytes("EXFAT   ").CopyTo(buf, 3);
-                    BitConverter.GetBytes((ulong)totalSectors).CopyTo(buf, 0x48);
-                    uint exId = (uint)(0x45584600 ^ (int)part.StartingOffset);
-                    BitConverter.GetBytes(exId).CopyTo(buf, 0x64);
-                    WriteCustomLabelHint(buf, 0x1A0, part.Label);
-                    long exUsed = part.UsedBytes ?? Math.Min(part.PartitionLength, 1048576L);
-                    WriteCustomUsedHint(buf, 0x1C0, exUsed);
-                    buf[510] = 0x55; buf[511] = 0xAA;
-                    part.UUID = string.Format("{0:X4}-{1:X4}", (exId >> 16) & 0xFFFF, exId & 0xFFFF);
-                    part.UsedBytes = exUsed;
-                    part.FreeBytes = Math.Max(0, part.PartitionLength - exUsed);
+                    // Handled by full Microsoft exFAT-spec formatter after switch
                     break;
 
                 case FileSystemType.Ext2:
@@ -1879,6 +1942,12 @@ namespace WinParted.Core
                     break;
             }
 
+            if (part.FileSystem == FileSystemType.exFAT)
+            {
+                WriteExFatStructures(disk, part);
+                return;
+            }
+
             WriteBytes(disk, part.StartingOffset, buf);
 
             if ((part.FileSystem == FileSystemType.FAT32 || part.FileSystem == FileSystemType.EfiSystem) && fat32Sz > 0 && fat32SecPerClus > 0)
@@ -1887,10 +1956,230 @@ namespace WinParted.Core
                 WriteFat16TailStructures(disk, part, fat16Sz);
         }
 
+        private static string SanitizeFatLabel(string label, bool forRootEntry)
+        {
+            const string invalid = "\"*+,/:;<=>?[\\]|";
+            string raw = (label ?? string.Empty).ToUpperInvariant().Trim();
+            var sb = new StringBuilder(11);
+            for (int i = 0; i < raw.Length && sb.Length < 11; i++)
+            {
+                char ch = raw[i];
+                if (ch < 0x20 || ch > 0x7E || invalid.IndexOf(ch) >= 0)
+                    continue;
+                sb.Append(ch);
+            }
+            string clean = sb.ToString().Trim();
+            if (clean.Length == 0)
+                return forRootEntry ? string.Empty : "NO NAME    ";
+            return clean.PadRight(11).Substring(0, 11);
+        }
+
+        public static uint ComputeExFatChecksum(byte[] data, int length, bool isBootSectorRegion)
+        {
+            uint checksum = 0;
+            int count = Math.Min(length, data != null ? data.Length : 0);
+            for (int index = 0; index < count; index++)
+            {
+                if (isBootSectorRegion && (index == 106 || index == 107 || index == 112))
+                    continue;
+                checksum = ((checksum & 1u) != 0 ? 0x80000000u : 0u) + (checksum >> 1) + data[index];
+            }
+            return checksum;
+        }
+
+        private static byte[] BuildExFatUpCaseTable(out uint checksum)
+        {
+            var outBytes = new List<byte>(8192);
+            int cp = 0;
+            while (cp <= 0xFFFF)
+            {
+                ushort upper = (ushort)char.ToUpperInvariant((char)cp);
+                if (upper == (ushort)cp)
+                {
+                    int runLen = 1;
+                    while (cp + runLen <= 0xFFFF &&
+                           (ushort)char.ToUpperInvariant((char)(cp + runLen)) == (ushort)(cp + runLen))
+                    {
+                        runLen++;
+                    }
+                    if (runLen >= 3)
+                    {
+                        outBytes.Add(0xFF);
+                        outBytes.Add(0xFF);
+                        outBytes.Add((byte)(runLen & 0xFF));
+                        outBytes.Add((byte)((runLen >> 8) & 0xFF));
+                        cp += runLen;
+                        continue;
+                    }
+                }
+                outBytes.Add((byte)(upper & 0xFF));
+                outBytes.Add((byte)((upper >> 8) & 0xFF));
+                cp++;
+            }
+
+            byte[] result = outBytes.ToArray();
+            checksum = ComputeExFatChecksum(result, result.Length, false);
+            return result;
+        }
+
+        private static void WriteExFatStructures(DiskInfo disk, PartitionEntry part)
+        {
+            long totalSectors = part.PartitionLength / 512L;
+            if (totalSectors < 48L) return;
+
+            int secPerClusShift;
+            if (part.PartitionLength <= 256L * 1048576L) secPerClusShift = 3;          // 4 KiB
+            else if (part.PartitionLength <= 32L * 1073741824L) secPerClusShift = 6;   // 32 KiB
+            else secPerClusShift = 8;                                                   // 128 KiB
+
+            while (secPerClusShift > 1 && totalSectors < 48L + 8L * (1L << secPerClusShift))
+                secPerClusShift--;
+
+            uint secPerClus = 1u << secPerClusShift;
+            uint clusBytes = secPerClus * 512u;
+            uint fatOffset = 24u;
+
+            long availAfterBoot = Math.Max(16L, totalSectors - 32L);
+            uint estClusters = (uint)Math.Max(16L, availAfterBoot / secPerClus);
+            uint fatLength = (uint)Math.Max(1L, ((long)(estClusters + 2u) * 4L + 511L) / 512L);
+
+            long rawHeapStart = fatOffset + fatLength;
+            long alignedHeap = ((rawHeapStart + secPerClus - 1L) / secPerClus) * secPerClus;
+            if (alignedHeap + (long)secPerClus * 12L > totalSectors)
+                alignedHeap = rawHeapStart;
+
+            uint clusterHeapOffset = (uint)alignedHeap;
+            uint clusterCount = (uint)Math.Max(8L, Math.Min((long)uint.MaxValue - 10L, (totalSectors - clusterHeapOffset) / secPerClus));
+            uint maxFatEntries = (uint)Math.Min((long)uint.MaxValue, ((long)fatLength * 512L) / 4L);
+            if (maxFatEntries > 2u && clusterCount + 2u > maxFatEntries)
+                clusterCount = maxFatEntries - 2u;
+
+            uint upcaseChecksum;
+            byte[] upcaseBytes = BuildExFatUpCaseTable(out upcaseChecksum);
+
+            ulong bitmapLenBytes = (clusterCount + 7UL) / 8UL;
+            uint bitmapClusters = (uint)Math.Max(1UL, (bitmapLenBytes + clusBytes - 1UL) / clusBytes);
+            uint upcaseFirst = 2u + bitmapClusters;
+            uint upcaseClusters = (uint)Math.Max(1UL, ((ulong)upcaseBytes.Length + clusBytes - 1UL) / clusBytes);
+            uint rootFirst = upcaseFirst + upcaseClusters;
+            uint totalUsedClusters = bitmapClusters + upcaseClusters + 1u;
+
+            byte[] mainBoot = new byte[12 * 512];
+            mainBoot[0] = 0xEB; mainBoot[1] = 0x76; mainBoot[2] = 0x90;
+            Encoding.ASCII.GetBytes("EXFAT   ").CopyTo(mainBoot, 3);
+            BitConverter.GetBytes((ulong)Math.Max(0L, part.StartingOffset / 512L)).CopyTo(mainBoot, 0x40);
+            BitConverter.GetBytes((ulong)totalSectors).CopyTo(mainBoot, 0x48);
+            BitConverter.GetBytes(fatOffset).CopyTo(mainBoot, 0x50);
+            BitConverter.GetBytes(fatLength).CopyTo(mainBoot, 0x54);
+            BitConverter.GetBytes(clusterHeapOffset).CopyTo(mainBoot, 0x58);
+            BitConverter.GetBytes(clusterCount).CopyTo(mainBoot, 0x5C);
+            BitConverter.GetBytes(rootFirst).CopyTo(mainBoot, 0x60);
+            uint exId = (uint)(0x45584600 ^ (int)part.StartingOffset);
+            BitConverter.GetBytes(exId).CopyTo(mainBoot, 0x64);
+            BitConverter.GetBytes((ushort)0x0100).CopyTo(mainBoot, 0x68); // FileSystemRevision 1.00
+            BitConverter.GetBytes((ushort)0).CopyTo(mainBoot, 0x6A);      // VolumeFlags
+            mainBoot[0x6C] = 9;                                           // BytesPerSectorShift (512 B)
+            mainBoot[0x6D] = (byte)secPerClusShift;                       // SectorsPerClusterShift
+            mainBoot[0x6E] = 1;                                           // NumberOfFats
+            mainBoot[0x6F] = 0x80;                                        // DriveSelect
+            mainBoot[0x70] = 0xFF;                                        // PercentInUse
+
+            long exUsed = part.UsedBytes ?? Math.Min(part.PartitionLength, (long)totalUsedClusters * clusBytes);
+            if (disk.IsVirtualImage)
+                WriteCustomUsedHint(mainBoot, 0x1C0, exUsed);
+            mainBoot[510] = 0x55; mainBoot[511] = 0xAA;
+
+            for (int ext = 1; ext <= 8; ext++)
+            {
+                mainBoot[ext * 512 + 510] = 0x55;
+                mainBoot[ext * 512 + 511] = 0xAA;
+            }
+
+            uint bootChecksum = ComputeExFatChecksum(mainBoot, 11 * 512, true);
+            byte[] chkBytes = BitConverter.GetBytes(bootChecksum);
+            for (int i = 0; i < 128; i++)
+                Array.Copy(chkBytes, 0, mainBoot, 11 * 512 + i * 4, 4);
+
+            // Main Boot Region (LBA 0..11) + Backup Boot Region (LBA 12..23)
+            WriteBytes(disk, part.StartingOffset, mainBoot);
+            WriteBytes(disk, part.StartingOffset + 12L * 512L, mainBoot);
+
+            // Zero entire FAT and populate cluster chains for Bitmap, Up-Case Table, and Root Directory
+            long fatStartByte = part.StartingOffset + (long)fatOffset * 512L;
+            long fatTotalBytes = (long)fatLength * 512L;
+            WriteZeroedRegion(disk, fatStartByte, fatTotalBytes);
+
+            int fatHeadLen = (int)Math.Min(fatTotalBytes, (((long)(rootFirst + 2u) * 4L + 511L) / 512L) * 512L);
+            byte[] fatHead = new byte[Math.Max(512, fatHeadLen)];
+            BitConverter.GetBytes(0xFFFFFFF8u).CopyTo(fatHead, 0);
+            BitConverter.GetBytes(0xFFFFFFFFu).CopyTo(fatHead, 4);
+            for (uint c = 2u; c < 2u + bitmapClusters; c++)
+            {
+                uint next = (c + 1u < 2u + bitmapClusters) ? (c + 1u) : 0xFFFFFFFFu;
+                BitConverter.GetBytes(next).CopyTo(fatHead, (int)(c * 4u));
+            }
+            for (uint c = upcaseFirst; c < upcaseFirst + upcaseClusters; c++)
+            {
+                uint next = (c + 1u < upcaseFirst + upcaseClusters) ? (c + 1u) : 0xFFFFFFFFu;
+                BitConverter.GetBytes(next).CopyTo(fatHead, (int)(c * 4u));
+            }
+            BitConverter.GetBytes(0xFFFFFFFFu).CopyTo(fatHead, (int)(rootFirst * 4u));
+            WriteBytes(disk, fatStartByte, fatHead);
+
+            // Allocation Bitmap at Cluster 2
+            long heapStartByte = part.StartingOffset + (long)clusterHeapOffset * 512L;
+            int bitmapWriteLen = (int)(bitmapClusters * clusBytes);
+            byte[] bitmapBuf = new byte[bitmapWriteLen];
+            for (uint b = 0; b < totalUsedClusters && (b >> 3) < (uint)bitmapWriteLen; b++)
+                bitmapBuf[b >> 3] |= (byte)(1 << (int)(b & 7));
+            WriteBytes(disk, heapStartByte, bitmapBuf);
+
+            // Up-Case Table at upcaseFirst
+            long upcaseStartByte = heapStartByte + (long)(upcaseFirst - 2u) * clusBytes;
+            int upcaseWriteLen = (int)(upcaseClusters * clusBytes);
+            byte[] upcaseBuf = new byte[Math.Max(upcaseBytes.Length, upcaseWriteLen)];
+            Array.Copy(upcaseBytes, 0, upcaseBuf, 0, upcaseBytes.Length);
+            WriteBytes(disk, upcaseStartByte, upcaseBuf);
+
+            // Root Directory at rootFirst (Volume Label 0x83 + Bitmap 0x81 + Up-Case 0x82)
+            long rootStartByte = heapStartByte + (long)(rootFirst - 2u) * clusBytes;
+            byte[] rootBuf = new byte[clusBytes];
+            int slot = 0;
+            string cleanVolLbl = (part.Label ?? string.Empty).Trim();
+            if (cleanVolLbl.Length > 11)
+                cleanVolLbl = cleanVolLbl.Substring(0, 11);
+            if (!string.IsNullOrEmpty(cleanVolLbl))
+            {
+                rootBuf[slot] = 0x83;
+                rootBuf[slot + 1] = (byte)cleanVolLbl.Length;
+                Encoding.Unicode.GetBytes(cleanVolLbl).CopyTo(rootBuf, slot + 2);
+                slot += 32;
+            }
+
+            // Allocation Bitmap Entry (0x81)
+            rootBuf[slot] = 0x81;
+            rootBuf[slot + 1] = 0x00;
+            BitConverter.GetBytes(2u).CopyTo(rootBuf, slot + 20);
+            BitConverter.GetBytes(bitmapLenBytes).CopyTo(rootBuf, slot + 24);
+            slot += 32;
+
+            // Up-Case Table Entry (0x82)
+            rootBuf[slot] = 0x82;
+            BitConverter.GetBytes(upcaseChecksum).CopyTo(rootBuf, slot + 4);
+            BitConverter.GetBytes(upcaseFirst).CopyTo(rootBuf, slot + 20);
+            BitConverter.GetBytes((ulong)upcaseBytes.Length).CopyTo(rootBuf, slot + 24);
+
+            WriteBytes(disk, rootStartByte, rootBuf);
+
+            part.UUID = string.Format("{0:X4}-{1:X4}", (exId >> 16) & 0xFFFF, exId & 0xFFFF);
+            part.UsedBytes = exUsed;
+            part.FreeBytes = Math.Max(0, part.PartitionLength - exUsed);
+        }
+
         private static void WriteZeroedRegion(DiskInfo disk, long offset, long length)
         {
             if (length <= 0) return;
-            const int chunkSize = 65536;
+            const int chunkSize = 1048576;
             byte[] zeros = new byte[chunkSize];
             long done = 0;
             while (done < length)
@@ -1904,7 +2193,7 @@ namespace WinParted.Core
 
         private static void WriteFat32TailStructures(DiskInfo disk, PartitionEntry part, int secPerClus, uint fatSz32)
         {
-            long fatBytes = Math.Min((long)fatSz32 * 512L, 4L * 1048576L);
+            long fatBytes = (long)fatSz32 * 512L;
             long fat1Rel = 32L * 512L;
             long fat2Rel = (32L + fatSz32) * 512L;
             long rootRel = (32L + 2L * fatSz32) * 512L;
@@ -1927,10 +2216,10 @@ namespace WinParted.Core
             if (rootRel + clusBytes <= part.PartitionLength)
             {
                 byte[] rootClus = new byte[(int)clusBytes];
-                if (!string.IsNullOrEmpty(part.Label))
+                string rootLbl = SanitizeFatLabel(part.Label, true);
+                if (!string.IsNullOrEmpty(rootLbl))
                 {
-                    string lbl = part.Label.ToUpperInvariant().PadRight(11).Substring(0, 11);
-                    Encoding.ASCII.GetBytes(lbl).CopyTo(rootClus, 0);
+                    Encoding.ASCII.GetBytes(rootLbl).CopyTo(rootClus, 0);
                     rootClus[11] = 0x08; // ATTR_VOLUME_ID
                 }
                 WriteBytes(disk, part.StartingOffset + rootRel, rootClus);
@@ -1961,10 +2250,10 @@ namespace WinParted.Core
             if (rootRel + rootBytes <= part.PartitionLength)
             {
                 byte[] rootDir = new byte[(int)rootBytes];
-                if (!string.IsNullOrEmpty(part.Label))
+                string rootLbl = SanitizeFatLabel(part.Label, true);
+                if (!string.IsNullOrEmpty(rootLbl))
                 {
-                    string lbl = part.Label.ToUpperInvariant().PadRight(11).Substring(0, 11);
-                    Encoding.ASCII.GetBytes(lbl).CopyTo(rootDir, 0);
+                    Encoding.ASCII.GetBytes(rootLbl).CopyTo(rootDir, 0);
                     rootDir[11] = 0x08; // ATTR_VOLUME_ID
                 }
                 WriteBytes(disk, part.StartingOffset + rootRel, rootDir);
@@ -2026,9 +2315,26 @@ namespace WinParted.Core
                 if (used >= 0)
                 {
                     if (used > part.PartitionLength) used = part.PartitionLength;
-                    WriteCustomUsedHint(buf, 0x1C0, used);
+                    if (disk.IsVirtualImage)
+                        WriteCustomUsedHint(buf, 0x1C0, used);
                     part.UsedBytes = used;
                     part.FreeBytes = part.PartitionLength - used;
+                }
+                if (buf.Length >= 12 * 512 && buf[0x6C] == 9)
+                {
+                    uint heapOff = BitConverter.ToUInt32(buf, 0x58);
+                    int spcShift = buf[0x6D];
+                    if (spcShift >= 1 && spcShift <= 20 && totalSectors > heapOff)
+                    {
+                        uint newClusCount = (uint)Math.Max(8L, Math.Min((long)uint.MaxValue - 10L, (totalSectors - heapOff) >> spcShift));
+                        BitConverter.GetBytes(newClusCount).CopyTo(buf, 0x5C);
+                    }
+                    uint chk = ComputeExFatChecksum(buf, 11 * 512, true);
+                    byte[] chkBytes = BitConverter.GetBytes(chk);
+                    for (int i = 0; i < 128; i++)
+                        Array.Copy(chkBytes, 0, buf, 11 * 512 + i * 4, 4);
+                    if (buf.Length >= 24 * 512)
+                        Array.Copy(buf, 0, buf, 12 * 512, 12 * 512);
                 }
                 WriteBytes(disk, part.StartingOffset, buf);
                 return;
@@ -2296,6 +2602,15 @@ namespace WinParted.Core
             {
                 Array.Clear(buf, 0x1A0, 32);
                 WriteCustomLabelHint(buf, 0x1A0, part.Label);
+                if (MatchesAscii(buf, 3, "EXFAT   ") && buf.Length >= 12 * 512 && buf[0x6C] == 9)
+                {
+                    uint chk = ComputeExFatChecksum(buf, 11 * 512, true);
+                    byte[] chkBytes = BitConverter.GetBytes(chk);
+                    for (int i = 0; i < 128; i++)
+                        Array.Copy(chkBytes, 0, buf, 11 * 512 + i * 4, 4);
+                    if (buf.Length >= 24 * 512)
+                        Array.Copy(buf, 0, buf, 12 * 512, 12 * 512);
+                }
                 WriteBytes(disk, part.StartingOffset, buf);
                 return;
             }
