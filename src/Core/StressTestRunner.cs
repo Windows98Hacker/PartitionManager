@@ -2535,13 +2535,310 @@ namespace WinParted.Core
                     (demoSwapVol2.OverlayRecords != null && demoSwapVol2.OverlayRecords.Count != 0))
                     throw new Exception("Experimental files or overlay records survived CreateDemoVirtualDisk reset!");
 
-                log("  -> Stress 10 PASSED (Zero/Ones/CryptoRandom wipe, Format overlay purge, and Demo reset cache/overlay cleanup verified).");
+                VerifyAllFileSystemsFormatMatrix(tempDir, log);
+
+                log("  -> Stress 10 PASSED (Zero/Ones/CryptoRandom wipe, Format overlay purge, Demo reset & all-23 FS format matrix verified).");
             }
             finally
             {
                 ReadOnlyFileSystemMountEngine.ShadowOverlayRootOverride = null;
                 ReadOnlyFileSystemMountEngine.UnmountAll();
             }
+        }
+
+        private static void VerifyAllFileSystemsFormatMatrix(string tempDir, Action<string> log)
+        {
+            string matrixImg = Path.Combine(tempDir, "stress10_all_fs_matrix.img");
+            var disk = RawDiskEngine.CreateBlankVirtualDisk(matrixImg, 24L * MiB, PartitionTableStyle.GPT);
+            disk.DiskNumber = 911;
+
+            var qmCreate = new OperationQueueManager();
+            qmCreate.SetBaselineDisks(null, new[] { disk });
+            qmCreate.Enqueue(MakeCreateOp(911, matrixImg, 1L * MiB, 20L * MiB, FileSystemType.NTFS, "MATRIX_INIT"));
+            qmCreate.ApplyAll();
+
+            FileSystemType[] allFormats = new FileSystemType[]
+            {
+                FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
+                FileSystemType.Ext2, FileSystemType.Ext3, FileSystemType.Ext4, FileSystemType.Btrfs, FileSystemType.XFS,
+                FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
+                FileSystemType.LinuxSwap, FileSystemType.LVM2, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
+                FileSystemType.EfiSystem, FileSystemType.WindowsRecovery, FileSystemType.RAW
+            };
+
+            for (int i = 0; i < allFormats.Length; i++)
+            {
+                FileSystemType targetFs = allFormats[i];
+                disk = RawDiskEngine.LoadVirtualDisk(matrixImg, 911);
+                var p = disk.Partitions[0];
+                string lbl = (targetFs == FileSystemType.RAW) ? string.Empty : ("M_" + targetFs.ToString().ToUpperInvariant());
+                if (lbl.Length > 11) lbl = lbl.Substring(0, 11);
+
+                var qm = new OperationQueueManager();
+                qm.SetBaselineDisks(null, new[] { disk });
+                qm.Enqueue(new PendingOperation
+                {
+                    Type = OperationType.FormatPartition,
+                    TargetDiskNumber = 911,
+                    TargetDiskPath = matrixImg,
+                    TargetPartitionNumber = p.PartitionNumber,
+                    OriginalStartOffset = p.StartingOffset,
+                    OriginalLength = p.PartitionLength,
+                    NewFileSystem = targetFs,
+                    NewLabel = lbl,
+                    NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(targetFs),
+                    NewMbrType = RawDiskEngine.GetDefaultMbrType(targetFs),
+                    Summary = "Matrix Format -> " + targetFs
+                });
+                qm.ApplyAll();
+
+                disk = RawDiskEngine.LoadVirtualDisk(matrixImg, 911);
+                var reloadedPart = disk.Partitions[0];
+                if (reloadedPart.FileSystem != targetFs)
+                {
+                    throw new Exception(string.Format(
+                        "Format matrix mismatch for {0}: reloaded as {1}.", targetFs, reloadedPart.FileSystem));
+                }
+
+                if (targetFs == FileSystemType.FAT32 || targetFs == FileSystemType.EfiSystem)
+                {
+                    byte[] hdr = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset, 4096);
+                    uint fatSz32 = BitConverter.ToUInt32(hdr, 0x24);
+                    uint rootClus = BitConverter.ToUInt32(hdr, 0x2C);
+                    ushort fsInfo = BitConverter.ToUInt16(hdr, 0x30);
+                    ushort bkBoot = BitConverter.ToUInt16(hdr, 0x32);
+                    if (fatSz32 == 0 || rootClus != 2u || fsInfo != 1 || bkBoot != 6)
+                        throw new Exception("Invalid FAT32 BPB geometry fields on formatted partition.");
+                    if (BitConverter.ToUInt32(hdr, 512) != 0x41615252u ||
+                        BitConverter.ToUInt32(hdr, 512 + 484) != 0x61417272u ||
+                        BitConverter.ToUInt32(hdr, 512 + 508) != 0xAA550000u)
+                        throw new Exception("Invalid FAT32 FSInfo signatures at LBA 1.");
+                    if (hdr[6 * 512 + 510] != 0x55 || hdr[6 * 512 + 511] != 0xAA)
+                        throw new Exception("Missing FAT32 backup boot sector signature at LBA 6.");
+
+                    byte[] fat1 = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + 32L * 512L, 512);
+                    byte[] fat2 = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + (32L + fatSz32) * 512L, 512);
+                    if (BitConverter.ToUInt32(fat1, 0) != 0x0FFFFFF8u || BitConverter.ToUInt32(fat2, 0) != 0x0FFFFFF8u)
+                        throw new Exception("Invalid FAT32 FAT1/FAT2 cluster 0 signature.");
+                }
+                else if (targetFs == FileSystemType.FAT16)
+                {
+                    byte[] boot16 = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset, 512);
+                    ushort fat16Sz = BitConverter.ToUInt16(boot16, 0x16);
+                    if (fat16Sz == 0)
+                        throw new Exception("Invalid FAT16 BPB_FATSz16 = 0.");
+                    byte[] fat1 = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + 512L, 512);
+                    byte[] fat2 = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + (1L + fat16Sz) * 512L, 512);
+                    if (fat1[0] != 0xF8 || fat1[1] != 0xFF || fat1[2] != 0xFF || fat1[3] != 0xFF ||
+                        fat2[0] != 0xF8 || fat2[1] != 0xFF || fat2[2] != 0xFF || fat2[3] != 0xFF)
+                        throw new Exception("Invalid FAT16 FAT1/FAT2 media descriptor entries.");
+                }
+                else if (targetFs == FileSystemType.exFAT)
+                {
+                    byte[] bootRegion = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset, 24 * 512);
+                    for (int z = 0x0B; z <= 0x3F; z++)
+                    {
+                        if (bootRegion[z] != 0)
+                            throw new Exception("exFAT MustBeZero region contains non-zero byte.");
+                    }
+                    if (bootRegion[0x6C] != 9 || bootRegion[0x6D] == 0 || bootRegion[0x6E] != 1)
+                        throw new Exception("Invalid exFAT sector/cluster/FAT shifts.");
+                    uint fatOffset = BitConverter.ToUInt32(bootRegion, 0x50);
+                    uint heapOffset = BitConverter.ToUInt32(bootRegion, 0x58);
+                    uint clusCount = BitConverter.ToUInt32(bootRegion, 0x5C);
+                    uint rootClus = BitConverter.ToUInt32(bootRegion, 0x60);
+                    if (fatOffset != 24u || heapOffset <= fatOffset || clusCount == 0 || rootClus < 4u)
+                        throw new Exception("Invalid exFAT volume geometry offsets.");
+
+                    uint expectedBootChk = RawDiskEngine.ComputeExFatChecksum(bootRegion, 11 * 512, true);
+                    for (int ci = 0; ci < 128; ci++)
+                    {
+                        if (BitConverter.ToUInt32(bootRegion, 11 * 512 + ci * 4) != expectedBootChk)
+                            throw new Exception("exFAT BootChecksum mismatch at LBA 11.");
+                    }
+                    for (int bi = 0; bi < 12 * 512; bi++)
+                    {
+                        if (bootRegion[bi] != bootRegion[12 * 512 + bi])
+                            throw new Exception("exFAT Backup Boot Region does not match Main Boot Region.");
+                    }
+
+                    byte[] exFat = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + (long)fatOffset * 512L, 512);
+                    if (BitConverter.ToUInt32(exFat, 0) != 0xFFFFFFF8u || BitConverter.ToUInt32(exFat, 4) != 0xFFFFFFFFu)
+                        throw new Exception("Invalid exFAT FAT media/EOC entries.");
+
+                    long spc = 1L << bootRegion[0x6D];
+                    long clusBytes = spc * 512L;
+                    long heapByteOff = (long)heapOffset * 512L;
+                    byte[] bmp = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + heapByteOff, 512);
+                    if ((bmp[0] & 1) == 0)
+                        throw new Exception("exFAT Allocation Bitmap cluster 2 bit not marked allocated.");
+
+                    long rootByteOff = heapByteOff + (long)(rootClus - 2u) * clusBytes;
+                    byte[] rootSec = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + rootByteOff, 512);
+                    bool foundBitmap = false, foundUpCase = false;
+                    uint upClus = 0, upChk = 0;
+                    ulong upLen = 0;
+                    for (int rOff = 0; rOff + 32 <= rootSec.Length; rOff += 32)
+                    {
+                        if (rootSec[rOff] == 0x81) foundBitmap = true;
+                        if (rootSec[rOff] == 0x82)
+                        {
+                            foundUpCase = true;
+                            upChk = BitConverter.ToUInt32(rootSec, rOff + 4);
+                            upClus = BitConverter.ToUInt32(rootSec, rOff + 20);
+                            upLen = BitConverter.ToUInt64(rootSec, rOff + 24);
+                        }
+                    }
+                    if (!foundBitmap || !foundUpCase || upClus < 3u || upLen == 0)
+                        throw new Exception("exFAT Root Directory missing Allocation Bitmap (0x81) or Up-Case Table (0x82).");
+                    byte[] upBytes = RawDiskEngine.ReadBytes(disk, reloadedPart.StartingOffset + heapByteOff + (long)(upClus - 2u) * clusBytes, (int)upLen);
+                    if (RawDiskEngine.ComputeExFatChecksum(upBytes, upBytes.Length, false) != upChk)
+                        throw new Exception("exFAT Up-Case Table checksum mismatch.");
+                }
+            }
+
+            // Verify 72 MiB FAT32 (inside 64..260 MiB range) reaches >= 65525 clusters with secPerClus == 1
+            string smallFatImg = Path.Combine(tempDir, "stress10_fat32_72m.img");
+            var smallFatDisk = RawDiskEngine.CreateBlankVirtualDisk(smallFatImg, 74L * MiB, PartitionTableStyle.MBR);
+            smallFatDisk.DiskNumber = 912;
+            var qmFat72 = new OperationQueueManager();
+            qmFat72.SetBaselineDisks(null, new[] { smallFatDisk });
+            qmFat72.Enqueue(MakeCreateOp(912, smallFatImg, 1L * MiB, 72L * MiB, FileSystemType.FAT32, "FAT72M"));
+            qmFat72.ApplyAll();
+            smallFatDisk = RawDiskEngine.LoadVirtualDisk(smallFatImg, 912);
+            var p72 = smallFatDisk.Partitions[0];
+            if (p72.FileSystem != FileSystemType.FAT32)
+                throw new Exception("72 MiB FAT32 partition misidentified as " + p72.FileSystem);
+            byte[] hdr72 = RawDiskEngine.ReadBytes(smallFatDisk, p72.StartingOffset, 4096);
+            if (hdr72[0x0D] != 1)
+                throw new Exception("72 MiB FAT32 expected BPB_SecPerClus = 1, got " + hdr72[0x0D]);
+            uint fatSz72 = BitConverter.ToUInt32(hdr72, 0x24);
+            long totSec72 = BitConverter.ToUInt32(hdr72, 0x20);
+            long dataClus72 = (totSec72 - 32L - 2L * fatSz72) / hdr72[0x0D];
+            if (dataClus72 < 65525L)
+                throw new Exception("72 MiB FAT32 has fewer than 65525 data clusters: " + dataClus72);
+
+            // Verify real multi-group Linux-mountable Ext2/Ext3/Ext4 formatter across 2 block groups (140 MiB)
+            string extImg = Path.Combine(tempDir, "stress10_real_ext_2grp.img");
+            FileSystemType[] extFses = new FileSystemType[] { FileSystemType.Ext2, FileSystemType.Ext3, FileSystemType.Ext4 };
+            for (int ei = 0; ei < extFses.Length; ei++)
+            {
+                FileSystemType extFs = extFses[ei];
+                var extDisk = RawDiskEngine.CreateBlankVirtualDisk(extImg, 144L * MiB, PartitionTableStyle.MBR);
+                extDisk.DiskNumber = 913;
+                var qmExt = new OperationQueueManager();
+                qmExt.SetBaselineDisks(null, new[] { extDisk });
+                qmExt.Enqueue(MakeCreateOp(913, extImg, 1L * MiB, 140L * MiB, extFs, "REAL_" + extFs.ToString().ToUpperInvariant()));
+                qmExt.ApplyAll();
+
+                extDisk = RawDiskEngine.LoadVirtualDisk(extImg, 913);
+                var ep = extDisk.Partitions[0];
+                ep.Label = "REAL_" + extFs.ToString().ToUpperInvariant();
+                ep.FileSystem = extFs;
+                RawDiskEngine.WriteRealExtFileSystem(extDisk, ep);
+                extDisk.CanRawRead = true;
+                RawDiskEngine.InspectPartitionSuperblock(extDisk, ep);
+                if (ep.FileSystem != extFs)
+                    throw new Exception("WriteRealExtFileSystem readback mismatch for " + extFs + ": got " + ep.FileSystem);
+
+                byte[] sbBytes = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + 1024L, 1024);
+                uint freeBlocksSb = BitConverter.ToUInt32(sbBytes, 0x0C);
+                uint freeInodesSb = BitConverter.ToUInt32(sbBytes, 0x10);
+                uint featIncompat = BitConverter.ToUInt32(sbBytes, 0x60);
+                uint journalInum = BitConverter.ToUInt32(sbBytes, 0xE0);
+                byte[] gdtBytes = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + 4096L, 64);
+                uint bgFreeSum = BitConverter.ToUInt16(gdtBytes, 0x0C) + (uint)BitConverter.ToUInt16(gdtBytes, 32 + 0x0C);
+                uint bgInoSum = BitConverter.ToUInt16(gdtBytes, 0x0E) + (uint)BitConverter.ToUInt16(gdtBytes, 32 + 0x0E);
+                if (freeBlocksSb != bgFreeSum || freeInodesSb != bgInoSum)
+                    throw new Exception("Real " + extFs + " superblock free counts do not match Group 0 + Group 1 sums.");
+
+                byte[] backupSb = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + 32768L * 4096L, 1024);
+                if (BitConverter.ToUInt16(backupSb, 0x38) != 0xEF53 || BitConverter.ToUInt16(backupSb, 0x5A) != 1)
+                    throw new Exception("Real " + extFs + " Group 1 backup superblock invalid.");
+
+                if (extFs == FileSystemType.Ext3 || extFs == FileSystemType.Ext4)
+                {
+                    if (journalInum != 8u)
+                        throw new Exception("Real " + extFs + " missing s_journal_inum=8.");
+                    uint g0ItableBlk = BitConverter.ToUInt32(gdtBytes, 0x08);
+                    byte[] ino8 = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + (long)g0ItableBlk * 4096L + 7L * 256L, 256);
+                    uint jFirstBlk = (extFs == FileSystemType.Ext4)
+                        ? BitConverter.ToUInt32(ino8, 0x3C)
+                        : BitConverter.ToUInt32(ino8, 0x28);
+                    if (jFirstBlk == 0u)
+                        throw new Exception("Real " + extFs + " Inode 8 has zero journal block.");
+                    byte[] jHdr = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + (long)jFirstBlk * 4096L, 64);
+                    if (jHdr[0] != 0xC0 || jHdr[1] != 0x3B || jHdr[2] != 0x39 || jHdr[3] != 0x98 ||
+                        jHdr[4] != 0 || jHdr[5] != 0 || jHdr[6] != 0 || jHdr[7] != 4)
+                        throw new Exception("Real " + extFs + " Inode 8 missing big-endian JBD2_SUPERBLOCK_V2 header.");
+                }
+                if (extFs == FileSystemType.Ext4)
+                {
+                    if ((featIncompat & 0x0200u) != 0 || (featIncompat & 0x0040u) == 0)
+                        throw new Exception("Real Ext4 incompat flags invalid (expected EXTENTS without FLEX_BG).");
+                }
+            }
+
+            // Verify >32 GiB FAT32 and MBR vs GPT DiskPart scripts
+            var bigFat32 = new PendingOperation
+            {
+                Type = OperationType.FormatPartition,
+                TargetDiskNumber = 2,
+                TargetPartitionNumber = 1,
+                OriginalStartOffset = 1L * MiB,
+                OriginalLength = 64L * 1073741824L,
+                NewFileSystem = FileSystemType.FAT32,
+                NewLabel = "BIGFAT32"
+            };
+            string bigScript = OperationQueueManager.BuildDiskPartScript(bigFat32, PartitionTableStyle.GPT);
+            if (bigScript.IndexOf("format fs=fat32", StringComparison.OrdinalIgnoreCase) >= 0)
+                throw new Exception("FAT32 > 32 GiB should bypass DiskPart format fs=fat32.");
+
+            var smallFat32 = new PendingOperation
+            {
+                Type = OperationType.FormatPartition,
+                TargetDiskNumber = 2,
+                TargetPartitionNumber = 1,
+                OriginalStartOffset = 1L * MiB,
+                OriginalLength = 8L * 1073741824L,
+                NewFileSystem = FileSystemType.FAT32,
+                NewLabel = "SMALLFAT"
+            };
+            string modernSmall = OperationQueueManager.BuildDiskPartScript(smallFat32, PartitionTableStyle.GPT);
+            if (modernSmall.IndexOf("format fs=fat32", StringComparison.OrdinalIgnoreCase) < 0)
+                throw new Exception("FAT32 <= 32 GiB should emit DiskPart format on modern Windows.");
+
+            var mbrEfiCreate = new PendingOperation
+            {
+                Type = OperationType.CreatePartition,
+                TargetDiskNumber = 2,
+                StartOffset = 1L * MiB,
+                Length = 100L * MiB,
+                NewFileSystem = FileSystemType.EfiSystem,
+                NewMbrBoot = true
+            };
+            string mbrCreateScript = OperationQueueManager.BuildDiskPartScript(mbrEfiCreate, PartitionTableStyle.MBR);
+            if (mbrCreateScript.IndexOf("create partition efi", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                mbrCreateScript.IndexOf("create partition primary", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrCreateScript.IndexOf("active", StringComparison.OrdinalIgnoreCase) < 0)
+                throw new Exception("MBR CreatePartition script must emit 'create partition primary' + 'active', never 'create partition efi'.");
+
+            var extFmtOp = new PendingOperation
+            {
+                Type = OperationType.FormatPartition,
+                TargetDiskNumber = 2,
+                TargetPartitionNumber = 1,
+                OriginalStartOffset = 1L * MiB,
+                OriginalLength = 100L * MiB,
+                NewFileSystem = FileSystemType.Ext4
+            };
+            string mbrExtScript = OperationQueueManager.BuildDiskPartScript(extFmtOp, PartitionTableStyle.MBR);
+            string gptExtScript = OperationQueueManager.BuildDiskPartScript(extFmtOp, PartitionTableStyle.GPT);
+            if (mbrExtScript.IndexOf("set id=83 override", StringComparison.OrdinalIgnoreCase) < 0 ||
+                gptExtScript.IndexOf("set id=" + GptPartitionTypeGuids.LinuxFilesystem.ToString("D"), StringComparison.OrdinalIgnoreCase) < 0)
+                throw new Exception("Ext4 FormatPartition script must emit 0x83 on MBR and LinuxFilesystem GUID on GPT.");
+
+            log("  -> Verified all " + allFormats.Length + " formattable FileSystemTypes + 2-group Ext2/3/4 + FAT32 (incl. 72 MiB)/FAT16/exFAT + MBR/GPT scripts.");
         }
 
         private static void ExpectRejected(Action act, string scenario)

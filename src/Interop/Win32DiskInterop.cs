@@ -129,10 +129,39 @@ namespace WinParted.Interop
             out ulong lpTotalNumberOfFreeBytes);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool SetVolumeMountPoint(string lpszVolumeMountPoint, string lpszVolumeName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool DeleteVolumeMountPoint(string lpszVolumeMountPoint);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool SetVolumeLabel(string lpRootPathName, string lpVolumeName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetDriveType(string lpRootPathName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint GetLogicalDrives();
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate bool FmifsCallback(uint command, uint subAction, IntPtr actionInfo);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FmifsTextOutput
+        {
+            public uint Lines;
+            public IntPtr Output;
+        }
+
+        [DllImport("fmifs.dll", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.StdCall)]
+        private static extern void FormatEx(
+            [MarshalAs(UnmanagedType.LPWStr)] string driveRoot,
+            uint mediaFlag,
+            [MarshalAs(UnmanagedType.LPWStr)] string format,
+            [MarshalAs(UnmanagedType.LPWStr)] string label,
+            [MarshalAs(UnmanagedType.Bool)] bool quickFormat,
+            uint clusterSize,
+            FmifsCallback callback);
 
         public static bool IsAdministrator()
         {
@@ -290,18 +319,22 @@ namespace WinParted.Interop
                                 disk.IsSystemDisk = true;
                             }
                         }
-                        if (!string.IsNullOrEmpty(match.Label))
-                            part.Label = match.Label;
-                        if (!string.IsNullOrEmpty(match.FileSystemName))
-                            part.FileSystem = ParseWindowsFsName(match.FileSystemName, part.FileSystem);
-                        if (match.TotalBytes.HasValue && match.FreeBytes.HasValue)
+                        bool allowWinFsOverride = !disk.CanRawRead || IsWindowsNativeFileSystem(part.FileSystem);
+                        if (allowWinFsOverride)
                         {
-                            part.FreeBytes = match.FreeBytes.Value;
-                            part.UsedBytes = Math.Max(0, match.TotalBytes.Value - match.FreeBytes.Value);
-                        }
-                        if (match.VolumeSerial != 0 && string.IsNullOrEmpty(part.UUID))
-                        {
-                            part.UUID = string.Format("{0:X4}-{1:X4}", (match.VolumeSerial >> 16) & 0xFFFF, match.VolumeSerial & 0xFFFF);
+                            if (!string.IsNullOrEmpty(match.Label))
+                                part.Label = match.Label;
+                            if (!string.IsNullOrEmpty(match.FileSystemName))
+                                part.FileSystem = ParseWindowsFsName(match.FileSystemName, part.FileSystem);
+                            if (match.TotalBytes.HasValue && match.FreeBytes.HasValue)
+                            {
+                                part.FreeBytes = match.FreeBytes.Value;
+                                part.UsedBytes = Math.Max(0, match.TotalBytes.Value - match.FreeBytes.Value);
+                            }
+                            if (match.VolumeSerial != 0 && string.IsNullOrEmpty(part.UUID))
+                            {
+                                part.UUID = string.Format("{0:X4}-{1:X4}", (match.VolumeSerial >> 16) & 0xFFFF, match.VolumeSerial & 0xFFFF);
+                            }
                         }
                         part.IsMounted = !string.IsNullOrEmpty(match.DriveLetter) || !string.IsNullOrEmpty(match.VolumeGuidPath);
                     }
@@ -1104,7 +1137,7 @@ namespace WinParted.Interop
             return TryWriteRawAlignedExact(handle, alignedStart, alignedBuf, out win32Error);
         }
 
-        private static void NotifyDiskPropertiesUpdated(string devicePath)
+        public static void NotifyDiskPropertiesUpdated(string devicePath)
         {
             try
             {
@@ -1119,6 +1152,191 @@ namespace WinParted.Interop
             }
             catch
             {
+            }
+        }
+
+        public static string TryAssignFreeDriveLetter(string volumeGuidPath)
+        {
+            if (string.IsNullOrEmpty(volumeGuidPath))
+                return string.Empty;
+
+            string volGuid = volumeGuidPath.TrimEnd('\\') + "\\";
+            uint mask = GetLogicalDrives();
+            for (char c = 'D'; c <= 'Z'; c++)
+            {
+                if ((mask & (1u << (c - 'A'))) != 0)
+                    continue;
+                string root = c + ":\\";
+                try
+                {
+                    if (SetVolumeMountPoint(root, volGuid))
+                        return c + ":";
+                }
+                catch
+                {
+                }
+            }
+            return string.Empty;
+        }
+
+        public static bool WaitForPartitionVolume(
+            int diskNumber,
+            long expectedStartOffset,
+            int timeoutMs,
+            out string driveLetter,
+            out string volumeGuidPath)
+        {
+            driveLetter = string.Empty;
+            volumeGuidPath = string.Empty;
+
+            NotifyDiskPropertiesUpdated(@"\\.\PhysicalDrive" + diskNumber);
+            int deadline = Environment.TickCount + Math.Max(250, timeoutMs);
+
+            while (true)
+            {
+                var mappings = DiscoverVolumeMappings();
+                var match = mappings
+                    .Where(v => v.DiskNumber == diskNumber && Math.Abs(v.StartOffset - expectedStartOffset) <= 16L * 1048576L)
+                    .OrderBy(v => Math.Abs(v.StartOffset - expectedStartOffset))
+                    .FirstOrDefault();
+
+                if (match != null)
+                {
+                    driveLetter = match.DriveLetter ?? string.Empty;
+                    volumeGuidPath = match.VolumeGuidPath ?? string.Empty;
+                    if (string.IsNullOrEmpty(driveLetter) && !string.IsNullOrEmpty(volumeGuidPath))
+                    {
+                        string assigned = TryAssignFreeDriveLetter(volumeGuidPath);
+                        if (!string.IsNullOrEmpty(assigned))
+                            driveLetter = assigned;
+                    }
+                    if (!string.IsNullOrEmpty(driveLetter) || !string.IsNullOrEmpty(volumeGuidPath))
+                        return true;
+                }
+
+                if (Environment.TickCount - deadline >= 0)
+                    break;
+                System.Threading.Thread.Sleep(250);
+            }
+
+            return false;
+        }
+
+        public static bool TryFormatVolumeWithFmifs(
+            string volumeRoot,
+            string fileSystemName,
+            string label,
+            Action<int> onPercent,
+            Action<string> onOutput,
+            out string failureReason)
+        {
+            failureReason = string.Empty;
+            if (string.IsNullOrEmpty(volumeRoot) || string.IsNullOrEmpty(fileSystemName))
+            {
+                failureReason = "Missing target volume path or filesystem name.";
+                return false;
+            }
+
+            string root = volumeRoot.TrimEnd('\\') + "\\";
+            uint dt = GetDriveType(root);
+            uint primaryMedia = (dt == 2u) ? 0x0Bu : 0x0Cu; // FMIFS_REMOVABLE vs FMIFS_HARDDISK
+            uint altMedia = (primaryMedia == 0x0Bu) ? 0x0Cu : 0x0Bu;
+
+            string attemptErr;
+            if (InvokeFmifsFormatEx(root, primaryMedia, fileSystemName, label, onPercent, onOutput, out attemptErr))
+                return true;
+
+            if (attemptErr.IndexOf("Unsupported filesystem", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                attemptErr.IndexOf("Insufficient rights", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                failureReason = attemptErr;
+                return false;
+            }
+
+            string altErr;
+            if (InvokeFmifsFormatEx(root, altMedia, fileSystemName, label, onPercent, onOutput, out altErr))
+                return true;
+
+            failureReason = !string.IsNullOrEmpty(altErr) ? altErr : attemptErr;
+            return false;
+        }
+
+        private static bool InvokeFmifsFormatEx(
+            string root,
+            uint mediaFlag,
+            string fileSystemName,
+            string label,
+            Action<int> onPercent,
+            Action<string> onOutput,
+            out string failureReason)
+        {
+            failureReason = string.Empty;
+            bool doneSeen = false;
+            bool ok = false;
+            string cbFailure = string.Empty;
+
+            FmifsCallback cb = (command, subAction, actionInfo) =>
+            {
+                try
+                {
+                    if (command == 0u && actionInfo != IntPtr.Zero) // PROGRESS
+                    {
+                        int pct = Marshal.ReadInt32(actionInfo);
+                        if (onPercent != null) onPercent(pct);
+                    }
+                    else if (command == 6u) // INSUFFICIENTRIGHTS
+                    {
+                        cbFailure = "Insufficient rights (Administrator required).";
+                    }
+                    else if (command == 7u) // FSNOTSUPPORTED
+                    {
+                        cbFailure = "Unsupported filesystem on this OS (" + fileSystemName + ").";
+                    }
+                    else if (command == 11u && actionInfo != IntPtr.Zero) // DONE
+                    {
+                        doneSeen = true;
+                        ok = Marshal.ReadByte(actionInfo) != 0;
+                    }
+                    else if (command == 14u && actionInfo != IntPtr.Zero) // OUTPUT
+                    {
+                        FmifsTextOutput txt = (FmifsTextOutput)Marshal.PtrToStructure(actionInfo, typeof(FmifsTextOutput));
+                        if (txt.Output != IntPtr.Zero)
+                        {
+                            string line = Marshal.PtrToStringAnsi(txt.Output);
+                            if (!string.IsNullOrEmpty(line))
+                            {
+                                string trimmed = line.Trim();
+                                if (trimmed.Length > 0 && onOutput != null)
+                                    onOutput(trimmed);
+                            }
+                        }
+                    }
+                    else if (command == 16u) // CLUSTERSIZETOOSMALL
+                    {
+                        cbFailure = "Volume too small or too large for default cluster size.";
+                    }
+                }
+                catch
+                {
+                }
+                return true;
+            };
+
+            try
+            {
+                FormatEx(root, mediaFlag, fileSystemName, label ?? string.Empty, true, 0u, cb);
+                GC.KeepAlive(cb);
+                if (doneSeen && ok)
+                    return true;
+                failureReason = !string.IsNullOrEmpty(cbFailure)
+                    ? cbFailure
+                    : string.Format("fmifs.dll FormatEx declined ({0}, media=0x{1:X2}).", fileSystemName, mediaFlag);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                failureReason = ex.Message;
+                return false;
             }
         }
 
@@ -1209,6 +1427,11 @@ namespace WinParted.Interop
                         int err;
                         if (TryWriteHandleAtOffset(heldHandles[coverIdx], relOffset, data, align, out err))
                         {
+                            if (relOffset < 65536L)
+                            {
+                                uint dRet;
+                                DeviceIoControl(heldHandles[coverIdx], FSCTL_DISMOUNT_VOLUME, null, 0, null, 0, out dRet, IntPtr.Zero);
+                            }
                             NotifyDiskPropertiesUpdated(devicePath);
                             return;
                         }
@@ -1427,6 +1650,25 @@ namespace WinParted.Interop
 
             string detail = attemptErrors.Count > 0 ? " [" + string.Join("; ", attemptErrors.ToArray()) + "]" : "";
             throw new Win32Exception(lastErr, "Raw disk WriteFile failed at offset 0x" + byteOffset.ToString("X") + detail);
+        }
+
+        private static bool IsWindowsNativeFileSystem(FileSystemType fs)
+        {
+            switch (fs)
+            {
+                case FileSystemType.NTFS:
+                case FileSystemType.WindowsRecovery:
+                case FileSystemType.FAT32:
+                case FileSystemType.EfiSystem:
+                case FileSystemType.FAT16:
+                case FileSystemType.exFAT:
+                case FileSystemType.ReFS:
+                case FileSystemType.BitLocker:
+                case FileSystemType.RAW:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         public static FileSystemType ParseWindowsFsName(string fsName, FileSystemType fallback)

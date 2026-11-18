@@ -34,6 +34,9 @@ namespace WinParted.UI.Dialogs
         private readonly ComboBox _cmbFs;
         private readonly TextBox _txtLabel;
         private readonly TextBox _txtPartName;
+        private readonly CheckBox _chkMbrBoot;
+        private readonly Label _lblTableTypeInfo;
+        private readonly Label _lblFormatNote;
         private readonly Label _lblRangeInfo;
 
         private bool _updating;
@@ -43,6 +46,7 @@ namespace WinParted.UI.Dialogs
         public FileSystemType ResultFileSystem { get; private set; }
         public string ResultLabel { get; private set; }
         public string ResultPartitionName { get; private set; }
+        public bool ResultMbrBoot { get; private set; }
 
         public CreateOrResizePartitionDialog(
             DiskInfo disk,
@@ -57,13 +61,21 @@ namespace WinParted.UI.Dialogs
             _regionStartBytes = contiguousStartBytes;
             _regionTotalBytes = contiguousTotalBytes;
 
+            bool isGpt = disk.PartitionStyle == PartitionTableStyle.GPT;
+            bool isMbr = disk.PartitionStyle == PartitionTableStyle.MBR;
+
             long usedBytes = (!isCreateMode && targetSlice.UsedBytes.HasValue) ? targetSlice.UsedBytes.Value : 0;
             _minSizeBytes = Math.Max(1048576L, ByteFormatter.AlignUp(Math.Max(1048576L, usedBytes), 1048576L));
             if (_minSizeBytes > _regionTotalBytes) _minSizeBytes = _regionTotalBytes;
 
-            Text = isCreateMode ? "Create New Partition" : "Resize / Move Partition — " + targetSlice.ShortDeviceName;
-            Size = new Size(890, 560);
-            MinimumSize = new Size(760, 480);
+            Text = isCreateMode
+                ? string.Format("Create New Partition ({0})", disk.PartitionStyle)
+                : string.Format("Resize / Move Partition — {0} ({1})", targetSlice.ShortDeviceName, disk.PartitionStyle);
+            Rectangle wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int maxW = Math.Max(480, (int)(wa.Width * 0.92));
+            int maxH = Math.Max(340, (int)(wa.Height * 0.92));
+            Size = new Size(Math.Min(860, maxW), Math.Min(620, maxH));
+            MinimumSize = new Size(Math.Min(640, maxW), Math.Min(460, maxH));
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
@@ -82,6 +94,7 @@ namespace WinParted.UI.Dialogs
             {
                 Dock = DockStyle.Bottom,
                 Height = ThemeManager.F55,
+                WrapContents = false,
                 FlowDirection = FlowDirection.RightToLeft,
                 Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
             };
@@ -109,19 +122,36 @@ namespace WinParted.UI.Dialogs
             var formTable = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
+                AutoScroll = true,
                 ColumnCount = 2,
-                RowCount = 8,
-                Padding = new Padding(0, 8, 0, 0)
+                RowCount = 10,
+                Padding = new Padding(0, 4, 0, 0)
             };
             formTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             formTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
+            int existingCount = disk.Partitions != null ? disk.Partitions.Count(p => !p.IsUnallocated) : 0;
+            string tableDesc = isGpt
+                ? string.Format("GPT (GUID Partition Table — {0} / {1} partitions)", existingCount, disk.MaxPartitions > 0 ? disk.MaxPartitions : 128)
+                : (isMbr
+                    ? string.Format("MBR (Master Boot Record — {0} / 4 primary partitions)", existingCount)
+                    : "RAW (Uninitialized — create MBR or GPT table first)");
+            var lblPartitionTable = new Label
+            {
+                Text = tableDesc,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(8, 5, 0, 4)
+            };
+            AddRow(formTable, 0, "Partition table:", lblPartitionTable);
+
             long maxMiB = Math.Max(1, _regionTotalBytes / 1048576L);
             long minMiB = Math.Max(1, _minSizeBytes / 1048576L);
 
-            _numBeforeMiB = AddNumericRow(formTable, 0, "Free space preceding (MiB):", 0, maxMiB - minMiB);
-            _numSizeMiB = AddNumericRow(formTable, 1, "New size (MiB):", minMiB, maxMiB);
-            _numAfterMiB = AddNumericRow(formTable, 2, "Free space following (MiB):", 0, maxMiB - minMiB);
+            _numBeforeMiB = AddNumericRow(formTable, 1, "Free space preceding (MiB):", 0, maxMiB - minMiB);
+            _numSizeMiB = AddNumericRow(formTable, 2, "New size (MiB):", minMiB, maxMiB);
+            _numAfterMiB = AddNumericRow(formTable, 3, "Free space following (MiB):", 0, maxMiB - minMiB);
 
             _numBeforeMiB.ValueChanged += (s, e) => OnNumericBeforeChanged();
             _numSizeMiB.ValueChanged += (s, e) => OnNumericSizeChanged();
@@ -131,53 +161,105 @@ namespace WinParted.UI.Dialogs
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Anchor = AnchorStyles.Left | AnchorStyles.Right,
-                Margin = new Padding(8, 6, 0, 6)
+                Margin = new Padding(8, 4, 0, 4)
             };
             _cmbAlign.Items.AddRange(new object[] { "MiB (1024 KiB - Recommended)", "Cylinder (8 MiB)", "None (Sector 512 B)" });
             _cmbAlign.SelectedIndex = 0;
-            AddRow(formTable, 3, "Align to:", _cmbAlign);
+            AddRow(formTable, 4, "Align to:", _cmbAlign);
 
             _cmbFs = new ComboBox
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 Enabled = isCreateMode,
                 Anchor = AnchorStyles.Left | AnchorStyles.Right,
-                Margin = new Padding(8, 6, 0, 6)
+                Margin = new Padding(8, 4, 0, 4)
             };
             var fsOptions = new[]
             {
                 FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
                 FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
                 FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
-                FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
+                FileSystemType.LinuxSwap, FileSystemType.LVM2, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
                 FileSystemType.EfiSystem, FileSystemType.MicrosoftReserved, FileSystemType.RAW
             };
-            foreach (var fs in fsOptions) _cmbFs.Items.Add(fs);
-            _cmbFs.SelectedItem = isCreateMode ? FileSystemType.NTFS : (fsOptions.Contains(targetSlice.FileSystem) ? targetSlice.FileSystem : FileSystemType.NTFS);
-            _cmbFs.SelectedIndexChanged += (s, e) =>
+            foreach (var fs in fsOptions)
             {
-                if (_cmbFs.SelectedItem is FileSystemType)
-                    _sliderBar.SetFileSystem((FileSystemType)_cmbFs.SelectedItem);
-            };
-            AddRow(formTable, 4, "File system:", _cmbFs);
+                if (fs == FileSystemType.MicrosoftReserved && !isGpt && (isCreateMode || targetSlice.FileSystem != FileSystemType.MicrosoftReserved))
+                    continue;
+                _cmbFs.Items.Add(fs);
+            }
+            FileSystemType initialFs = isCreateMode
+                ? FileSystemType.NTFS
+                : (_cmbFs.Items.Contains(targetSlice.FileSystem) ? targetSlice.FileSystem : FileSystemType.NTFS);
+            _cmbFs.SelectedItem = initialFs;
 
-            _txtPartName = new TextBox
+            int rowIdx = 5;
+            AddRow(formTable, rowIdx++, "File system:", _cmbFs);
+
+            _lblTableTypeInfo = new Label
             {
-                Text = isCreateMode ? "Basic data partition" : (targetSlice.PartitionName ?? string.Empty),
-                Enabled = isCreateMode && disk.PartitionStyle == PartitionTableStyle.GPT,
-                Anchor = AnchorStyles.Left | AnchorStyles.Right,
-                Margin = new Padding(8, 6, 0, 6)
+                Text = RawDiskEngine.DescribePartitionType(disk.PartitionStyle, initialFs),
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(8, 5, 0, 4)
             };
-            AddRow(formTable, 5, "Partition name (GPT):", _txtPartName);
+
+            if (isGpt)
+            {
+                _txtPartName = new TextBox
+                {
+                    Text = isCreateMode ? "Basic data partition" : (targetSlice.PartitionName ?? string.Empty),
+                    Enabled = isCreateMode,
+                    Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                    Margin = new Padding(8, 4, 0, 4)
+                };
+                AddRow(formTable, rowIdx++, "Partition name (GPT):", _txtPartName);
+                AddRow(formTable, rowIdx++, "GPT partition type:", _lblTableTypeInfo);
+            }
+            else
+            {
+                AddRow(formTable, rowIdx++, "MBR partition type:", _lblTableTypeInfo);
+                _chkMbrBoot = new CheckBox
+                {
+                    Text = "Active / Bootable (0x80 MBR)",
+                    AutoSize = true,
+                    Enabled = isCreateMode && isMbr,
+                    Checked = !isCreateMode && targetSlice.MbrBootable,
+                    Anchor = AnchorStyles.Left,
+                    Margin = new Padding(8, 5, 0, 4)
+                };
+                AddRow(formTable, rowIdx++, "MBR flags:", _chkMbrBoot);
+            }
 
             _txtLabel = new TextBox
             {
                 Text = isCreateMode ? "New Volume" : (targetSlice.Label ?? string.Empty),
                 Enabled = isCreateMode,
                 Anchor = AnchorStyles.Left | AnchorStyles.Right,
-                Margin = new Padding(8, 6, 0, 6)
+                Margin = new Padding(8, 4, 0, 4)
             };
-            AddRow(formTable, 6, "Volume label:", _txtLabel);
+            AddRow(formTable, rowIdx++, "Volume label:", _txtLabel);
+
+            _lblFormatNote = new Label
+            {
+                Text = RawDiskEngine.GetFormatSupportNote(initialFs),
+                AutoSize = true,
+                MaximumSize = new Size(520, 0),
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(8, 5, 0, 4)
+            };
+            AddRow(formTable, rowIdx++, "Format behavior:", _lblFormatNote);
+
+            _cmbFs.SelectedIndexChanged += (s, e) =>
+            {
+                if (_cmbFs.SelectedItem is FileSystemType)
+                {
+                    FileSystemType chosen = (FileSystemType)_cmbFs.SelectedItem;
+                    _sliderBar.SetFileSystem(chosen);
+                    _lblTableTypeInfo.Text = RawDiskEngine.DescribePartitionType(_disk.PartitionStyle, chosen);
+                    _lblFormatNote.Text = RawDiskEngine.GetFormatSupportNote(chosen);
+                }
+            };
 
             rootPanel.Controls.Add(formTable);
 
@@ -314,7 +396,10 @@ namespace WinParted.UI.Dialogs
             ResultLengthBytes = alignedLen;
             ResultFileSystem = _cmbFs.SelectedItem is FileSystemType ? (FileSystemType)_cmbFs.SelectedItem : FileSystemType.NTFS;
             ResultLabel = _txtLabel.Text.Trim();
-            ResultPartitionName = _txtPartName.Text.Trim();
+            ResultPartitionName = (_disk.PartitionStyle == PartitionTableStyle.GPT && _txtPartName != null)
+                ? _txtPartName.Text.Trim()
+                : string.Empty;
+            ResultMbrBoot = (_disk.PartitionStyle != PartitionTableStyle.GPT && _chkMbrBoot != null && _chkMbrBoot.Checked);
         }
 
         private class SliderPreviewPanel : Panel
@@ -1333,6 +1418,7 @@ namespace WinParted.UI.Dialogs
         private readonly SmoothProgressBar _barCurrent;
         private readonly ListView _lvOps;
         private readonly TextBox _txtLog;
+        private readonly TableLayoutPanel _bottomBar;
         private readonly Button _btnCopyLog;
         private readonly Button _btnClose;
 
@@ -1367,8 +1453,11 @@ namespace WinParted.UI.Dialogs
             Text = count == 1
                 ? "Applying 1 Partition Operation"
                 : string.Format("Applying {0} Pending Partition Operations", count);
-            Size = new Size(920, 620);
-            MinimumSize = new Size(720, 480);
+            Rectangle initWa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int initMaxW = Math.Max(480, (int)(initWa.Width * 0.92));
+            int initMaxH = Math.Max(340, (int)(initWa.Height * 0.92));
+            Size = new Size(Math.Min(820, initMaxW), Math.Min(540, initMaxH));
+            MinimumSize = new Size(Math.Min(560, initMaxW), Math.Min(380, initMaxH));
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = true;
             MinimizeBox = false;
@@ -1380,7 +1469,7 @@ namespace WinParted.UI.Dialogs
             var headerPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 188,
+                Height = Math.Max(192, Font.Height * 12 + 24),
                 Padding = new Padding(ThemeManager.F13),
                 Tag = "SurfacePanel"
             };
@@ -1471,8 +1560,8 @@ namespace WinParted.UI.Dialogs
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
                 SplitterWidth = 6,
-                Panel1MinSize = 110,
-                Panel2MinSize = 110
+                Panel1MinSize = 52,
+                Panel2MinSize = 52
             };
 
             _lvOps = new ListView
@@ -1484,12 +1573,12 @@ namespace WinParted.UI.Dialogs
                 HideSelection = false,
                 BorderStyle = BorderStyle.FixedSingle
             };
-            _lvOps.Columns.Add("#", 38);
-            _lvOps.Columns.Add("Disk", 96);
-            _lvOps.Columns.Add("Operation", 360);
-            _lvOps.Columns.Add("Status", 128);
-            _lvOps.Columns.Add("Progress", 76);
-            _lvOps.Columns.Add("Time", 76);
+            _lvOps.Columns.Add("#", 32);
+            _lvOps.Columns.Add("Disk", 78);
+            _lvOps.Columns.Add("Operation", 300);
+            _lvOps.Columns.Add("Status", 96);
+            _lvOps.Columns.Add("Progress", 66);
+            _lvOps.Columns.Add("Time", 58);
 
             for (int i = 0; i < count; i++)
             {
@@ -1526,18 +1615,26 @@ namespace WinParted.UI.Dialogs
             };
             split.Panel2.Controls.Add(_txtLog);
 
-            var bottomBar = new Panel
+            _bottomBar = new TableLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = ThemeManager.F55,
-                Padding = new Padding(0, ThemeManager.F8, 0, 0)
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0, ThemeManager.F8, 0, 2)
             };
+            _bottomBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _bottomBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _bottomBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
             var btnFlow = new FlowLayoutPanel
             {
-                Dock = DockStyle.Right,
-                Width = 250,
-                FlowDirection = FlowDirection.RightToLeft,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                WrapContents = false,
+                FlowDirection = FlowDirection.LeftToRight,
+                Anchor = AnchorStyles.Right | AnchorStyles.Top | AnchorStyles.Bottom,
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0),
                 Padding = new Padding(0, 2, 0, 2)
             };
             _btnClose = new Button
@@ -1565,8 +1662,8 @@ namespace WinParted.UI.Dialogs
                 }
                 catch { }
             };
-            btnFlow.Controls.Add(_btnClose);
             btnFlow.Controls.Add(_btnCopyLog);
+            btnFlow.Controls.Add(_btnClose);
 
             _lblBottomHint = new Label
             {
@@ -1577,25 +1674,28 @@ namespace WinParted.UI.Dialogs
                 TextAlign = ContentAlignment.MiddleLeft,
                 AutoEllipsis = true,
                 UseMnemonic = false,
+                Margin = new Padding(0),
                 Tag = "KeepForeColor"
             };
-            bottomBar.Controls.Add(_lblBottomHint);
-            bottomBar.Controls.Add(btnFlow);
+            _bottomBar.Controls.Add(_lblBottomHint, 0, 0);
+            _bottomBar.Controls.Add(btnFlow, 1, 0);
 
             root.Controls.Add(split);
             root.Controls.Add(headerPanel);
-            root.Controls.Add(bottomBar);
+            root.Controls.Add(_bottomBar);
 
             AcceptButton = _btnClose;
             CancelButton = _btnClose;
             ThemeManager.ApplyTheme(this);
+            _bottomBar.Height = Math.Max(ThemeManager.F55, Math.Max(_btnCopyLog.Height, _btnClose.Height) + 20);
+            _bottomBar.PerformLayout();
 
             Action autoSizeOpsColumns = () =>
             {
                 if (_lvOps == null || _lvOps.Columns.Count < 6) return;
                 int fixedW = _lvOps.Columns[0].Width + _lvOps.Columns[1].Width +
                              _lvOps.Columns[3].Width + _lvOps.Columns[4].Width + _lvOps.Columns[5].Width + 4;
-                int opW = Math.Max(220, _lvOps.ClientSize.Width - fixedW);
+                int opW = Math.Max(120, _lvOps.ClientSize.Width - fixedW);
                 if (_lvOps.Columns[2].Width != opW)
                     _lvOps.Columns[2].Width = opW;
             };
@@ -1604,9 +1704,23 @@ namespace WinParted.UI.Dialogs
             _uiTimer = new System.Windows.Forms.Timer { Interval = 75 };
             _uiTimer.Tick += (s, e) => FlushUiState();
 
+            Action clampToWorkingArea = () =>
+            {
+                Rectangle wa = Screen.FromControl(this).WorkingArea;
+                int maxW = Math.Max(480, (int)(wa.Width * 0.92));
+                int maxH = Math.Max(340, (int)(wa.Height * 0.92));
+                MinimumSize = new Size(Math.Min(560, maxW), Math.Min(380, maxH));
+                int w = Math.Min(Width, maxW);
+                int h = Math.Min(Height, maxH);
+                if (w != Width || h != Height)
+                    Size = new Size(w, h);
+            };
+            Load += (s, e) => clampToWorkingArea();
+
             Shown += (s, e) =>
             {
-                ThemeManager.ApplyGoldenSplitter(split, false, 110, 110);
+                clampToWorkingArea();
+                ThemeManager.ApplyGoldenSplitter(split, false, 52, 52);
                 autoSizeOpsColumns();
                 StartExecutionWorker();
             };
@@ -1850,6 +1964,8 @@ namespace WinParted.UI.Dialogs
 
                 _btnClose.Text = "Done";
                 _btnClose.Enabled = true;
+                _bottomBar.PerformLayout();
+                _btnClose.Invalidate();
                 _btnClose.Focus();
             }
         }
