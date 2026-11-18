@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using WinParted.Core;
@@ -17,9 +18,15 @@ namespace WinParted
     /// </summary>
     internal static class Program
     {
-        // Ensures crisp text/ribbon rendering on high-DPI Windows displays
+        // Ensures crisp text/ribbon rendering on high-DPI Windows displays (Vista+)
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void TryEnableDpiAwareness()
+        {
+            SetProcessDPIAware();
+        }
 
         /// <summary>
         /// Program entry point. Dispatches CLI self-test/stress modes or starts the DPI-aware WinForms UI.
@@ -35,7 +42,10 @@ namespace WinParted
                 return stressOnly ? RunStressTestsOnly() : RunSelfTest();
             }
 
-            try { SetProcessDPIAware(); } catch { }
+            if (Win32DiskInterop.IsWindowsVistaOrNewer)
+            {
+                try { TryEnableDpiAwareness(); } catch { }
+            }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
@@ -55,7 +65,7 @@ namespace WinParted
             {
                 Console.WriteLine("=== WinParted Self-Test ===");
                 Console.WriteLine("Process Architecture: {0}-bit (IntPtr.Size={1})", IntPtr.Size * 8, IntPtr.Size);
-                Console.WriteLine("OS 64-bit: {0} | Badge: {1}", Environment.Is64BitOperatingSystem, Win32DiskInterop.GetArchitectureBadge());
+                Console.WriteLine("OS 64-bit: {0} | Badge: {1}", Win32DiskInterop.Is64BitOperatingSystem(), Win32DiskInterop.GetArchitectureBadge());
 
                 // 1. Live Physical Drive Discovery
                 var physical = Win32DiskInterop.EnumeratePhysicalDisks();

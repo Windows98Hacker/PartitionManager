@@ -2,14 +2,13 @@
   <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
-    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <Platform Condition=" '$(Platform)' == '' ">x86</Platform>
     <ProjectGuid>{7D2A4E81-3A5B-4B94-9E15-2E8C0E72A001}</ProjectGuid>
     <OutputType>WinExe</OutputType>
     <RootNamespace>WinParted</RootNamespace>
     <AssemblyName>WinParted</AssemblyName>
-    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v3.5</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
-    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -36,12 +35,17 @@
     <Compile Include="src\Models\DiskModels.cs" />
     <Compile Include="src\Interop\Win32DiskInterop.cs" />
     <Compile Include="src\Core\RawDiskEngine.cs" />
+    <Compile Include="src\Core\ReadOnlyFileSystemMountEngine.cs" />
     <Compile Include="src\Core\OperationQueueManager.cs" />
     <Compile Include="src\Core\StressTestRunner.cs" />
+    <Compile Include="src\UI\ThemeManager.cs" />
     <Compile Include="src\UI\PartitionRibbonControl.cs" />
+    <Compile Include="src\UI\IntegratedFileSystemExplorerControl.cs" />
+    <Compile Include="src\UI\Dialogs\FileSystemBrowserDialog.cs" />
     <Compile Include="src\UI\Dialogs\PartitionDialogs.cs" />
     <Compile Include="src\UI\MainForm.cs" />
     <Compile Include="src\Program.cs" />
+    <None Include="src\app.config" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

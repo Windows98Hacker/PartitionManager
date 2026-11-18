@@ -21,8 +21,8 @@ namespace WinParted.UI
         private bool _smartScale = true;
         private readonly ToolTip _toolTip = new ToolTip();
 
-        public event EventHandler<PartitionEntry> SelectedPartitionChanged;
-        public event EventHandler<PartitionEntry> PartitionDoubleClicked;
+        public event Action<object, PartitionEntry> SelectedPartitionChanged;
+        public event Action<object, PartitionEntry> PartitionDoubleClicked;
         public event Action<PartitionEntry, Point> PartitionContextMenuRequested;
 
         public bool SmartScale

@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
@@ -30,7 +31,9 @@ namespace WinParted.Interop
         public const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
 
         // Win32 Disk/Volume/Storage IOCTL and FSCTL control codes
+        public const uint IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x00070000;
         public const uint IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0;
+        public const uint IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C;
         public const uint IOCTL_DISK_GET_DRIVE_LAYOUT_EX = 0x00070050;
         public const uint IOCTL_DISK_SET_DRIVE_LAYOUT_EX = 0x0007C054;
         public const uint IOCTL_DISK_GET_PARTITION_INFO_EX = 0x00070048;
@@ -134,6 +137,51 @@ namespace WinParted.Interop
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool SetVolumeLabel(string lpRootPathName, string lpVolumeName);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWow64Process(IntPtr hProcess, out bool wow64Process);
+
+        public static bool IsWindowsVistaOrNewer
+        {
+            get
+            {
+                Version v = Environment.OSVersion.Version;
+                return Environment.OSVersion.Platform == PlatformID.Win32NT && v.Major >= 6;
+            }
+        }
+
+        public static bool IsWindowsXpOrOlder
+        {
+            get
+            {
+                Version v = Environment.OSVersion.Version;
+                return Environment.OSVersion.Platform == PlatformID.Win32NT && v.Major < 6;
+            }
+        }
+
+        public static bool Is64BitOperatingSystem()
+        {
+            if (IntPtr.Size == 8) return true;
+            try
+            {
+                return CheckWow64();
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static bool CheckWow64()
+        {
+            bool isWow64;
+            using (Process proc = Process.GetCurrentProcess())
+            {
+                return IsWow64Process(proc.Handle, out isWow64) && isWow64;
+            }
+        }
+
         public static bool IsAdministrator()
         {
             try
@@ -153,7 +201,9 @@ namespace WinParted.Interop
         public static string GetArchitectureBadge()
         {
             string proc = IntPtr.Size == 8 ? "64-bit x64" : "32-bit x86";
-            string os = Environment.Is64BitOperatingSystem ? "Win64" : "Win32";
+            string os = IsWindowsXpOrOlder
+                ? (Is64BitOperatingSystem() ? "WinXP x64" : "WinXP 32-bit")
+                : (Is64BitOperatingSystem() ? "Win64" : "Win32");
             string priv = IsAdministrator() ? "Admin" : "Standard User";
             return string.Format("{0} ({1}) | {2}", proc, os, priv);
         }
@@ -468,14 +518,33 @@ namespace WinParted.Interop
         {
             byte[] geomBuf = new byte[256];
             uint ret;
-            if (!DeviceIoControl(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, null, 0, geomBuf, (uint)geomBuf.Length, out ret, IntPtr.Zero))
-                return null;
+            int bytesPerSector;
+            long diskSize;
 
-            if (ret < 32)
-                return null;
+            if (DeviceIoControl(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, null, 0, geomBuf, (uint)geomBuf.Length, out ret, IntPtr.Zero) && ret >= 32)
+            {
+                bytesPerSector = BitConverter.ToInt32(geomBuf, 20);
+                diskSize = BitConverter.ToInt64(geomBuf, 24);
+            }
+            else if (DeviceIoControl(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY, null, 0, geomBuf, 24, out ret, IntPtr.Zero) && ret >= 24)
+            {
+                long cylinders = BitConverter.ToInt64(geomBuf, 0);
+                uint tracksPerCyl = BitConverter.ToUInt32(geomBuf, 12);
+                uint secsPerTrack = BitConverter.ToUInt32(geomBuf, 16);
+                bytesPerSector = BitConverter.ToInt32(geomBuf, 20);
+                if (bytesPerSector <= 0) bytesPerSector = 512;
 
-            int bytesPerSector = BitConverter.ToInt32(geomBuf, 20);
-            long diskSize = BitConverter.ToInt64(geomBuf, 24);
+                byte[] lenBuf = new byte[8];
+                if (DeviceIoControl(handle, IOCTL_DISK_GET_LENGTH_INFO, null, 0, lenBuf, 8, out ret, IntPtr.Zero) && ret >= 8)
+                    diskSize = BitConverter.ToInt64(lenBuf, 0);
+                else
+                    diskSize = cylinders * (long)tracksPerCyl * (long)secsPerTrack * (long)bytesPerSector;
+            }
+            else
+            {
+                return null;
+            }
+
             if (bytesPerSector <= 0) bytesPerSector = 512;
 
             var disk = new DiskInfo
@@ -601,6 +670,15 @@ namespace WinParted.Interop
                 }
             }
 
+            // Windows XP 32-bit lacks kernel GPT support and reports a single 0xEE protective MBR partition.
+            // Parse GPT headers directly in userspace when raw disk reads are available.
+            bool hasProtectiveMbr = disk.PartitionStyle == PartitionTableStyle.MBR &&
+                                    disk.Partitions.Any(p => p.MbrPartitionType == 0xEE);
+            if (canRawRead && (disk.Partitions.Count == 0 || hasProtectiveMbr))
+            {
+                try { RawDiskEngine.ParseDiskPartitionTable(disk); } catch { }
+            }
+
             return disk;
         }
 
@@ -616,6 +694,13 @@ namespace WinParted.Interop
 
         private static bool TryReadHandleAtOffset(SafeFileHandle handle, long byteOffset, int length, out byte[] data, out int win32Error)
         {
+            if (TryReadHandleAligned(handle, byteOffset, length, 4096, out data, out win32Error))
+                return true;
+            return TryReadHandleAligned(handle, byteOffset, length, 512, out data, out win32Error);
+        }
+
+        private static bool TryReadHandleAligned(SafeFileHandle handle, long byteOffset, int length, int alignment, out byte[] data, out int win32Error)
+        {
             data = null;
             win32Error = 0;
             if (handle == null || handle.IsInvalid || byteOffset < 0)
@@ -627,9 +712,10 @@ namespace WinParted.Interop
             uint ret;
             DeviceIoControl(handle, FSCTL_ALLOW_EXTENDED_DASD_IO, null, 0, null, 0, out ret, IntPtr.Zero);
 
-            long alignedStart = (byteOffset / 4096L) * 4096L;
+            long alignLong = Math.Max(512, alignment);
+            long alignedStart = (byteOffset / alignLong) * alignLong;
             int headSkip = (int)(byteOffset - alignedStart);
-            int alignedLen = ((headSkip + length + 4095) / 4096) * 4096;
+            int alignedLen = (int)(((headSkip + length + alignLong - 1) / alignLong) * alignLong);
 
             long newPos;
             if (!SetFilePointerEx(handle, alignedStart, out newPos, 0))
@@ -1521,7 +1607,7 @@ namespace WinParted.Interop
             if ((attrs & (1UL << 60)) != 0) flags.Add("readonly");
             if ((attrs & (1UL << 62)) != 0) flags.Add("hidden");
             if ((attrs & (1UL << 63)) != 0) flags.Add("no_automount");
-            return string.Join(", ", flags);
+            return string.Join(", ", flags.ToArray());
         }
 
         private static string ReadAsciiZ(byte[] buf, int offset)

@@ -1637,7 +1637,8 @@ namespace WinParted.UI.Dialogs
         {
             if (_isRunning || _workerFinished) return;
             _isRunning = true;
-            _totalSw.Restart();
+            _totalSw.Reset();
+            _totalSw.Start();
             _uiTimer.Start();
 
             var worker = new Thread(() =>

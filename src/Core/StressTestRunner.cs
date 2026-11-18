@@ -812,21 +812,21 @@ namespace WinParted.Core
                 string apfsExportRoot = Path.Combine(tempDir, "host_export_apfs");
                 var apfsSystemDir = FindFsNodeByPath(apfsVol.RootNode, "/System");
                 ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[3], apfsSystemDir, apfsExportRoot, out fCount, out dCount, out bCount);
-                string exportedApfsFile = Path.Combine(apfsExportRoot, "System", "Library", "CoreServices", "SystemVersion.plist");
+                string exportedApfsFile = Path.Combine(Path.Combine(Path.Combine(Path.Combine(apfsExportRoot, "System"), "Library"), "CoreServices"), "SystemVersion.plist");
                 if (!File.Exists(exportedApfsFile) || File.ReadAllText(exportedApfsFile).IndexOf("ro-apfs", StringComparison.OrdinalIgnoreCase) < 0 || fCount < 1 || dCount < 3)
                     throw new Exception("Recursive APFS folder copy to host failed.");
 
                 string hfsExportRoot = Path.Combine(tempDir, "host_export_hfs");
                 var usersDir = FindFsNodeByPath(hfsVol.RootNode, "/Users");
                 ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[4], usersDir, hfsExportRoot, out fCount, out dCount, out bCount);
-                string exportedHfsFile = Path.Combine(hfsExportRoot, "Users", "Shared", "ReadMe.txt");
+                string exportedHfsFile = Path.Combine(Path.Combine(Path.Combine(hfsExportRoot, "Users"), "Shared"), "ReadMe.txt");
                 if (!File.Exists(exportedHfsFile) || File.ReadAllText(exportedHfsFile).IndexOf("hfs+", StringComparison.OrdinalIgnoreCase) < 0 || fCount < 1 || dCount < 2)
                     throw new Exception("Recursive HFS+ folder copy to host failed.");
 
                 string extExportRoot = Path.Combine(tempDir, "host_export_ext4");
                 var etcDir = FindFsNodeByPath(extVol.RootNode, "/etc");
                 ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[0], etcDir, extExportRoot, out fCount, out dCount, out bCount);
-                string exportedExtFile = Path.Combine(extExportRoot, "etc", "fstab");
+                string exportedExtFile = Path.Combine(Path.Combine(extExportRoot, "etc"), "fstab");
                 if (!File.Exists(exportedExtFile) || File.ReadAllText(exportedExtFile).IndexOf("UUID=", StringComparison.OrdinalIgnoreCase) < 0)
                     throw new Exception("Recursive Ext4 folder copy to host failed.");
             }
@@ -854,7 +854,7 @@ namespace WinParted.Core
             string hostUploadSrc = Path.Combine(tempDir, "HostUploadBundle");
             Directory.CreateDirectory(Path.Combine(hostUploadSrc, "Nested"));
             File.WriteAllText(Path.Combine(hostUploadSrc, "notes.txt"), "Experimental host upload top-level file.");
-            File.WriteAllText(Path.Combine(hostUploadSrc, "Nested", "deep.txt"), "Experimental nested file payload 12345!");
+            File.WriteAllText(Path.Combine(Path.Combine(hostUploadSrc, "Nested"), "deep.txt"), "Experimental nested file payload 12345!");
 
             foreach (int pIdx in new int[] { 0, 4 })
             {
@@ -1011,7 +1011,7 @@ namespace WinParted.Core
                 string btrfsExport = Path.Combine(tempDir, "host_export_btrfs");
                 var bVol = ReadOnlyFileSystemMountEngine.GetMount(disk.DiskNumber, disk.Partitions[0].StartingOffset);
                 ReadOnlyFileSystemMountEngine.ExportNodeToHost(disk, disk.Partitions[0], FindFsNodeByPath(bVol.RootNode, "/@dev"), btrfsExport, out fc, out dc, out bc);
-                if (!File.Exists(Path.Combine(btrfsExport, "@dev", "btrfs-subvol.conf")))
+                if (!File.Exists(Path.Combine(Path.Combine(btrfsExport, "@dev"), "btrfs-subvol.conf")))
                     throw new Exception("Btrfs host export missing /@dev/btrfs-subvol.conf");
             }
             finally

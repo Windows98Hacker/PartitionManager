@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.CompilerServices;
@@ -50,8 +51,8 @@ namespace WinParted.UI
             public bool Pressed;
         }
 
-        private static readonly ConditionalWeakTable<Button, ButtonVisualState> s_buttonStates =
-            new ConditionalWeakTable<Button, ButtonVisualState>();
+        private static readonly Dictionary<Button, ButtonVisualState> s_buttonStates =
+            new Dictionary<Button, ButtonVisualState>();
 
         public static int GoldenWidth(int height)
         {
@@ -259,28 +260,35 @@ namespace WinParted.UI
         private static void ApplyDwmWindowChrome(Form form)
         {
             if (form == null || form.IsDisposed || !form.IsHandleCreated) return;
+            if (!WinParted.Interop.Win32DiskInterop.IsWindowsVistaOrNewer) return;
             try
             {
-                int darkMode = IsDarkMode ? 1 : 0;
-                DwmSetWindowAttribute(form.Handle, 20, ref darkMode, sizeof(int));
-
-                // COLORREF is 0x00BBGGRR
-                Color caption = BackElevated;
-                int captionRef = caption.R | (caption.G << 8) | (caption.B << 16);
-                DwmSetWindowAttribute(form.Handle, 35, ref captionRef, sizeof(int));
-
-                Color text = TextPrimary;
-                int textRef = text.R | (text.G << 8) | (text.B << 16);
-                DwmSetWindowAttribute(form.Handle, 36, ref textRef, sizeof(int));
-
-                Color border = AccentGold;
-                int borderRef = border.R | (border.G << 8) | (border.B << 16);
-                DwmSetWindowAttribute(form.Handle, 34, ref borderRef, sizeof(int));
+                ApplyDwmWindowChromeNative(form.Handle);
             }
             catch
             {
                 // Older Windows builds without DWMWA_* caption attributes fall back safely.
             }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void ApplyDwmWindowChromeNative(IntPtr hwnd)
+        {
+            int darkMode = IsDarkMode ? 1 : 0;
+            DwmSetWindowAttribute(hwnd, 20, ref darkMode, sizeof(int));
+
+            // COLORREF is 0x00BBGGRR
+            Color caption = BackElevated;
+            int captionRef = caption.R | (caption.G << 8) | (caption.B << 16);
+            DwmSetWindowAttribute(hwnd, 35, ref captionRef, sizeof(int));
+
+            Color text = TextPrimary;
+            int textRef = text.R | (text.G << 8) | (text.B << 16);
+            DwmSetWindowAttribute(hwnd, 36, ref textRef, sizeof(int));
+
+            Color border = AccentGold;
+            int borderRef = border.R | (border.G << 8) | (border.B << 16);
+            DwmSetWindowAttribute(hwnd, 34, ref borderRef, sizeof(int));
         }
 
         public static Color AccentGold
@@ -511,6 +519,7 @@ namespace WinParted.UI
             {
                 state = new ButtonVisualState();
                 s_buttonStates.Add(btn, state);
+                btn.Disposed += delegate { s_buttonStates.Remove(btn); };
             }
             if (state.Attached) return;
             state.Attached = true;

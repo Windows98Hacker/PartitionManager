@@ -4,19 +4,24 @@ This document explains how **WinParted** is structured, how its raw storage, nat
 
 ---
 
-## 1. Build System, Binaries & Releases
+## 1. Build System, Binaries & Windows XP 32-bit Support
 
-WinParted compiles directly against Windows' built-in `.NET Framework 4.8` / `v4.0.30319` toolchain using [`build.ps1`](build.ps1) with zero external NuGet dependencies ([`WinParted.csproj`](WinParted.csproj) is provided alongside it for IDE navigation).
+WinParted compiles directly via [`build.ps1`](build.ps1) with zero external NuGet dependencies ([`WinParted.csproj`](WinParted.csproj) targets `.NET Framework 3.5` / `x86` for IDE compatibility):
 
-- **Compiler Script**: [`build.ps1`](build.ps1) (`Invoke-TargetBuild`) compiles all sources under `src\` directly with `csc.exe`:
-  - `C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe` -> `bin\WinParted-x86.exe` (32-bit x86)
-  - `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` -> `bin\WinParted-x64.exe` (64-bit x64) and `bin\WinParted.exe` (AnyCPU)
+- **Compiler Script**: [`build.ps1`](build.ps1) compiles all sources under `src\` directly with `csc.exe`:
+  - `Invoke-Xp35Build` (`/noconfig /nostdlib /platform:x86` against `Framework\v2.0.50727\*.dll` + `v3.5\System.Core.dll`) -> `bin\WinParted-XP-x86.exe` and `bin\WinParted-x86.exe` (CLR `v2.0.50727` `.NET 3.5 SP1` native binaries for Windows XP 32-bit SP2/SP3, PE Subsystem Version `4.0`).
+  - `Invoke-TargetBuild` (`Framework64\v4.0.30319\csc.exe`) -> `bin\WinParted-x64.exe` (`x64`) and `bin\WinParted.exe` (`AnyCPU`).
+  - [`src/app.config`](src/app.config) is copied beside every executable as `<exe>.config` with `<supportedRuntime version="v2.0.50727" />` followed by `<supportedRuntime version="v4.0" />`, allowing the XP x86 binaries to launch cleanly on both Windows XP (`.NET 3.5 SP1`) and modern Windows (`.NET 4.x`).
+- **Windows XP 32-bit Runtime Compatibility Layer**:
+  - **OS & P/Invoke Guards**: `Win32DiskInterop.IsWindowsVistaOrNewer`, `IsWindowsXpOrOlder`, and `Is64BitOperatingSystem()` (`IsWow64Process` inside `[MethodImpl(MethodImplOptions.NoInlining)]`) keep Vista+ entry points (`SetProcessDPIAware`, `dwmapi.dll` `DwmSetWindowAttribute`) out of JIT resolution on Windows XP.
+  - **Legacy Disk Geometry & GPT Fallback**: `QueryDiskFromHandle` falls back from `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` to `IOCTL_DISK_GET_DRIVE_GEOMETRY` (`0x00070000`) + `IOCTL_DISK_GET_LENGTH_INFO` (`0x0007405C`), retries 512-byte sector-aligned reads when 4K alignment exceeds legacy CHS track boundaries, and runs userspace `RawDiskEngine.ParseDiskPartitionTable` whenever XP 32-bit's `disk.sys` returns a `0xEE` protective MBR partition for a GPT disk.
+  - **Legacy `diskpart.exe` Raw Fallback**: `OperationQueueManager.ExecutePhysicalDiskOperation` automatically falls back to direct raw table/filesystem header updates on XP when `diskpart.exe` lacks `format`, `shrink`, `convert gpt`, or removable-drive support.
+- **Non-Blocking Progress & Async Execution**: `OperationQueueManager.ApplyAll` streams `OperationProgressReport` events (sub-stage, live byte counts, throughput in `MiB/s`, async `diskpart.exe` output lines) into `ApplyOperationsProgressDialog` running on a background worker thread so the WinForms UI remains responsive.
 - **Framework References**: `System.dll`, `System.Core.dll`, `System.Drawing.dll`, `System.Windows.Forms.dll`.
 - **Source vs. Releases Policy**: Compiled executables (`bin/`, `*.exe`, `*.dll`, `*.pdb`) are git-ignored and excluded from source branches. Local developer builds compile into `bin\` on demand, while pre-built release binaries are published exclusively on the GitHub Releases page.
-- **Strict C# 5.0 Compiler Constraint**: Because `v4.0.30319\csc.exe` is a C# 5.0 compiler, newer syntax breaks the build:
-  - Do **not** use string interpolation (`$"..."`) -> use `string.Format(...)`.
-  - Do **not** use null-conditional (`?.`), expression-bodied members (`=>` properties/methods), inline `out var`, `nameof(...)`, or pattern matching (`is Type x`).
-  - Use explicit `delegate` / lambda statements, `string.Format`, and pre-declared `out` variables.
+- **Strict .NET 3.5 / C# 5.0 Constraints**: Code must compile under both `v4.0.30319` C# 5.0 syntax **and** `.NET 3.5` (`CLR v2.0.50727`) API surface:
+  - Do **not** use string interpolation (`$"..."`), null-conditional (`?.`), expression-bodied members, inline `out var`, `nameof(...)`, or pattern matching.
+  - Do **not** use .NET 4.0+ APIs (`IReadOnlyList<T>`, `ConditionalWeakTable<,>`, 3+-arg `Path.Combine`, `Stopwatch.Restart()`, `Environment.Is64BitOperatingSystem`, `string.Join(sep, IEnumerable<string>)`, `using` on `RNGCryptoServiceProvider`, or `EventHandler<NonEventArgs>`).
 
 ---
 

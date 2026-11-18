@@ -40,8 +40,8 @@ namespace WinParted.Core
         private readonly List<DiskInfo> _baselineDisks = new List<DiskInfo>();
         private readonly List<PendingOperation> _queue = new List<PendingOperation>();
 
-        public IReadOnlyList<DiskInfo> BaselineDisks { get { return _baselineDisks; } }
-        public IReadOnlyList<PendingOperation> Queue { get { return _queue; } }
+        public IList<DiskInfo> BaselineDisks { get { return _baselineDisks; } }
+        public IList<PendingOperation> Queue { get { return _queue; } }
         public int PendingCount { get { return _queue.Count; } }
 
         /// <summary>
@@ -968,6 +968,9 @@ namespace WinParted.Core
             bool diskPartSucceeded = false;
             try
             {
+                if (Win32DiskInterop.IsWindowsXpOrOlder && disk.PartitionStyle == PartitionTableStyle.GPT)
+                    throw new InvalidOperationException("Windows XP 32-bit DiskPart does not support GPT disks; using userspace GPT writer.");
+
                 ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 35,
                     "Running DiskPart script...",
                     indeterminate: true);
@@ -983,30 +986,55 @@ namespace WinParted.Core
             }
             catch (InvalidOperationException)
             {
-                if (!isNonWindowsCreateOrFormat || (op.Type != OperationType.CreatePartition && op.Type != OperationType.FormatPartition))
+                bool allowLegacyXpFallback = Win32DiskInterop.IsWindowsXpOrOlder &&
+                    (op.Type == OperationType.CreatePartition ||
+                     op.Type == OperationType.FormatPartition ||
+                     op.Type == OperationType.ResizeMovePartition ||
+                     op.Type == OperationType.ChangeFlags);
+                bool allowNonWinFallback = isNonWindowsCreateOrFormat &&
+                    (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition);
+
+                if (!allowLegacyXpFallback && !allowNonWinFallback)
                     throw;
 
                 ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 68,
-                    "DiskPart declined; writing raw table & superblock directly...",
-                    logLine: "  [Fallback] Writing raw partition table and superblock...");
-                // Fallback for non-Windows filesystems when DiskPart cannot update layout directly
+                    "DiskPart unavailable/declined; applying raw partition structures directly...",
+                    logLine: "  [Fallback] Writing raw partition table / filesystem structures directly...");
+
+                // Fallback for non-Windows filesystems or legacy Windows XP DiskPart limitations
                 ApplyOperationToModel(disk, op);
                 RenumberPartitions(disk);
                 RawDiskEngine.WritePartitionTable(disk);
-                var rawTarget = disk.Partitions
-                    .Where(p => !p.IsUnallocated)
-                    .OrderBy(p => Math.Abs(p.StartingOffset - (op.Type == OperationType.CreatePartition ? op.StartOffset : op.OriginalStartOffset)))
-                    .FirstOrDefault();
-                if (rawTarget == null)
-                    throw;
 
-                Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, rawTarget.StartingOffset, true);
-                rawTarget.FileSystem = op.NewFileSystem;
-                rawTarget.Label = op.NewLabel ?? string.Empty;
-                rawTarget.UsedBytes = 0;
-                rawTarget.FreeBytes = rawTarget.PartitionLength;
-                RawDiskEngine.WriteFileSystemHeader(disk, rawTarget);
-                RawDiskEngine.InspectPartitionSuperblock(disk, rawTarget);
+                if (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition)
+                {
+                    var rawTarget = disk.Partitions
+                        .Where(p => !p.IsUnallocated)
+                        .OrderBy(p => Math.Abs(p.StartingOffset - (op.Type == OperationType.CreatePartition ? op.StartOffset : op.OriginalStartOffset)))
+                        .FirstOrDefault();
+                    if (rawTarget == null)
+                        throw;
+
+                    Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, rawTarget.StartingOffset, true);
+                    rawTarget.FileSystem = op.NewFileSystem;
+                    rawTarget.Label = op.NewLabel ?? string.Empty;
+                    rawTarget.UsedBytes = 0;
+                    rawTarget.FreeBytes = rawTarget.PartitionLength;
+                    RawDiskEngine.WriteFileSystemHeader(disk, rawTarget);
+                    RawDiskEngine.InspectPartitionSuperblock(disk, rawTarget);
+                }
+                else if (op.Type == OperationType.ResizeMovePartition)
+                {
+                    var resizedTarget = disk.Partitions
+                        .Where(p => !p.IsUnallocated)
+                        .OrderBy(p => Math.Abs(p.StartingOffset - op.StartOffset))
+                        .FirstOrDefault();
+                    if (resizedTarget != null)
+                    {
+                        Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, resizedTarget.StartingOffset, false);
+                        RawDiskEngine.ResizeFileSystemInPlace(disk, resizedTarget, op.OriginalLength);
+                    }
+                }
             }
 
             if (isNonWindowsCreateOrFormat && diskPartSucceeded)

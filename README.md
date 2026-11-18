@@ -1,6 +1,6 @@
-# WinParted
+# WinParted (Windows XP 32-bit Legacy Edition)
 
-A GParted-inspired disk and partition manager for **32-bit (x86)** and **64-bit (x64)** Windows, featuring a Google Material Design 3 light/dark UI, non-destructive operation queuing, raw sector inspection, full native Apple/Linux/optical read-only mounting, and an experimental write overlay.
+A GParted-inspired disk and partition manager for **Windows XP 32-bit (SP2/SP3, NT 5.1)** through modern **32-bit (x86)** and **64-bit (x64)** Windows, featuring a light/dark UI, non-destructive operation queuing with a non-blocking live progress dialog, raw sector inspection, full native Apple/Linux/optical read-only mounting, and an experimental write overlay.
 
 Entirely experimental and vibe-coded. I don't know a thing about programming, but I do know that I dislike the windows partition manager, and have had great success with gparted on linux. I wanted this to be freely available for windows, but found that my only options were rather terrible and pay to use. I think that sucks. So I told AI to make this in hopes that this creates a better alternative to what is already available.
 
@@ -33,25 +33,35 @@ See [**ARCHITECTURE.md**](ARCHITECTURE.md) for the full code layout, subsystem d
 
 Compiled executables are **not** stored in the Git source tree. Pre-built release binaries (`WinParted-x64.exe`, `WinParted-x86.exe`, `WinParted.exe`) are distributed exclusively on the GitHub **Releases** page, or you can compile them locally from source using `build.ps1`.
 
+## Windows XP 32-bit Support
+
+The `Windows-XP-32bit` branch adds first-class legacy support for Windows XP (x86 SP2/SP3):
+
+- **Dual CLR Runtime Target**: `WinParted-XP-x86.exe` and `WinParted-x86.exe` compile strictly against `.NET Framework 3.5` (`CLR v2.0.50727`, `x86`, PE subsystem version `4.0`) with [src/app.config](src/app.config) enabling execution on either **.NET 3.5 SP1** (Windows XP) or **.NET 4.x** (Windows 7/10/11).
+- **Vista+ API Guards**: High-DPI (`SetProcessDPIAware`), DWM window chrome (`dwmapi.dll`), and WoW64 detection (`IsWow64Process`) are isolated behind `IsWindowsVistaOrNewer` and `MethodImplOptions.NoInlining` wrappers so missing entry points on Windows XP SP2/SP3 `user32.dll` / `dwmapi.dll` never fail to load.
+- **Userspace GPT & Legacy IOCTL Fallbacks**: Because 32-bit Windows XP lacks kernel GPT support (reporting GPT drives as a single `0xEE` protective MBR slot), `Win32DiskInterop` automatically falls back to `IOCTL_DISK_GET_DRIVE_GEOMETRY` + `IOCTL_DISK_GET_LENGTH_INFO`, 512-byte aligned reads on 63-sector/track geometry, and userspace GPT parsing via `RawDiskEngine.ParseDiskPartitionTable`.
+- **Legacy `diskpart.exe` Raw Fallbacks**: When Windows XP's legacy `diskpart.exe` rejects GPT disks, `format fs=... quick`, `shrink`, `set id=... override`, or removable USB media, `OperationQueueManager` falls back to direct raw sector partition table and filesystem header operations.
+
 ## Build from Source
 
-Requires Windows with `.NET Framework 4.8` / `v4.0.30319` (`csc.exe`, using C# 5.0 syntax):
+Requires Windows with `.NET Framework 3.5 SP1` / `4.x` (`csc.exe` under `v4.0.30319` + `.NET 2.0/3.5` reference assemblies):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-Outputs local (git-ignored) binaries into `bin\WinParted-x86.exe`, `bin\WinParted-x64.exe`, and `bin\WinParted.exe`.
+Outputs local (git-ignored) binaries into `bin\WinParted-XP-x86.exe`, `bin\WinParted-x86.exe`, `bin\WinParted-x64.exe`, and `bin\WinParted.exe` alongside their `.exe.config` dual-runtime manifests.
 
 ## Self-Test & Stress Test
 
 ```powershell
-.\bin\WinParted-x64.exe --self-test
+.\bin\WinParted-XP-x86.exe --self-test
 .\bin\WinParted-x86.exe --self-test
+.\bin\WinParted-x64.exe --self-test
 ```
 
 Or run only the 10-suite stress harness with `--stress-test`:
 
 ```powershell
-.\bin\WinParted-x64.exe --stress-test
+.\bin\WinParted-XP-x86.exe --stress-test
 ```

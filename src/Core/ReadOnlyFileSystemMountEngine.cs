@@ -232,8 +232,7 @@ namespace WinParted.Core
             if (!string.IsNullOrEmpty(ShadowOverlayRootOverride))
                 return ShadowOverlayRootOverride;
             return Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "WinParted",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinParted"),
                 "ExperimentalOverlays");
         }
 
@@ -244,8 +243,7 @@ namespace WinParted.Core
             if (!string.IsNullOrEmpty(ShadowOverlayRootOverride))
                 dirs.Add(ShadowOverlayRootOverride);
             string appDataDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "WinParted",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinParted"),
                 "ExperimentalOverlays");
             if (!dirs.Contains(appDataDir))
                 dirs.Add(appDataDir);
@@ -1150,7 +1148,7 @@ namespace WinParted.Core
         {
             string baseDir = !string.IsNullOrEmpty(ShadowOverlayRootOverride)
                 ? ShadowOverlayRootOverride
-                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinParted", "ExperimentalOverlays");
+                : Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinParted"), "ExperimentalOverlays");
             string identity = string.Format("{0}|{1}|{2}|{3}|{4}",
                 disk != null ? (disk.SerialNumber ?? string.Empty) : string.Empty,
                 disk != null ? (disk.Model ?? string.Empty) : string.Empty,

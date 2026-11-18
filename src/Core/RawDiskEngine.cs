@@ -2366,18 +2366,17 @@ namespace WinParted.Core
         private static void FillCryptoRandom(byte[] buffer, int count)
         {
             if (buffer == null || count <= 0) return;
-            using (var rng = new RNGCryptoServiceProvider())
+            // In .NET Framework 2.0/3.5, RNGCryptoServiceProvider does not implement IDisposable.
+            var rng = new RNGCryptoServiceProvider();
+            if (count == buffer.Length)
             {
-                if (count == buffer.Length)
-                {
-                    rng.GetBytes(buffer);
-                }
-                else
-                {
-                    byte[] tmp = new byte[count];
-                    rng.GetBytes(tmp);
-                    Buffer.BlockCopy(tmp, 0, buffer, 0, count);
-                }
+                rng.GetBytes(buffer);
+            }
+            else
+            {
+                byte[] tmp = new byte[count];
+                rng.GetBytes(tmp);
+                Buffer.BlockCopy(tmp, 0, buffer, 0, count);
             }
         }
 
