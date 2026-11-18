@@ -1190,7 +1190,7 @@ namespace WinParted.Interop
             return TryWriteRawAlignedExact(handle, alignedStart, alignedBuf, out win32Error);
         }
 
-        private static void NotifyDiskPropertiesUpdated(string devicePath)
+        public static void NotifyDiskPropertiesUpdated(string devicePath)
         {
             try
             {

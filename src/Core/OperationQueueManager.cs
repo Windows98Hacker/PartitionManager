@@ -847,7 +847,7 @@ namespace WinParted.Core
                 return;
             }
 
-            string script = BuildDiskPartScript(op, disk.PartitionStyle);
+            string script = BuildDiskPartScript(op, disk.PartitionStyle, Win32DiskInterop.IsWindowsXpOrOlder);
             Action<string> diskPartLineHandler = line =>
             {
                 ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 55,
@@ -947,7 +947,8 @@ namespace WinParted.Core
                 return;
             }
 
-            string mappedFs = MapDiskPartFs(op.NewFileSystem);
+            long targetLenBytes = op.Length > 0 ? op.Length : op.OriginalLength;
+            string mappedFs = MapDiskPartFs(op.NewFileSystem, targetLenBytes);
             bool isNonWindowsCreateOrFormat =
                 (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition) &&
                 string.IsNullOrEmpty(mappedFs) &&
@@ -991,48 +992,127 @@ namespace WinParted.Core
                      op.Type == OperationType.FormatPartition ||
                      op.Type == OperationType.ResizeMovePartition ||
                      op.Type == OperationType.ChangeFlags);
-                bool allowNonWinFallback = isNonWindowsCreateOrFormat &&
-                    (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition);
+                bool allowCreateOrFormatFallback =
+                    op.Type == OperationType.CreatePartition ||
+                    op.Type == OperationType.FormatPartition;
 
-                if (!allowLegacyXpFallback && !allowNonWinFallback)
+                if (!allowLegacyXpFallback && !allowCreateOrFormatFallback)
                     throw;
 
-                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 68,
-                    "DiskPart unavailable/declined; applying raw partition structures directly...",
-                    logLine: "  [Fallback] Writing raw partition table / filesystem structures directly...");
-
-                // Fallback for non-Windows filesystems or legacy Windows XP DiskPart limitations
-                ApplyOperationToModel(disk, op);
-                RenumberPartitions(disk);
-                RawDiskEngine.WritePartitionTable(disk);
-
-                if (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition)
+                bool formattedViaCom = false;
+                if (op.Type == OperationType.FormatPartition && !isNonWindowsCreateOrFormat && targetPart != null)
                 {
-                    var rawTarget = disk.Partitions
-                        .Where(p => !p.IsUnallocated)
-                        .OrderBy(p => Math.Abs(p.StartingOffset - (op.Type == OperationType.CreatePartition ? op.StartOffset : op.OriginalStartOffset)))
-                        .FirstOrDefault();
-                    if (rawTarget == null)
-                        throw;
-
-                    Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, rawTarget.StartingOffset, true);
-                    rawTarget.FileSystem = op.NewFileSystem;
-                    rawTarget.Label = op.NewLabel ?? string.Empty;
-                    rawTarget.UsedBytes = 0;
-                    rawTarget.FreeBytes = rawTarget.PartitionLength;
-                    RawDiskEngine.WriteFileSystemHeader(disk, rawTarget);
-                    RawDiskEngine.InspectPartitionSuperblock(disk, rawTarget);
-                }
-                else if (op.Type == OperationType.ResizeMovePartition)
-                {
-                    var resizedTarget = disk.Partitions
-                        .Where(p => !p.IsUnallocated)
-                        .OrderBy(p => Math.Abs(p.StartingOffset - op.StartOffset))
-                        .FirstOrDefault();
-                    if (resizedTarget != null)
+                    string volTarget = !string.IsNullOrEmpty(targetPart.DriveLetter)
+                        ? targetPart.DriveLetter
+                        : targetPart.VolumeGuidPath;
+                    if (!string.IsNullOrEmpty(volTarget))
                     {
-                        Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, resizedTarget.StartingOffset, false);
-                        RawDiskEngine.ResizeFileSystemInPlace(disk, resizedTarget, op.OriginalLength);
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 60,
+                            string.Format("Formatting {0} via Windows format.com...", op.NewFileSystem),
+                            indeterminate: true);
+                        formattedViaCom = TryFormatWithWindowsFormatCom(
+                            volTarget,
+                            op.NewFileSystem,
+                            op.NewLabel,
+                            line => ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 70,
+                                "format.com: " + line,
+                                indeterminate: true,
+                                logLine: "  [format.com] " + line));
+                    }
+                }
+
+                if (!formattedViaCom)
+                {
+                    ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 68,
+                        "DiskPart unavailable/declined; applying raw partition structures directly...",
+                        logLine: "  [Fallback] Writing raw partition table / filesystem structures directly...");
+
+                    // Fallback for non-Windows filesystems, ReFS/>32GiB FAT32, or legacy Windows XP DiskPart limitations
+                    ApplyOperationToModel(disk, op);
+                    RenumberPartitions(disk);
+                    RawDiskEngine.WritePartitionTable(disk);
+
+                    if (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition)
+                    {
+                        var rawTarget = disk.Partitions
+                            .Where(p => !p.IsUnallocated)
+                            .OrderBy(p => Math.Abs(p.StartingOffset - (op.Type == OperationType.CreatePartition ? op.StartOffset : op.OriginalStartOffset)))
+                            .FirstOrDefault();
+                        if (rawTarget == null)
+                            throw;
+
+                        Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, rawTarget.StartingOffset, true);
+                        rawTarget.FileSystem = op.NewFileSystem;
+                        rawTarget.Label = op.NewLabel ?? string.Empty;
+                        rawTarget.UsedBytes = 0;
+                        rawTarget.FreeBytes = rawTarget.PartitionLength;
+                        RawDiskEngine.WriteFileSystemHeader(disk, rawTarget);
+                        RawDiskEngine.InspectPartitionSuperblock(disk, rawTarget);
+                    }
+                    else if (op.Type == OperationType.ResizeMovePartition)
+                    {
+                        var resizedTarget = disk.Partitions
+                            .Where(p => !p.IsUnallocated)
+                            .OrderBy(p => Math.Abs(p.StartingOffset - op.StartOffset))
+                            .FirstOrDefault();
+                        if (resizedTarget != null)
+                        {
+                            Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, resizedTarget.StartingOffset, false);
+                            RawDiskEngine.ResizeFileSystemInPlace(disk, resizedTarget, op.OriginalLength);
+                        }
+                    }
+
+                    Win32DiskInterop.NotifyDiskPropertiesUpdated(disk.DevicePath);
+                }
+            }
+
+            // On Windows XP, DiskPart creates MBR partitions without formatting them; format Windows filesystems via format.com or raw headers.
+            if (diskPartSucceeded && Win32DiskInterop.IsWindowsXpOrOlder && !isNonWindowsCreateOrFormat &&
+                (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition) &&
+                op.NewFileSystem != FileSystemType.MicrosoftReserved)
+            {
+                var xpDisks = Win32DiskInterop.EnumeratePhysicalDisks();
+                var xpDisk = xpDisks.FirstOrDefault(d => d.DiskNumber == disk.DiskNumber) ?? disk;
+                long expectedStart = op.Type == OperationType.CreatePartition
+                    ? op.StartOffset
+                    : (targetPart != null ? targetPart.StartingOffset : op.OriginalStartOffset);
+                var xpPart = xpDisk.Partitions
+                    .Where(p => !p.IsUnallocated)
+                    .OrderBy(p => Math.Abs(p.StartingOffset - expectedStart))
+                    .FirstOrDefault();
+                if (xpPart != null)
+                {
+                    bool xpFmtOk = false;
+                    string volTarget = !string.IsNullOrEmpty(xpPart.DriveLetter)
+                        ? xpPart.DriveLetter
+                        : xpPart.VolumeGuidPath;
+                    if (!string.IsNullOrEmpty(volTarget))
+                    {
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 72,
+                            string.Format("Formatting {0} via Windows XP format.com...", op.NewFileSystem),
+                            indeterminate: true);
+                        xpFmtOk = TryFormatWithWindowsFormatCom(
+                            volTarget,
+                            op.NewFileSystem,
+                            op.NewLabel,
+                            line => ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 78,
+                                "format.com: " + line,
+                                indeterminate: true,
+                                logLine: "  [format.com] " + line));
+                    }
+
+                    if (!xpFmtOk)
+                    {
+                        ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 84,
+                            string.Format("Writing {0} filesystem structures in userspace...", op.NewFileSystem),
+                            logLine: string.Format("  [XP Fallback] Writing {0} boot/BPB structures directly...", op.NewFileSystem));
+                        Win32DiskInterop.PreparePartitionForRawWrite(xpDisk.DiskNumber, xpPart.StartingOffset, true);
+                        xpPart.FileSystem = op.NewFileSystem;
+                        xpPart.Label = op.NewLabel ?? string.Empty;
+                        xpPart.UsedBytes = 0;
+                        xpPart.FreeBytes = xpPart.PartitionLength;
+                        RawDiskEngine.WriteFileSystemHeader(xpDisk, xpPart);
+                        Win32DiskInterop.NotifyDiskPropertiesUpdated(xpDisk.DevicePath);
                     }
                 }
             }
@@ -1070,6 +1150,8 @@ namespace WinParted.Core
                     RawDiskEngine.WriteFileSystemHeader(liveDisk, livePart);
                     RawDiskEngine.InspectPartitionSuperblock(liveDisk, livePart);
                 }
+
+                Win32DiskInterop.NotifyDiskPropertiesUpdated(liveDisk.DevicePath);
 
                 if (op.NewFileSystem != FileSystemType.RAW && livePart.FileSystem != op.NewFileSystem)
                 {
@@ -1151,13 +1233,75 @@ namespace WinParted.Core
             }
         }
 
+        private static bool TryFormatWithWindowsFormatCom(string volumeTarget, FileSystemType fs, string label, Action<string> onOutputLine = null)
+        {
+            if (string.IsNullOrEmpty(volumeTarget))
+                return false;
+
+            string fsArg = MapDiskPartFs(fs, 0L);
+            if (string.IsNullOrEmpty(fsArg))
+                return false;
+
+            string cleanTarget = volumeTarget.TrimEnd('\\');
+            string cleanLabel = (label ?? string.Empty).Replace("\"", string.Empty).Trim();
+            int maxLabelLen = (fs == FileSystemType.FAT32 || fs == FileSystemType.EfiSystem || fs == FileSystemType.FAT16) ? 11 : 32;
+            if (cleanLabel.Length > maxLabelLen)
+                cleanLabel = cleanLabel.Substring(0, maxLabelLen);
+
+            string args = string.Format("{0} /FS:{1} /Q /Y /V:\"{2}\"",
+                cleanTarget, fsArg.ToUpperInvariant(), cleanLabel);
+
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "format.com",
+                    Arguments = args,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using (var proc = new Process { StartInfo = psi })
+                using (var outDone = new ManualResetEvent(false))
+                using (var errDone = new ManualResetEvent(false))
+                {
+                    proc.OutputDataReceived += (s, e) =>
+                    {
+                        if (e.Data == null) { outDone.Set(); return; }
+                        string trimmed = e.Data.Trim();
+                        if (trimmed.Length > 0 && onOutputLine != null) onOutputLine(trimmed);
+                    };
+                    proc.ErrorDataReceived += (s, e) =>
+                    {
+                        if (e.Data == null) { errDone.Set(); return; }
+                        string trimmed = e.Data.Trim();
+                        if (trimmed.Length > 0 && onOutputLine != null) onOutputLine(trimmed);
+                    };
+
+                    proc.Start();
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+                    while (!proc.WaitForExit(80)) { }
+                    outDone.WaitOne(2000);
+                    errDone.WaitOne(2000);
+                    return proc.ExitCode == 0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         /// <summary>
         /// Generates the equivalent Windows <c>diskpart.exe</c> script (for live execution or user export).
         /// </summary>
-        public static string BuildDiskPartScript(PendingOperation op, PartitionTableStyle tableStyle = PartitionTableStyle.GPT)
+        public static string BuildDiskPartScript(PendingOperation op, PartitionTableStyle tableStyle = PartitionTableStyle.GPT, bool legacyXpMode = false)
         {
             var sb = new StringBuilder();
             sb.AppendLine("select disk " + op.TargetDiskNumber);
+            long targetLenBytes = op.Length > 0 ? op.Length : op.OriginalLength;
             long sizeMb = Math.Max(1, op.Length / 1048576L);
             long offsetKb = op.StartOffset / 1024L;
 
@@ -1172,23 +1316,31 @@ namespace WinParted.Core
             {
                 case OperationType.CreatePartitionTable:
                     sb.AppendLine("clean");
-                    sb.AppendLine(op.NewTableStyle == PartitionTableStyle.GPT ? "convert gpt" : "convert mbr");
+                    if (!legacyXpMode || op.NewTableStyle == PartitionTableStyle.MBR)
+                        sb.AppendLine(op.NewTableStyle == PartitionTableStyle.GPT ? "convert gpt" : "convert mbr");
                     break;
 
                 case OperationType.CreatePartition:
-                    if (op.NewFileSystem == FileSystemType.EfiSystem)
+                    if (!legacyXpMode && op.NewFileSystem == FileSystemType.EfiSystem)
                         sb.AppendLine(string.Format("create partition efi size={0}", sizeMb));
-                    else if (op.NewFileSystem == FileSystemType.MicrosoftReserved)
+                    else if (!legacyXpMode && op.NewFileSystem == FileSystemType.MicrosoftReserved)
                         sb.AppendLine(string.Format("create partition msr size={0}", sizeMb));
                     else
                         sb.AppendLine(string.Format("create partition primary size={0} offset={1}", sizeMb, offsetKb));
 
-                    string fsArg = MapDiskPartFs(op.NewFileSystem);
-                    if (!string.IsNullOrEmpty(fsArg))
+                    string fsArg = MapDiskPartFs(op.NewFileSystem, targetLenBytes);
+                    if (!legacyXpMode && !string.IsNullOrEmpty(fsArg))
                     {
                         string lbl = string.IsNullOrEmpty(op.NewLabel) ? "" : " label=\"" + op.NewLabel + "\"";
                         sb.AppendLine(string.Format("format fs={0} quick{1}", fsArg, lbl));
                         sb.AppendLine("assign noerr");
+                    }
+                    else if (legacyXpMode)
+                    {
+                        if (tableStyle == PartitionTableStyle.MBR && resolvedMbrId != 0)
+                            sb.AppendLine(string.Format("set id={0:X2}", resolvedMbrId));
+                        if (!string.IsNullOrEmpty(fsArg))
+                            sb.AppendLine("assign noerr");
                     }
                     else if (op.NewFileSystem != FileSystemType.MicrosoftReserved)
                     {
@@ -1206,17 +1358,27 @@ namespace WinParted.Core
 
                 case OperationType.FormatPartition:
                     sb.AppendLine("select partition " + op.TargetPartitionNumber);
-                    if (tableStyle == PartitionTableStyle.GPT && resolvedGptGuid != Guid.Empty)
-                        sb.AppendLine("set id=" + resolvedGptGuid.ToString("D") + " override");
-                    else if (tableStyle == PartitionTableStyle.MBR && resolvedMbrId != 0)
-                        sb.AppendLine(string.Format("set id={0:X2} override", resolvedMbrId));
-
-                    string fmtFs = MapDiskPartFs(op.NewFileSystem);
-                    if (!string.IsNullOrEmpty(fmtFs))
+                    if (legacyXpMode)
                     {
-                        string lbl = string.IsNullOrEmpty(op.NewLabel) ? "" : " label=\"" + op.NewLabel + "\"";
-                        sb.AppendLine(string.Format("format fs={0} quick{1}", fmtFs, lbl));
-                        sb.AppendLine("assign noerr");
+                        if (tableStyle == PartitionTableStyle.MBR && resolvedMbrId != 0)
+                            sb.AppendLine(string.Format("set id={0:X2}", resolvedMbrId));
+                        if (!string.IsNullOrEmpty(MapDiskPartFs(op.NewFileSystem, targetLenBytes)))
+                            sb.AppendLine("assign noerr");
+                    }
+                    else
+                    {
+                        if (tableStyle == PartitionTableStyle.GPT && resolvedGptGuid != Guid.Empty)
+                            sb.AppendLine("set id=" + resolvedGptGuid.ToString("D") + " override");
+                        else if (tableStyle == PartitionTableStyle.MBR && resolvedMbrId != 0)
+                            sb.AppendLine(string.Format("set id={0:X2} override", resolvedMbrId));
+
+                        string fmtFs = MapDiskPartFs(op.NewFileSystem, targetLenBytes);
+                        if (!string.IsNullOrEmpty(fmtFs))
+                        {
+                            string lbl = string.IsNullOrEmpty(op.NewLabel) ? "" : " label=\"" + op.NewLabel + "\"";
+                            sb.AppendLine(string.Format("format fs={0} quick{1}", fmtFs, lbl));
+                            sb.AppendLine("assign noerr");
+                        }
                     }
                     break;
 
@@ -1236,10 +1398,12 @@ namespace WinParted.Core
 
                 case OperationType.ChangeFlags:
                     sb.AppendLine("select partition " + op.TargetPartitionNumber);
-                    if (op.NewGptTypeGuid != Guid.Empty)
+                    if (!legacyXpMode && op.NewGptTypeGuid != Guid.Empty)
                         sb.AppendLine("set id=" + op.NewGptTypeGuid.ToString("D") + " override");
                     else if (op.NewMbrType != 0)
-                        sb.AppendLine(string.Format("set id={0:X2} override", op.NewMbrType));
+                        sb.AppendLine(legacyXpMode
+                            ? string.Format("set id={0:X2}", op.NewMbrType)
+                            : string.Format("set id={0:X2} override", op.NewMbrType));
                     if (op.NewMbrBoot)
                         sb.AppendLine("active");
                     break;
@@ -1247,7 +1411,7 @@ namespace WinParted.Core
             return sb.ToString();
         }
 
-        private static string MapDiskPartFs(FileSystemType fs)
+        private static string MapDiskPartFs(FileSystemType fs, long partitionLength = 0)
         {
             switch (fs)
             {
@@ -1256,7 +1420,9 @@ namespace WinParted.Core
                     return "ntfs";
                 case FileSystemType.FAT32:
                 case FileSystemType.EfiSystem:
-                    return "fat32";
+                    return (partitionLength <= 0 || partitionLength <= 32L * 1073741824L) ? "fat32" : string.Empty;
+                case FileSystemType.FAT16:
+                    return (partitionLength <= 0 || partitionLength <= 2L * 1073741824L) ? "fat" : string.Empty;
                 case FileSystemType.exFAT:
                     return "exfat";
                 case FileSystemType.ReFS:

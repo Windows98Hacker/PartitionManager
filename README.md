@@ -33,6 +33,24 @@ See [**ARCHITECTURE.md**](ARCHITECTURE.md) for the full code layout, subsystem d
 
 Compiled executables are **not** stored in the Git source tree. Pre-built release binaries (`WinParted-x64.exe`, `WinParted-x86.exe`, `WinParted.exe`) are distributed exclusively on the GitHub **Releases** page, or you can compile them locally from source using `build.ps1`.
 
+## Dependencies & System Requirements
+
+### Windows 11 / Modern Windows (10 / 8.1 / 7 / Server)
+- **Runtime**: `.NET Framework 4.x` (`4.0`–`4.8`, built into Windows 10 & Windows 11 — zero extra downloads required). Launch `WinParted-x64.exe` (recommended for 64-bit systems), `WinParted.exe`, or `WinParted-x86.exe`. Do **not** place a CLR 2.0 `app.config` alongside `WinParted-x64.exe` or `WinParted.exe`.
+- **Architecture**: x64 (`WinParted-x64.exe`), AnyCPU (`WinParted.exe`), or x86 (`WinParted-x86.exe`).
+- **Built-in OS Utilities & APIs** (included with Windows): `diskpart.exe` and `format.com` (native NTFS / FAT32 <= 32 GiB / FAT16 <= 2 GiB / exFAT / ReFS partitioning & formatting), `kernel32.dll` (`DeviceIoControl`, volume locking/dismount), `user32.dll` (`SetProcessDPIAware`), and `dwmapi.dll` (themed window chrome).
+- **Privileges**: Standard user works for read-only inspection and all virtual `.img` / `.vhd` testing; **Administrator** elevation (`UAC`) is required to write to physical disks or format physical volumes.
+- **Formatting Notes**: `ReFS` formatting via `diskpart`/`format.com` is restricted by Microsoft on some Windows 11 Home/Pro builds, and Windows `diskpart` caps `FAT32` at `32 GiB`; WinParted automatically falls back to its built-in userspace formatter when DiskPart declines or exceeds 32 GiB.
+- **Build from Source (Windows 11 / Modern)**: Uses Windows' built-in compiler (`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` and PowerShell). No Visual Studio or NuGet packages required; to build the XP x86 targets (`WinParted-XP-x86.exe`, `WinParted-x86.exe`), ensure the **.NET Framework 3.5** Windows feature is enabled so `.NET 2.0/3.5` reference assemblies exist.
+
+### Windows XP 32-bit (SP2 / SP3, NT 5.1)
+- **Target Branch & Binary**: Use **`WinParted-XP-x86.exe`** (or `WinParted-x86.exe`) built from the **`Windows-XP-32bit`** branch, kept together with **`WinParted-XP-x86.exe.config`** (from [src/app.config](src/app.config)).
+- **Runtime**: **.NET Framework 3.5 SP1** (provides CLR `v2.0.50727` and `System.Core.dll` 3.5; `.NET Framework 4.0` Client Profile/Extended on XP SP3 is also supported by `app.config`). Windows Installer 3.1 + XP SP2 or SP3 is required for `.NET 3.5 SP1`.
+- **Built-in OS Utilities**: `diskpart.exe` (legacy MBR layout creation/assignment) and `format.com` (NTFS / FAT32 <= 32 GiB / FAT16). When XP's `diskpart.exe` lacks `format`, `shrink`, `convert gpt`, `set id=... override`, or removable USB support, WinParted invokes `format.com` or falls back automatically to direct raw sector & userspace GPT/filesystem writes.
+- **Optional Windows XP Updates**: Installing **KB955704** (Microsoft exFAT file system driver update for Windows XP) enables native OS mounting and `format.com /FS:EXFAT` for exFAT volumes; without KB955704, WinParted still inspects and formats exFAT headers in userspace.
+- **Privileges**: Run from a Windows XP **Administrator** account for raw physical disk access and partitioning.
+- **Hardware / Kernel Limitations Handled Automatically**: Windows XP 32-bit lacks native kernel GPT partitioning (`disk.sys` exposes GPT drives as a single `0xEE` protective MBR slice) and lacks Vista+ `SetProcessDPIAware` / `dwmapi.dll` APIs — WinParted isolates those APIs and parses/writes GPT tables in userspace when raw read access is available.
+
 ## Windows XP 32-bit Support
 
 The `Windows-XP-32bit` branch adds first-class legacy support for Windows XP (x86 SP2/SP3):
@@ -40,7 +58,7 @@ The `Windows-XP-32bit` branch adds first-class legacy support for Windows XP (x8
 - **Dual CLR Runtime Target**: `WinParted-XP-x86.exe` and `WinParted-x86.exe` compile strictly against `.NET Framework 3.5` (`CLR v2.0.50727`, `x86`, PE subsystem version `4.0`) with [src/app.config](src/app.config) enabling execution on either **.NET 3.5 SP1** (Windows XP) or **.NET 4.x** (Windows 7/10/11).
 - **Vista+ API Guards**: High-DPI (`SetProcessDPIAware`), DWM window chrome (`dwmapi.dll`), and WoW64 detection (`IsWow64Process`) are isolated behind `IsWindowsVistaOrNewer` and `MethodImplOptions.NoInlining` wrappers so missing entry points on Windows XP SP2/SP3 `user32.dll` / `dwmapi.dll` never fail to load.
 - **Userspace GPT & Legacy IOCTL Fallbacks**: Because 32-bit Windows XP lacks kernel GPT support (reporting GPT drives as a single `0xEE` protective MBR slot), `Win32DiskInterop` automatically falls back to `IOCTL_DISK_GET_DRIVE_GEOMETRY` + `IOCTL_DISK_GET_LENGTH_INFO`, 512-byte aligned reads on 63-sector/track geometry, and userspace GPT parsing via `RawDiskEngine.ParseDiskPartitionTable`.
-- **Legacy `diskpart.exe` Raw Fallbacks**: When Windows XP's legacy `diskpart.exe` rejects GPT disks, `format fs=... quick`, `shrink`, `set id=... override`, or removable USB media, `OperationQueueManager` falls back to direct raw sector partition table and filesystem header operations.
+- **Legacy `diskpart.exe` + `format.com` Raw Fallbacks**: When Windows XP's legacy `diskpart.exe` rejects GPT disks, `format fs=... quick`, `shrink`, `set id=... override`, or removable USB media, `OperationQueueManager` formats MBR volumes via `format.com` or falls back to direct raw sector partition table and filesystem header operations (including spec-compliant FAT32/FAT16 and >32 GiB FAT32).
 
 ## Build from Source
 

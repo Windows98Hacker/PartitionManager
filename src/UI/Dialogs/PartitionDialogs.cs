@@ -149,7 +149,7 @@ namespace WinParted.UI.Dialogs
                 FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
                 FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
                 FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
-                FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
+                FileSystemType.LinuxSwap, FileSystemType.LVM2, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
                 FileSystemType.EfiSystem, FileSystemType.MicrosoftReserved, FileSystemType.RAW
             };
             foreach (var fs in fsOptions) _cmbFs.Items.Add(fs);
@@ -1333,6 +1333,7 @@ namespace WinParted.UI.Dialogs
         private readonly SmoothProgressBar _barCurrent;
         private readonly ListView _lvOps;
         private readonly TextBox _txtLog;
+        private readonly TableLayoutPanel _bottomBar;
         private readonly Button _btnCopyLog;
         private readonly Button _btnClose;
 
@@ -1367,8 +1368,11 @@ namespace WinParted.UI.Dialogs
             Text = count == 1
                 ? "Applying 1 Partition Operation"
                 : string.Format("Applying {0} Pending Partition Operations", count);
-            Size = new Size(920, 620);
-            MinimumSize = new Size(720, 480);
+            Rectangle initWa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int initMaxW = Math.Max(480, (int)(initWa.Width * 0.92));
+            int initMaxH = Math.Max(340, (int)(initWa.Height * 0.92));
+            Size = new Size(Math.Min(820, initMaxW), Math.Min(540, initMaxH));
+            MinimumSize = new Size(Math.Min(560, initMaxW), Math.Min(380, initMaxH));
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = true;
             MinimizeBox = false;
@@ -1380,7 +1384,7 @@ namespace WinParted.UI.Dialogs
             var headerPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 188,
+                Height = Math.Max(192, Font.Height * 12 + 24),
                 Padding = new Padding(ThemeManager.F13),
                 Tag = "SurfacePanel"
             };
@@ -1471,8 +1475,8 @@ namespace WinParted.UI.Dialogs
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
                 SplitterWidth = 6,
-                Panel1MinSize = 110,
-                Panel2MinSize = 110
+                Panel1MinSize = 52,
+                Panel2MinSize = 52
             };
 
             _lvOps = new ListView
@@ -1484,12 +1488,12 @@ namespace WinParted.UI.Dialogs
                 HideSelection = false,
                 BorderStyle = BorderStyle.FixedSingle
             };
-            _lvOps.Columns.Add("#", 38);
-            _lvOps.Columns.Add("Disk", 96);
-            _lvOps.Columns.Add("Operation", 360);
-            _lvOps.Columns.Add("Status", 128);
-            _lvOps.Columns.Add("Progress", 76);
-            _lvOps.Columns.Add("Time", 76);
+            _lvOps.Columns.Add("#", 32);
+            _lvOps.Columns.Add("Disk", 78);
+            _lvOps.Columns.Add("Operation", 300);
+            _lvOps.Columns.Add("Status", 96);
+            _lvOps.Columns.Add("Progress", 66);
+            _lvOps.Columns.Add("Time", 58);
 
             for (int i = 0; i < count; i++)
             {
@@ -1526,18 +1530,26 @@ namespace WinParted.UI.Dialogs
             };
             split.Panel2.Controls.Add(_txtLog);
 
-            var bottomBar = new Panel
+            _bottomBar = new TableLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = ThemeManager.F55,
-                Padding = new Padding(0, ThemeManager.F8, 0, 0)
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0, ThemeManager.F8, 0, 2)
             };
+            _bottomBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _bottomBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _bottomBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
             var btnFlow = new FlowLayoutPanel
             {
-                Dock = DockStyle.Right,
-                Width = 250,
-                FlowDirection = FlowDirection.RightToLeft,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                WrapContents = false,
+                FlowDirection = FlowDirection.LeftToRight,
+                Anchor = AnchorStyles.Right | AnchorStyles.Top | AnchorStyles.Bottom,
+                Margin = new Padding(ThemeManager.F8, 0, 0, 0),
                 Padding = new Padding(0, 2, 0, 2)
             };
             _btnClose = new Button
@@ -1565,8 +1577,8 @@ namespace WinParted.UI.Dialogs
                 }
                 catch { }
             };
-            btnFlow.Controls.Add(_btnClose);
             btnFlow.Controls.Add(_btnCopyLog);
+            btnFlow.Controls.Add(_btnClose);
 
             _lblBottomHint = new Label
             {
@@ -1577,25 +1589,28 @@ namespace WinParted.UI.Dialogs
                 TextAlign = ContentAlignment.MiddleLeft,
                 AutoEllipsis = true,
                 UseMnemonic = false,
+                Margin = new Padding(0),
                 Tag = "KeepForeColor"
             };
-            bottomBar.Controls.Add(_lblBottomHint);
-            bottomBar.Controls.Add(btnFlow);
+            _bottomBar.Controls.Add(_lblBottomHint, 0, 0);
+            _bottomBar.Controls.Add(btnFlow, 1, 0);
 
             root.Controls.Add(split);
             root.Controls.Add(headerPanel);
-            root.Controls.Add(bottomBar);
+            root.Controls.Add(_bottomBar);
 
             AcceptButton = _btnClose;
             CancelButton = _btnClose;
             ThemeManager.ApplyTheme(this);
+            _bottomBar.Height = Math.Max(ThemeManager.F55, Math.Max(_btnCopyLog.Height, _btnClose.Height) + 20);
+            _bottomBar.PerformLayout();
 
             Action autoSizeOpsColumns = () =>
             {
                 if (_lvOps == null || _lvOps.Columns.Count < 6) return;
                 int fixedW = _lvOps.Columns[0].Width + _lvOps.Columns[1].Width +
                              _lvOps.Columns[3].Width + _lvOps.Columns[4].Width + _lvOps.Columns[5].Width + 4;
-                int opW = Math.Max(220, _lvOps.ClientSize.Width - fixedW);
+                int opW = Math.Max(120, _lvOps.ClientSize.Width - fixedW);
                 if (_lvOps.Columns[2].Width != opW)
                     _lvOps.Columns[2].Width = opW;
             };
@@ -1604,9 +1619,23 @@ namespace WinParted.UI.Dialogs
             _uiTimer = new System.Windows.Forms.Timer { Interval = 75 };
             _uiTimer.Tick += (s, e) => FlushUiState();
 
+            Action clampToWorkingArea = () =>
+            {
+                Rectangle wa = Screen.FromControl(this).WorkingArea;
+                int maxW = Math.Max(480, (int)(wa.Width * 0.92));
+                int maxH = Math.Max(340, (int)(wa.Height * 0.92));
+                MinimumSize = new Size(Math.Min(560, maxW), Math.Min(380, maxH));
+                int w = Math.Min(Width, maxW);
+                int h = Math.Min(Height, maxH);
+                if (w != Width || h != Height)
+                    Size = new Size(w, h);
+            };
+            Load += (s, e) => clampToWorkingArea();
+
             Shown += (s, e) =>
             {
-                ThemeManager.ApplyGoldenSplitter(split, false, 110, 110);
+                clampToWorkingArea();
+                ThemeManager.ApplyGoldenSplitter(split, false, 52, 52);
                 autoSizeOpsColumns();
                 StartExecutionWorker();
             };
@@ -1851,6 +1880,8 @@ namespace WinParted.UI.Dialogs
 
                 _btnClose.Text = "Done";
                 _btnClose.Enabled = true;
+                _bottomBar.PerformLayout();
+                _btnClose.Invalidate();
                 _btnClose.Focus();
             }
         }

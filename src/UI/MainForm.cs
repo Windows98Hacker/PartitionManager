@@ -671,7 +671,8 @@ namespace WinParted.UI
                 FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
                 FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
                 FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
-                FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS
+                FileSystemType.LinuxSwap, FileSystemType.LVM2, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
+                FileSystemType.RAW
             };
 
             var items = new List<ToolStripItem>();
@@ -1784,7 +1785,8 @@ namespace WinParted.UI
                     FileSystemType.NTFS, FileSystemType.FAT32, FileSystemType.FAT16, FileSystemType.exFAT, FileSystemType.ReFS,
                     FileSystemType.Ext4, FileSystemType.Ext3, FileSystemType.Ext2, FileSystemType.Btrfs, FileSystemType.XFS,
                     FileSystemType.F2FS, FileSystemType.ZFS, FileSystemType.SquashFS, FileSystemType.ISO9660, FileSystemType.UDF,
-                    FileSystemType.LinuxSwap, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS
+                    FileSystemType.LinuxSwap, FileSystemType.LVM2, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
+                    FileSystemType.RAW
                 });
                 cmbFs.SelectedIndex = 0;
                 tbl.Controls.Add(cmbFs, 1, 0);
@@ -2186,11 +2188,15 @@ namespace WinParted.UI
 
         private void RunStressTestsDialog()
         {
+            Rectangle wa = Screen.FromControl(this).WorkingArea;
+            int maxW = Math.Max(480, (int)(wa.Width * 0.92));
+            int maxH = Math.Max(340, (int)(wa.Height * 0.92));
+
             using (var dlg = new Form
             {
                 Text = "Stress & Data-Safety Test Suite — Running...",
-                Size = new Size(840, 560),
-                MinimumSize = new Size(640, 420),
+                Size = new Size(Math.Min(840, maxW), Math.Min(560, maxH)),
+                MinimumSize = new Size(Math.Min(560, maxW), Math.Min(380, maxH)),
                 StartPosition = FormStartPosition.CenterParent,
                 Font = new Font("Segoe UI", 9f)
             })
@@ -2225,6 +2231,7 @@ namespace WinParted.UI
                 {
                     Dock = DockStyle.Bottom,
                     Height = ThemeManager.F55,
+                    WrapContents = false,
                     FlowDirection = FlowDirection.RightToLeft,
                     Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
                 };
@@ -2244,6 +2251,8 @@ namespace WinParted.UI
                 dlg.AcceptButton = btnClose;
                 dlg.CancelButton = btnClose;
                 ThemeManager.ApplyTheme(dlg);
+                bottomFlow.Height = Math.Max(ThemeManager.F55, btnClose.Height + 18);
+                bottomFlow.PerformLayout();
 
                 object sync = new object();
                 var pendingLines = new Queue<string>();
