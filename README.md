@@ -50,7 +50,7 @@ Requires Windows with `.NET Framework 3.5 SP1` / `4.x` (`csc.exe` under `v4.0.30
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-Outputs local (git-ignored) binaries into `bin\WinParted-XP-x86.exe`, `bin\WinParted-x86.exe`, `bin\WinParted-x64.exe`, and `bin\WinParted.exe` alongside their `.exe.config` dual-runtime manifests.
+Outputs local (git-ignored) binaries into `bin\WinParted-XP-x86.exe`, `bin\WinParted-x86.exe`, `bin\WinParted-x64.exe`, and `bin\WinParted.exe`, with `.exe.config` dual-runtime manifests paired alongside `WinParted-XP-x86.exe` and `WinParted-x86.exe`.
 
 ## Self-Test & Stress Test
 

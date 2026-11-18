@@ -6,7 +6,7 @@
     eliminating any dependency on Visual Studio, MSBuild, or external NuGet packages.
     WinParted-XP-x86.exe and WinParted-x86.exe are linked strictly against .NET Framework 2.0/3.5
     assemblies (/noconfig /nostdlib /platform:x86) for native execution on Windows XP 32-bit SP2/SP3,
-    with src\app.config copied alongside each executable for dual CLR 2.0 / CLR 4.0 support.
+    with src\app.config copied alongside those CLR 2.0 x86 executables for dual CLR 2.0 / CLR 4.0 support.
 #>
 $ErrorActionPreference = "Stop"
 
@@ -115,7 +115,10 @@ function Invoke-TargetBuild($compiler, $platform, $outName) {
     if ($LASTEXITCODE -ne 0) {
         throw "Compilation failed for $outName (exit $LASTEXITCODE)"
     }
-    Copy-AppConfig $outPath
+    $staleCfg = $outPath + ".config"
+    if (Test-Path -LiteralPath $staleCfg) {
+        Remove-Item -LiteralPath $staleCfg -Force
+    }
     Write-Host "  -> Built $outPath" -ForegroundColor Green
 }
 
