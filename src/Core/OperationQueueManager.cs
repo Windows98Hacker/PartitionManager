@@ -886,6 +886,9 @@ namespace WinParted.Core
                 ReadOnlyFileSystemMountEngine.PurgeDiskOverlaysAndCache(disk.DiskNumber);
                 try
                 {
+                    if (Win32DiskInterop.IsWindowsXpOrOlder && op.NewTableStyle == PartitionTableStyle.GPT)
+                        throw new InvalidOperationException("Windows XP 32-bit DiskPart does not support GPT; using userspace GPT writer.");
+
                     ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 35,
                         "Running DiskPart to initialize partition table...",
                         indeterminate: true);
@@ -899,6 +902,7 @@ namespace WinParted.Core
                     // Fallback: write clean GPT or MBR table directly when DiskPart refuses removable hybrid media
                     ApplyOperationToModel(disk, op);
                     RawDiskEngine.WritePartitionTable(disk);
+                    Win32DiskInterop.NotifyDiskPropertiesUpdated(disk.DevicePath);
                 }
                 return;
             }
@@ -976,22 +980,6 @@ namespace WinParted.Core
             long expectedStart = op.Type == OperationType.CreatePartition
                 ? op.StartOffset
                 : (targetPart != null ? targetPart.StartingOffset : op.OriginalStartOffset);
-
-            if (op.Type == OperationType.FormatPartition && isNonWindowsCreateOrFormat && targetPart != null &&
-                op.NewFileSystem != FileSystemType.FAT32 &&
-                op.NewFileSystem != FileSystemType.EfiSystem &&
-                op.NewFileSystem != FileSystemType.FAT16 &&
-                op.NewFileSystem != FileSystemType.exFAT)
-            {
-                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 20,
-                    string.Format("Locking volume & writing {0} superblock...", op.NewFileSystem));
-                Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, targetPart.StartingOffset, true);
-                targetPart.FileSystem = op.NewFileSystem;
-                targetPart.Label = op.NewLabel ?? string.Empty;
-                targetPart.UsedBytes = 0;
-                targetPart.FreeBytes = targetPart.PartitionLength;
-                RawDiskEngine.WriteFileSystemHeader(disk, targetPart);
-            }
 
             bool diskPartSucceeded = false;
             try
@@ -1084,13 +1072,23 @@ namespace WinParted.Core
                             throw new InvalidOperationException("Target partition not found after partition table update.");
 
                         Win32DiskInterop.PreparePartitionForRawWrite(disk.DiskNumber, rawTarget.StartingOffset, true);
+                        disk.CanRawRead = true;
                         rawTarget.FileSystem = op.NewFileSystem;
                         rawTarget.Label = op.NewLabel ?? string.Empty;
                         rawTarget.UsedBytes = 0;
                         rawTarget.FreeBytes = rawTarget.PartitionLength;
                         RawDiskEngine.WriteFileSystemHeader(disk, rawTarget);
-                        RawDiskEngine.InspectPartitionSuperblock(disk, rawTarget);
                         Win32DiskInterop.NotifyDiskPropertiesUpdated(disk.DevicePath);
+                        RawDiskEngine.InspectPartitionSuperblock(disk, rawTarget);
+
+                        if (op.NewFileSystem != FileSystemType.RAW &&
+                            op.NewFileSystem != FileSystemType.MicrosoftReserved &&
+                            rawTarget.FileSystem != op.NewFileSystem)
+                        {
+                            throw new InvalidDataException(string.Format(
+                                "Post-format verification failed on Disk {0} Part #{1}: expected {2}, read back {3}.",
+                                disk.DiskNumber, rawTarget.PartitionNumber, op.NewFileSystem, rawTarget.FileSystem));
+                        }
                     }
                 }
                 else if (op.Type == OperationType.ResizeMovePartition)
@@ -1139,12 +1137,23 @@ namespace WinParted.Core
                             string.Format("Writing {0} filesystem structures in userspace...", op.NewFileSystem),
                             logLine: string.Format("  [XP Fallback] Writing spec-compliant {0} structures directly...", op.NewFileSystem));
                         Win32DiskInterop.PreparePartitionForRawWrite(xpDisk.DiskNumber, xpPart.StartingOffset, true);
+                        xpDisk.CanRawRead = true;
                         xpPart.FileSystem = op.NewFileSystem;
                         xpPart.Label = op.NewLabel ?? string.Empty;
                         xpPart.UsedBytes = 0;
                         xpPart.FreeBytes = xpPart.PartitionLength;
                         RawDiskEngine.WriteFileSystemHeader(xpDisk, xpPart);
                         Win32DiskInterop.NotifyDiskPropertiesUpdated(xpDisk.DevicePath);
+                        RawDiskEngine.InspectPartitionSuperblock(xpDisk, xpPart);
+
+                        if (op.NewFileSystem != FileSystemType.RAW &&
+                            op.NewFileSystem != FileSystemType.MicrosoftReserved &&
+                            xpPart.FileSystem != op.NewFileSystem)
+                        {
+                            throw new InvalidDataException(string.Format(
+                                "Post-format verification failed on Disk {0} Part #{1}: expected {2}, read back {3}.",
+                                xpDisk.DiskNumber, xpPart.PartitionNumber, op.NewFileSystem, xpPart.FileSystem));
+                        }
                     }
                 }
             }
@@ -1166,10 +1175,8 @@ namespace WinParted.Core
                     throw new InvalidOperationException("Unable to locate target partition on Disk " + disk.DiskNumber + " after DiskPart layout update.");
 
                 liveDisk.CanRawRead = true;
-                RawDiskEngine.InspectPartitionSuperblock(liveDisk, livePart);
 
-                if (op.Type == OperationType.CreatePartition ||
-                    (op.NewFileSystem != FileSystemType.RAW && livePart.FileSystem != op.NewFileSystem))
+                if (op.Type == OperationType.CreatePartition || op.Type == OperationType.FormatPartition)
                 {
                     Win32DiskInterop.PreparePartitionForRawWrite(liveDisk.DiskNumber, livePart.StartingOffset, true);
                     livePart.FileSystem = op.NewFileSystem;
@@ -1177,10 +1184,9 @@ namespace WinParted.Core
                     livePart.UsedBytes = 0;
                     livePart.FreeBytes = livePart.PartitionLength;
                     RawDiskEngine.WriteFileSystemHeader(liveDisk, livePart);
+                    Win32DiskInterop.NotifyDiskPropertiesUpdated(liveDisk.DevicePath);
                     RawDiskEngine.InspectPartitionSuperblock(liveDisk, livePart);
                 }
-
-                Win32DiskInterop.NotifyDiskPropertiesUpdated(liveDisk.DevicePath);
 
                 if (op.NewFileSystem != FileSystemType.RAW && livePart.FileSystem != op.NewFileSystem)
                 {
@@ -1492,9 +1498,9 @@ namespace WinParted.Core
                     break;
 
                 case OperationType.CreatePartition:
-                    if (!legacyXpMode && op.NewFileSystem == FileSystemType.EfiSystem)
+                    if (!legacyXpMode && tableStyle == PartitionTableStyle.GPT && op.NewFileSystem == FileSystemType.EfiSystem)
                         sb.AppendLine(string.Format("create partition efi size={0}", sizeMb));
-                    else if (!legacyXpMode && op.NewFileSystem == FileSystemType.MicrosoftReserved)
+                    else if (!legacyXpMode && tableStyle == PartitionTableStyle.GPT && op.NewFileSystem == FileSystemType.MicrosoftReserved)
                         sb.AppendLine(string.Format("create partition msr size={0}", sizeMb));
                     else
                         sb.AppendLine(string.Format("create partition primary size={0} offset={1}", sizeMb, offsetKb));
@@ -1518,6 +1524,8 @@ namespace WinParted.Core
                         else if (tableStyle == PartitionTableStyle.MBR && resolvedMbrId != 0)
                             sb.AppendLine(string.Format("set id={0:X2} override", resolvedMbrId));
                     }
+                    if (tableStyle == PartitionTableStyle.MBR && op.NewMbrBoot)
+                        sb.AppendLine("active");
                     break;
 
                 case OperationType.DeletePartition:

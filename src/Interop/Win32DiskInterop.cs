@@ -369,18 +369,22 @@ namespace WinParted.Interop
                                 disk.IsSystemDisk = true;
                             }
                         }
-                        if (!string.IsNullOrEmpty(match.Label))
-                            part.Label = match.Label;
-                        if (!string.IsNullOrEmpty(match.FileSystemName))
-                            part.FileSystem = ParseWindowsFsName(match.FileSystemName, part.FileSystem);
-                        if (match.TotalBytes.HasValue && match.FreeBytes.HasValue)
+                        bool allowWinFsOverride = !disk.CanRawRead || IsWindowsNativeFileSystem(part.FileSystem);
+                        if (allowWinFsOverride)
                         {
-                            part.FreeBytes = match.FreeBytes.Value;
-                            part.UsedBytes = Math.Max(0, match.TotalBytes.Value - match.FreeBytes.Value);
-                        }
-                        if (match.VolumeSerial != 0 && string.IsNullOrEmpty(part.UUID))
-                        {
-                            part.UUID = string.Format("{0:X4}-{1:X4}", (match.VolumeSerial >> 16) & 0xFFFF, match.VolumeSerial & 0xFFFF);
+                            if (!string.IsNullOrEmpty(match.Label))
+                                part.Label = match.Label;
+                            if (!string.IsNullOrEmpty(match.FileSystemName))
+                                part.FileSystem = ParseWindowsFsName(match.FileSystemName, part.FileSystem);
+                            if (match.TotalBytes.HasValue && match.FreeBytes.HasValue)
+                            {
+                                part.FreeBytes = match.FreeBytes.Value;
+                                part.UsedBytes = Math.Max(0, match.TotalBytes.Value - match.FreeBytes.Value);
+                            }
+                            if (match.VolumeSerial != 0 && string.IsNullOrEmpty(part.UUID))
+                            {
+                                part.UUID = string.Format("{0:X4}-{1:X4}", (match.VolumeSerial >> 16) & 0xFFFF, match.VolumeSerial & 0xFFFF);
+                            }
                         }
                         part.IsMounted = !string.IsNullOrEmpty(match.DriveLetter) || !string.IsNullOrEmpty(match.VolumeGuidPath);
                     }
@@ -1509,6 +1513,11 @@ namespace WinParted.Interop
                         int err;
                         if (TryWriteHandleAtOffset(heldHandles[coverIdx], relOffset, data, align, out err))
                         {
+                            if (relOffset < 65536L)
+                            {
+                                uint dRet;
+                                DeviceIoControl(heldHandles[coverIdx], FSCTL_DISMOUNT_VOLUME, null, 0, null, 0, out dRet, IntPtr.Zero);
+                            }
                             NotifyDiskPropertiesUpdated(devicePath);
                             return;
                         }
@@ -1727,6 +1736,25 @@ namespace WinParted.Interop
 
             string detail = attemptErrors.Count > 0 ? " [" + string.Join("; ", attemptErrors.ToArray()) + "]" : "";
             throw new Win32Exception(lastErr, "Raw disk WriteFile failed at offset 0x" + byteOffset.ToString("X") + detail);
+        }
+
+        private static bool IsWindowsNativeFileSystem(FileSystemType fs)
+        {
+            switch (fs)
+            {
+                case FileSystemType.NTFS:
+                case FileSystemType.WindowsRecovery:
+                case FileSystemType.FAT32:
+                case FileSystemType.EfiSystem:
+                case FileSystemType.FAT16:
+                case FileSystemType.exFAT:
+                case FileSystemType.ReFS:
+                case FileSystemType.BitLocker:
+                case FileSystemType.RAW:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         public static FileSystemType ParseWindowsFsName(string fsName, FileSystemType fallback)

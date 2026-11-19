@@ -2718,7 +2718,68 @@ namespace WinParted.Core
             if (dataClus72 < 65525L)
                 throw new Exception("72 MiB FAT32 has fewer than 65525 data clusters: " + dataClus72);
 
-            // Verify >32 GiB FAT32 bypasses DiskPart's 32 GiB limit while <=32 GiB uses DiskPart on modern Windows
+            // Verify real multi-group Linux-mountable Ext2/Ext3/Ext4 formatter across 2 block groups (140 MiB)
+            string extImg = Path.Combine(tempDir, "stress10_real_ext_2grp.img");
+            FileSystemType[] extFses = new FileSystemType[] { FileSystemType.Ext2, FileSystemType.Ext3, FileSystemType.Ext4 };
+            for (int ei = 0; ei < extFses.Length; ei++)
+            {
+                FileSystemType extFs = extFses[ei];
+                var extDisk = RawDiskEngine.CreateBlankVirtualDisk(extImg, 144L * MiB, PartitionTableStyle.MBR);
+                extDisk.DiskNumber = 913;
+                var qmExt = new OperationQueueManager();
+                qmExt.SetBaselineDisks(null, new[] { extDisk });
+                qmExt.Enqueue(MakeCreateOp(913, extImg, 1L * MiB, 140L * MiB, extFs, "REAL_" + extFs.ToString().ToUpperInvariant()));
+                qmExt.ApplyAll();
+
+                extDisk = RawDiskEngine.LoadVirtualDisk(extImg, 913);
+                var ep = extDisk.Partitions[0];
+                ep.Label = "REAL_" + extFs.ToString().ToUpperInvariant();
+                ep.FileSystem = extFs;
+                RawDiskEngine.WriteRealExtFileSystem(extDisk, ep);
+                extDisk.CanRawRead = true;
+                RawDiskEngine.InspectPartitionSuperblock(extDisk, ep);
+                if (ep.FileSystem != extFs)
+                    throw new Exception("WriteRealExtFileSystem readback mismatch for " + extFs + ": got " + ep.FileSystem);
+
+                byte[] sbBytes = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + 1024L, 1024);
+                uint freeBlocksSb = BitConverter.ToUInt32(sbBytes, 0x0C);
+                uint freeInodesSb = BitConverter.ToUInt32(sbBytes, 0x10);
+                uint featIncompat = BitConverter.ToUInt32(sbBytes, 0x60);
+                uint journalInum = BitConverter.ToUInt32(sbBytes, 0xE0);
+                byte[] gdtBytes = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + 4096L, 64);
+                uint bgFreeSum = BitConverter.ToUInt16(gdtBytes, 0x0C) + (uint)BitConverter.ToUInt16(gdtBytes, 32 + 0x0C);
+                uint bgInoSum = BitConverter.ToUInt16(gdtBytes, 0x0E) + (uint)BitConverter.ToUInt16(gdtBytes, 32 + 0x0E);
+                if (freeBlocksSb != bgFreeSum || freeInodesSb != bgInoSum)
+                    throw new Exception("Real " + extFs + " superblock free counts do not match Group 0 + Group 1 sums.");
+
+                byte[] backupSb = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + 32768L * 4096L, 1024);
+                if (BitConverter.ToUInt16(backupSb, 0x38) != 0xEF53 || BitConverter.ToUInt16(backupSb, 0x5A) != 1)
+                    throw new Exception("Real " + extFs + " Group 1 backup superblock invalid.");
+
+                if (extFs == FileSystemType.Ext3 || extFs == FileSystemType.Ext4)
+                {
+                    if (journalInum != 8u)
+                        throw new Exception("Real " + extFs + " missing s_journal_inum=8.");
+                    uint g0ItableBlk = BitConverter.ToUInt32(gdtBytes, 0x08);
+                    byte[] ino8 = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + (long)g0ItableBlk * 4096L + 7L * 256L, 256);
+                    uint jFirstBlk = (extFs == FileSystemType.Ext4)
+                        ? BitConverter.ToUInt32(ino8, 0x3C)
+                        : BitConverter.ToUInt32(ino8, 0x28);
+                    if (jFirstBlk == 0u)
+                        throw new Exception("Real " + extFs + " Inode 8 has zero journal block.");
+                    byte[] jHdr = RawDiskEngine.ReadBytes(extDisk, ep.StartingOffset + (long)jFirstBlk * 4096L, 64);
+                    if (jHdr[0] != 0xC0 || jHdr[1] != 0x3B || jHdr[2] != 0x39 || jHdr[3] != 0x98 ||
+                        jHdr[4] != 0 || jHdr[5] != 0 || jHdr[6] != 0 || jHdr[7] != 4)
+                        throw new Exception("Real " + extFs + " Inode 8 missing big-endian JBD2_SUPERBLOCK_V2 header.");
+                }
+                if (extFs == FileSystemType.Ext4)
+                {
+                    if ((featIncompat & 0x0200u) != 0 || (featIncompat & 0x0040u) == 0)
+                        throw new Exception("Real Ext4 incompat flags invalid (expected EXTENTS without FLEX_BG).");
+                }
+            }
+
+            // Verify >32 GiB FAT32 bypasses DiskPart's 32 GiB limit, MBR vs GPT scripts, and XP legacy scripts
             var bigFat32 = new PendingOperation
             {
                 Type = OperationType.FormatPartition,
@@ -2751,7 +2812,46 @@ namespace WinParted.Core
                 xpSmall.IndexOf("noerr", StringComparison.OrdinalIgnoreCase) >= 0)
                 throw new Exception("Legacy XP DiskPart script must not emit unsupported 'format fs=' or 'noerr' command.");
 
-            log("  -> Verified all " + allFormats.Length + " formattable FileSystemTypes + FAT32 (incl. 72 MiB)/FAT16/exFAT spec structures + >32 GiB / XP script modes.");
+            var mbrEfiCreate = new PendingOperation
+            {
+                Type = OperationType.CreatePartition,
+                TargetDiskNumber = 2,
+                StartOffset = 1L * MiB,
+                Length = 100L * MiB,
+                NewFileSystem = FileSystemType.EfiSystem,
+                NewMbrBoot = true
+            };
+            string mbrCreateModern = OperationQueueManager.BuildDiskPartScript(mbrEfiCreate, PartitionTableStyle.MBR, false);
+            string mbrCreateXp = OperationQueueManager.BuildDiskPartScript(mbrEfiCreate, PartitionTableStyle.MBR, true);
+            if (mbrCreateModern.IndexOf("create partition efi", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                mbrCreateModern.IndexOf("create partition primary", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrCreateModern.IndexOf("active", StringComparison.OrdinalIgnoreCase) < 0)
+                throw new Exception("MBR CreatePartition script must emit 'create partition primary' + 'active', never 'create partition efi'.");
+            if (mbrCreateXp.IndexOf("create partition efi", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                mbrCreateXp.IndexOf("create partition primary", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrCreateXp.IndexOf("active", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrCreateXp.IndexOf("noerr", StringComparison.OrdinalIgnoreCase) >= 0)
+                throw new Exception("XP MBR CreatePartition script must emit 'create partition primary' + 'active' without 'efi' or 'noerr'.");
+
+            var extFmtOp = new PendingOperation
+            {
+                Type = OperationType.FormatPartition,
+                TargetDiskNumber = 2,
+                TargetPartitionNumber = 1,
+                OriginalStartOffset = 1L * MiB,
+                OriginalLength = 100L * MiB,
+                NewFileSystem = FileSystemType.Ext4
+            };
+            string mbrExtModern = OperationQueueManager.BuildDiskPartScript(extFmtOp, PartitionTableStyle.MBR, false);
+            string mbrExtXp = OperationQueueManager.BuildDiskPartScript(extFmtOp, PartitionTableStyle.MBR, true);
+            string gptExtScript = OperationQueueManager.BuildDiskPartScript(extFmtOp, PartitionTableStyle.GPT, false);
+            if (mbrExtModern.IndexOf("set id=83 override", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrExtXp.IndexOf("set id=83", StringComparison.OrdinalIgnoreCase) < 0 ||
+                mbrExtXp.IndexOf("override", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                gptExtScript.IndexOf("set id=" + GptPartitionTypeGuids.LinuxFilesystem.ToString("D"), StringComparison.OrdinalIgnoreCase) < 0)
+                throw new Exception("Ext4 FormatPartition script must emit 0x83 (XP without override) on MBR and LinuxFilesystem GUID on GPT.");
+
+            log("  -> Verified all " + allFormats.Length + " formattable FileSystemTypes + 2-group Ext2/3/4 + FAT32 (incl. 72 MiB)/FAT16/exFAT + >32 GiB / MBR / GPT / XP scripts.");
         }
 
         private static void ExpectRejected(Action act, string scenario)

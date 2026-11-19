@@ -1529,6 +1529,11 @@ namespace WinParted.Core
                 case FileSystemType.Ext2:
                 case FileSystemType.Ext3:
                 case FileSystemType.Ext4:
+                    if (!disk.IsVirtualImage)
+                    {
+                        WriteRealExtFileSystem(disk, part);
+                        return;
+                    }
                     uint blockSize = 4096;
                     uint blocksCount = (uint)Math.Max(1, part.PartitionLength / blockSize);
                     long extUsed = part.UsedBytes ?? (long)(part.PartitionLength * 0.30);
@@ -2995,6 +3000,8 @@ namespace WinParted.Core
                     return 0x0C;
                 case FileSystemType.FAT16:
                     return 0x0E;
+                case FileSystemType.WindowsRecovery:
+                    return 0x27;
                 case FileSystemType.LinuxSwap:
                     return 0x82;
                 case FileSystemType.Ext2:
@@ -3019,6 +3026,396 @@ namespace WinParted.Core
                 default:
                     return 0x07;
             }
+        }
+
+        public static string DescribePartitionType(PartitionTableStyle style, FileSystemType fs)
+        {
+            if (style == PartitionTableStyle.GPT)
+            {
+                Guid guid = GptPartitionTypeGuids.ForFileSystem(fs);
+                string kind;
+                if (guid == GptPartitionTypeGuids.EfiSystem) kind = "EFI System Partition";
+                else if (guid == GptPartitionTypeGuids.MicrosoftReserved) kind = "Microsoft Reserved";
+                else if (guid == GptPartitionTypeGuids.WindowsRecovery) kind = "Windows Recovery";
+                else if (guid == GptPartitionTypeGuids.LinuxFilesystem) kind = "Linux Filesystem";
+                else if (guid == GptPartitionTypeGuids.LinuxSwap) kind = "Linux Swap";
+                else if (guid == GptPartitionTypeGuids.LinuxLvm) kind = "Linux LVM";
+                else if (guid == GptPartitionTypeGuids.ZfsMember) kind = "OpenZFS / Solaris";
+                else if (guid == GptPartitionTypeGuids.AppleApfs) kind = "Apple APFS";
+                else if (guid == GptPartitionTypeGuids.AppleHfs) kind = "Apple HFS / HFS+";
+                else kind = "Microsoft Basic Data";
+                return string.Format("{0} ({1})", kind, guid.ToString("D").ToUpperInvariant());
+            }
+
+            if (style == PartitionTableStyle.MBR)
+            {
+                byte mbrId = GetDefaultMbrType(fs);
+                string mbrName;
+                switch (mbrId)
+                {
+                    case 0x0C: mbrName = fs == FileSystemType.EfiSystem ? "EFI System (FAT32)" : "FAT32 LBA"; break;
+                    case 0x0E: mbrName = "FAT16 LBA"; break;
+                    case 0x27: mbrName = "Windows Recovery"; break;
+                    case 0x82: mbrName = "Linux Swap"; break;
+                    case 0x83: mbrName = "Linux Native"; break;
+                    case 0x8E: mbrName = "Linux LVM"; break;
+                    case 0xAF: mbrName = "Apple HFS+ / APFS"; break;
+                    case 0xBF: mbrName = "OpenZFS / Solaris"; break;
+                    case 0xCD: mbrName = "ISO9660 / UDF"; break;
+                    default: mbrName = "NTFS / exFAT / Data"; break;
+                }
+                return string.Format("Primary — 0x{0:X2} ({1})", mbrId, mbrName);
+            }
+
+            return "Uninitialized disk (RAW) — create an MBR or GPT table first";
+        }
+
+        public static string GetFormatSupportNote(FileSystemType fs)
+        {
+            switch (fs)
+            {
+                case FileSystemType.NTFS:
+                case FileSystemType.WindowsRecovery:
+                case FileSystemType.FAT32:
+                case FileSystemType.EfiSystem:
+                case FileSystemType.FAT16:
+                case FileSystemType.exFAT:
+                case FileSystemType.ReFS:
+                    return "Native Windows formatting (with spec-compliant FAT32/FAT16/exFAT fallback when needed).";
+                case FileSystemType.Ext2:
+                case FileSystemType.Ext3:
+                case FileSystemType.Ext4:
+                case FileSystemType.LinuxSwap:
+                case FileSystemType.LVM2:
+                    return "Writes multi-group Linux-mountable " + FileSystemColors.GetDisplayName(fs) + " on-disk structures & partition type.";
+                case FileSystemType.RAW:
+                    return "Clears existing superblock headers and leaves the partition unformatted (RAW).";
+                default:
+                    return "Writes " + FileSystemColors.GetDisplayName(fs) + " partition type & header structures (Windows cannot natively mount without third-party drivers).";
+            }
+        }
+
+        private static bool IsExtPowerOf(int value, int p)
+        {
+            if (value < 1) return false;
+            int v = value;
+            while (v % p == 0) v /= p;
+            return v == 1;
+        }
+
+        private static bool IsExtSparseSuperGroup(int g)
+        {
+            return g == 0 || g == 1 || IsExtPowerOf(g, 3) || IsExtPowerOf(g, 5) || IsExtPowerOf(g, 7);
+        }
+
+        private static void SetBitmapBits(byte[] bmp, uint fromBit, uint toBitExclusive)
+        {
+            for (uint b = fromBit; b < toBitExclusive; b++)
+                bmp[b >> 3] |= (byte)(1 << (int)(b & 7));
+        }
+
+        private static void WriteRealExtInode(
+            byte[] inodeTableBuf,
+            int inodeNum,
+            ushort mode,
+            ulong sizeBytes,
+            ushort linksCount,
+            uint iBlocks512,
+            uint blockNum,
+            ushort extentLen,
+            bool useExtents,
+            uint[] directBlocks,
+            uint indirectBlock)
+        {
+            int off = (inodeNum - 1) * 256;
+            if (off < 0 || off + 256 > inodeTableBuf.Length) return;
+
+            BitConverter.GetBytes(mode).CopyTo(inodeTableBuf, off + 0x00);
+            BitConverter.GetBytes((ushort)0).CopyTo(inodeTableBuf, off + 0x02);
+            BitConverter.GetBytes((uint)(sizeBytes & 0xFFFFFFFFUL)).CopyTo(inodeTableBuf, off + 0x04);
+            uint ts = (uint)Math.Max(1700000000L, (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds);
+            BitConverter.GetBytes(ts).CopyTo(inodeTableBuf, off + 0x08);
+            BitConverter.GetBytes(ts).CopyTo(inodeTableBuf, off + 0x0C);
+            BitConverter.GetBytes(ts).CopyTo(inodeTableBuf, off + 0x10);
+            BitConverter.GetBytes((ushort)0).CopyTo(inodeTableBuf, off + 0x18);
+            BitConverter.GetBytes(linksCount).CopyTo(inodeTableBuf, off + 0x1A);
+            BitConverter.GetBytes(iBlocks512).CopyTo(inodeTableBuf, off + 0x1C);
+            BitConverter.GetBytes((uint)(sizeBytes >> 32)).CopyTo(inodeTableBuf, off + 0x6C);
+            BitConverter.GetBytes((ushort)32).CopyTo(inodeTableBuf, off + 0x80); // i_extra_isize
+
+            if (useExtents)
+            {
+                BitConverter.GetBytes(0x80000u).CopyTo(inodeTableBuf, off + 0x20);       // EXT4_EXTENTS_FL
+                BitConverter.GetBytes((ushort)0xF30A).CopyTo(inodeTableBuf, off + 0x28); // eh_magic
+                BitConverter.GetBytes((ushort)1).CopyTo(inodeTableBuf, off + 0x2A);      // eh_entries
+                BitConverter.GetBytes((ushort)4).CopyTo(inodeTableBuf, off + 0x2C);      // eh_max
+                BitConverter.GetBytes((ushort)0).CopyTo(inodeTableBuf, off + 0x2E);      // eh_depth
+                BitConverter.GetBytes(0u).CopyTo(inodeTableBuf, off + 0x34);             // ee_block
+                BitConverter.GetBytes(extentLen).CopyTo(inodeTableBuf, off + 0x38);      // ee_len
+                BitConverter.GetBytes((ushort)0).CopyTo(inodeTableBuf, off + 0x3A);      // ee_start_hi
+                BitConverter.GetBytes(blockNum).CopyTo(inodeTableBuf, off + 0x3C);       // ee_start_lo
+            }
+            else if (directBlocks != null)
+            {
+                int cnt = Math.Min(12, directBlocks.Length);
+                for (int k = 0; k < cnt; k++)
+                    BitConverter.GetBytes(directBlocks[k]).CopyTo(inodeTableBuf, off + 0x28 + k * 4);
+                if (indirectBlock != 0)
+                    BitConverter.GetBytes(indirectBlock).CopyTo(inodeTableBuf, off + 0x28 + 12 * 4);
+            }
+            else
+            {
+                BitConverter.GetBytes(blockNum).CopyTo(inodeTableBuf, off + 0x28);       // i_block[0]
+            }
+        }
+
+        public static void WriteRealExtFileSystem(DiskInfo disk, PartitionEntry part)
+        {
+            const uint blockSize = 4096u;
+            const uint blocksPerGroup = 32768u;
+            uint totalBlocks = (uint)Math.Min((long)uint.MaxValue, part.PartitionLength / blockSize);
+            if (totalBlocks < 64u) return;
+
+            int numGroups = (int)((totalBlocks + blocksPerGroup - 1u) / blocksPerGroup);
+            uint inodesPerGroup;
+            if (numGroups == 1)
+            {
+                uint rawIpg = Math.Max(128u, (totalBlocks / 4u) & ~15u);
+                uint maxSafeIpg = Math.Max(16u, (totalBlocks / 8u) * 16u);
+                inodesPerGroup = Math.Min(rawIpg, maxSafeIpg);
+            }
+            else if (part.PartitionLength <= 16L * 1073741824L)
+            {
+                inodesPerGroup = 2048u;
+            }
+            else
+            {
+                inodesPerGroup = 1024u;
+            }
+            if (inodesPerGroup < 16u) inodesPerGroup = 16u;
+
+            uint inodeTableBlocks = (inodesPerGroup * 256u) / blockSize;
+            uint gdtBlocks = (uint)((numGroups * 32 + (int)blockSize - 1) / (int)blockSize);
+
+            // Drop a tiny partial tail group that cannot hold its own metadata + data
+            uint lastGroupBlocks = totalBlocks - (uint)(numGroups - 1) * blocksPerGroup;
+            bool lastHasSuper = IsExtSparseSuperGroup(numGroups - 1);
+            uint lastOverhead = (lastHasSuper ? (1u + gdtBlocks) : 0u) + 2u + inodeTableBlocks;
+            if (numGroups > 1 && lastGroupBlocks <= lastOverhead + 8u)
+            {
+                totalBlocks = (uint)(numGroups - 1) * blocksPerGroup;
+                numGroups--;
+                gdtBlocks = (uint)((numGroups * 32 + (int)blockSize - 1) / (int)blockSize);
+            }
+
+            uint totalInodes = (uint)numGroups * inodesPerGroup;
+            uint group0Blocks = Math.Min(blocksPerGroup, totalBlocks);
+            uint g0FirstDataAbs = 1u + gdtBlocks + 2u + inodeTableBlocks;
+            uint rootDirBlk = g0FirstDataAbs;
+            uint lostFoundDirBlk = g0FirstDataAbs + 1u;
+            uint afterDirsBlk = g0FirstDataAbs + 2u;
+
+            bool wantJournal = (part.FileSystem == FileSystemType.Ext3 || part.FileSystem == FileSystemType.Ext4);
+            bool useExtents = (part.FileSystem == FileSystemType.Ext4);
+            uint availGroup0 = group0Blocks > afterDirsBlk ? group0Blocks - afterDirsBlk : 0u;
+            uint journalBlocks = 0u;
+            if (wantJournal)
+            {
+                if (availGroup0 >= 1030u) journalBlocks = 1024u;
+                else if (availGroup0 >= 264u) journalBlocks = 256u;
+                else if (availGroup0 >= 24u) journalBlocks = Math.Min(128u, availGroup0 / 2u);
+            }
+
+            bool needExt3Indirect = (!useExtents && journalBlocks > 12u);
+            uint journalIndirectBlk = needExt3Indirect ? afterDirsBlk : 0u;
+            uint journalStartBlk = needExt3Indirect ? (afterDirsBlk + 1u) : afterDirsBlk;
+            uint g0UsedBlocks = afterDirsBlk + journalBlocks + (needExt3Indirect ? 1u : 0u);
+
+            byte[] gdt = new byte[gdtBlocks * blockSize];
+            uint totalFreeBlocks = 0u;
+            uint totalFreeInodes = 0u;
+
+            for (int g = 0; g < numGroups; g++)
+            {
+                bool hasSuper = IsExtSparseSuperGroup(g);
+                uint groupStart = (uint)g * blocksPerGroup;
+                uint groupBlocks = Math.Min(blocksPerGroup, totalBlocks - groupStart);
+                uint prefix = hasSuper ? (1u + gdtBlocks) : 0u;
+
+                uint blockBitmapBlk = groupStart + prefix;
+                uint inodeBitmapBlk = blockBitmapBlk + 1u;
+                uint inodeTableBlk = inodeBitmapBlk + 1u;
+                uint metaUsedRel = prefix + 2u + inodeTableBlocks;
+                uint groupUsedRel = (g == 0) ? g0UsedBlocks : metaUsedRel;
+
+                ushort freeBlksG = (ushort)(groupBlocks > groupUsedRel ? Math.Min(65535u, groupBlocks - groupUsedRel) : 0u);
+                ushort freeInodesG = (ushort)((g == 0) ? (inodesPerGroup - 11u) : inodesPerGroup);
+                ushort usedDirsG = (ushort)(g == 0 ? 2 : 0);
+
+                totalFreeBlocks += freeBlksG;
+                totalFreeInodes += freeInodesG;
+
+                int dOff = g * 32;
+                BitConverter.GetBytes(blockBitmapBlk).CopyTo(gdt, dOff + 0x00);
+                BitConverter.GetBytes(inodeBitmapBlk).CopyTo(gdt, dOff + 0x04);
+                BitConverter.GetBytes(inodeTableBlk).CopyTo(gdt, dOff + 0x08);
+                BitConverter.GetBytes(freeBlksG).CopyTo(gdt, dOff + 0x0C);
+                BitConverter.GetBytes(freeInodesG).CopyTo(gdt, dOff + 0x0E);
+                BitConverter.GetBytes(usedDirsG).CopyTo(gdt, dOff + 0x10);
+
+                byte[] blkBmp = new byte[blockSize];
+                SetBitmapBits(blkBmp, 0u, Math.Min(blocksPerGroup, groupUsedRel));
+                if (groupBlocks < blocksPerGroup)
+                    SetBitmapBits(blkBmp, groupBlocks, blocksPerGroup);
+                WriteBytes(disk, part.StartingOffset + (long)blockBitmapBlk * blockSize, blkBmp);
+
+                byte[] inoBmp = new byte[blockSize];
+                if (g == 0)
+                    SetBitmapBits(inoBmp, 0u, Math.Min(inodesPerGroup, 11u));
+                if (inodesPerGroup < blocksPerGroup)
+                    SetBitmapBits(inoBmp, inodesPerGroup, blocksPerGroup);
+                WriteBytes(disk, part.StartingOffset + (long)inodeBitmapBlk * blockSize, inoBmp);
+
+                WriteZeroedRegion(disk, part.StartingOffset + (long)inodeTableBlk * blockSize, (long)inodeTableBlocks * blockSize);
+            }
+
+            // Populate Group 0 Inode Table (Inode 2 = /, Inode 11 = /lost+found, Inode 8 = .journal)
+            Guid journalUuid = Guid.NewGuid();
+            uint g0InodeTableBlk = 1u + gdtBlocks + 2u;
+            byte[] g0InodeTable = new byte[inodeTableBlocks * blockSize];
+
+            WriteRealExtInode(g0InodeTable, 2, 0x41ED, blockSize, 3, 8u, rootDirBlk, 1, useExtents, null, 0u);
+            WriteRealExtInode(g0InodeTable, 11, 0x41C0, blockSize, 2, 8u, lostFoundDirBlk, 1, useExtents, null, 0u);
+
+            if (journalBlocks > 0u)
+            {
+                ulong jSize = (ulong)journalBlocks * blockSize;
+                uint jIBlocks512 = (journalBlocks + (needExt3Indirect ? 1u : 0u)) * 8u;
+                if (useExtents)
+                {
+                    WriteRealExtInode(g0InodeTable, 8, 0x8180, jSize, 1, jIBlocks512, journalStartBlk, (ushort)journalBlocks, true, null, 0u);
+                }
+                else
+                {
+                    int directCnt = (int)Math.Min(12u, journalBlocks);
+                    uint[] jDirect = new uint[directCnt];
+                    for (int k = 0; k < directCnt; k++)
+                        jDirect[k] = journalStartBlk + (uint)k;
+                    WriteRealExtInode(g0InodeTable, 8, 0x8180, jSize, 1, jIBlocks512, 0u, 0, false, jDirect, journalIndirectBlk);
+
+                    if (needExt3Indirect)
+                    {
+                        byte[] indBlk = new byte[blockSize];
+                        int rem = (int)(journalBlocks - 12u);
+                        int maxInd = (int)(blockSize / 4u);
+                        for (int k = 0; k < rem && k < maxInd; k++)
+                            BitConverter.GetBytes(journalStartBlk + 12u + (uint)k).CopyTo(indBlk, k * 4);
+                        WriteBytes(disk, part.StartingOffset + (long)journalIndirectBlk * blockSize, indBlk);
+                    }
+                }
+
+                // Write clean JBD2 superblock v2 (big-endian) at journalStartBlk and zero the remainder
+                byte[] jbdSb = new byte[blockSize];
+                WriteUInt32BE(jbdSb, 0x00, 0xC03B3998u); // JBD2_MAGIC_NUMBER
+                WriteUInt32BE(jbdSb, 0x04, 4u);          // JBD2_SUPERBLOCK_V2
+                WriteUInt32BE(jbdSb, 0x08, 0u);          // h_sequence
+                WriteUInt32BE(jbdSb, 0x0C, blockSize);   // s_blocksize
+                WriteUInt32BE(jbdSb, 0x10, journalBlocks);
+                WriteUInt32BE(jbdSb, 0x14, 1u);          // s_first
+                WriteUInt32BE(jbdSb, 0x18, 1u);          // s_sequence
+                WriteUInt32BE(jbdSb, 0x1C, 0u);          // s_start (0 = clean empty journal)
+                journalUuid.ToByteArray().CopyTo(jbdSb, 0x30);
+                WriteUInt32BE(jbdSb, 0x40, 1u);          // s_nr_users
+                WriteBytes(disk, part.StartingOffset + (long)journalStartBlk * blockSize, jbdSb);
+                if (journalBlocks > 1u)
+                    WriteZeroedRegion(disk, part.StartingOffset + (long)(journalStartBlk + 1u) * blockSize, (long)(journalBlocks - 1u) * blockSize);
+            }
+
+            WriteBytes(disk, part.StartingOffset + (long)g0InodeTableBlk * blockSize, g0InodeTable);
+
+            // Write Root Directory (/) and /lost+found
+            byte[] rootDir = new byte[blockSize];
+            WriteExtDirBlock(rootDir, 0, new[]
+            {
+                new ExtDirSpec(2u, 2, "."),
+                new ExtDirSpec(2u, 2, ".."),
+                new ExtDirSpec(11u, 2, "lost+found")
+            });
+            WriteBytes(disk, part.StartingOffset + (long)rootDirBlk * blockSize, rootDir);
+
+            byte[] lfDir = new byte[blockSize];
+            WriteExtDirBlock(lfDir, 0, new[]
+            {
+                new ExtDirSpec(11u, 2, "."),
+                new ExtDirSpec(2u, 2, "..")
+            });
+            WriteBytes(disk, part.StartingOffset + (long)lostFoundDirBlk * blockSize, lfDir);
+
+            // Build 1024-byte Superblock Template
+            byte[] sb = new byte[1024];
+            uint nowTs = (uint)Math.Max(1700000000L, (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds);
+            BitConverter.GetBytes(totalInodes).CopyTo(sb, 0x00);
+            BitConverter.GetBytes(totalBlocks).CopyTo(sb, 0x04);
+            BitConverter.GetBytes(totalBlocks / 20u).CopyTo(sb, 0x08);
+            BitConverter.GetBytes(totalFreeBlocks).CopyTo(sb, 0x0C);
+            BitConverter.GetBytes(totalFreeInodes).CopyTo(sb, 0x10);
+            BitConverter.GetBytes(0u).CopyTo(sb, 0x14);                 // s_first_data_block = 0 (4K)
+            BitConverter.GetBytes(2u).CopyTo(sb, 0x18);                 // s_log_block_size = 2 => 4096
+            BitConverter.GetBytes(2u).CopyTo(sb, 0x1C);                 // s_log_cluster_size = 2
+            BitConverter.GetBytes(blocksPerGroup).CopyTo(sb, 0x20);     // s_blocks_per_group
+            BitConverter.GetBytes(blocksPerGroup).CopyTo(sb, 0x24);     // s_clusters_per_group
+            BitConverter.GetBytes(inodesPerGroup).CopyTo(sb, 0x28);     // s_inodes_per_group
+            BitConverter.GetBytes(nowTs).CopyTo(sb, 0x30);              // s_wtime
+            BitConverter.GetBytes((ushort)0xFFFF).CopyTo(sb, 0x36);     // s_max_mnt_count
+            BitConverter.GetBytes((ushort)0xEF53).CopyTo(sb, 0x38);     // s_magic
+            BitConverter.GetBytes((ushort)1).CopyTo(sb, 0x3A);          // s_state = clean
+            BitConverter.GetBytes((ushort)1).CopyTo(sb, 0x3C);          // s_errors = continue
+            BitConverter.GetBytes(1u).CopyTo(sb, 0x4C);                 // s_rev_level = EXT4_DYNAMIC_REV
+            BitConverter.GetBytes(11u).CopyTo(sb, 0x54);                // s_first_ino
+            BitConverter.GetBytes((ushort)256).CopyTo(sb, 0x58);        // s_inode_size
+
+            uint compat = (wantJournal && journalBlocks > 0u) ? 0x0004u : 0x0000u; // EXT3_FEATURE_COMPAT_HAS_JOURNAL
+            uint incompat = (part.FileSystem == FileSystemType.Ext4) ? 0x0042u : 0x0002u; // FILETYPE | EXTENTS (no FLEX_BG)
+            uint roCompat = 0x0003u; // SPARSE_SUPER | LARGE_FILE
+            BitConverter.GetBytes(compat).CopyTo(sb, 0x5C);
+            BitConverter.GetBytes(incompat).CopyTo(sb, 0x60);
+            BitConverter.GetBytes(roCompat).CopyTo(sb, 0x64);
+
+            Guid extUuid = Guid.NewGuid();
+            extUuid.ToByteArray().CopyTo(sb, 0x68);
+            string extLbl = part.Label ?? string.Empty;
+            if (extLbl.Length > 16) extLbl = extLbl.Substring(0, 16);
+            Encoding.UTF8.GetBytes(extLbl).CopyTo(sb, 0x78);
+
+            if (journalBlocks > 0u)
+            {
+                journalUuid.ToByteArray().CopyTo(sb, 0xD0);             // s_journal_uuid
+                BitConverter.GetBytes(8u).CopyTo(sb, 0xE0);             // s_journal_inum
+            }
+            BitConverter.GetBytes((ushort)32).CopyTo(sb, 0xFE);         // s_desc_size
+            BitConverter.GetBytes(nowTs).CopyTo(sb, 0x108);             // s_mkfs_time
+
+            // Primary Block 0 (1024-byte zero lead + 1024-byte SB + 2048-byte zero tail) + GDT
+            byte[] block0 = new byte[blockSize];
+            Array.Copy(sb, 0, block0, 1024, 1024);
+            WriteBytes(disk, part.StartingOffset, block0);
+            WriteBytes(disk, part.StartingOffset + blockSize, gdt);
+
+            // Sparse Backup Superblocks + Backup GDTs for g > 0
+            byte[] backupBlock = new byte[blockSize];
+            for (int g = 1; g < numGroups; g++)
+            {
+                if (!IsExtSparseSuperGroup(g)) continue;
+                long gStartByte = (long)g * blocksPerGroup * blockSize;
+                Array.Copy(sb, 0, backupBlock, 0, 1024);
+                BitConverter.GetBytes((ushort)g).CopyTo(backupBlock, 0x5A); // s_block_group_nr
+                WriteBytes(disk, part.StartingOffset + gStartByte, backupBlock);
+                WriteBytes(disk, part.StartingOffset + gStartByte + blockSize, gdt);
+            }
+
+            part.UUID = extUuid.ToString("D");
+            part.FreeBytes = Math.Min(part.PartitionLength, (long)totalFreeBlocks * blockSize);
+            part.UsedBytes = Math.Max(0L, part.PartitionLength - part.FreeBytes.Value);
         }
 
         private sealed class ExtDirSpec

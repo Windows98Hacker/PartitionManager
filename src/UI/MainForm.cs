@@ -1650,11 +1650,22 @@ namespace WinParted.UI
         {
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || !sel.IsUnallocated) return;
+            if (_currentPreviewDisk.PartitionStyle == PartitionTableStyle.RAW)
+            {
+                MessageBox.Show(this,
+                    "This disk is currently uninitialized (RAW).\n\nUse Device -> Create Partition Table... to create an MBR or GPT partition table first.",
+                    "Partition Table Required",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
 
+            bool isGpt = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT;
             using (var dlg = new CreateOrResizePartitionDialog(_currentPreviewDisk, sel, sel.StartingOffset, sel.PartitionLength, true))
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
+                    byte mbrType = RawDiskEngine.GetDefaultMbrType(dlg.ResultFileSystem);
                     TryEnqueue(new PendingOperation
                     {
                         Type = OperationType.CreatePartition,
@@ -1664,13 +1675,15 @@ namespace WinParted.UI
                         Length = dlg.ResultLengthBytes,
                         NewFileSystem = dlg.ResultFileSystem,
                         NewLabel = dlg.ResultLabel,
-                        NewPartitionName = dlg.ResultPartitionName,
-                        NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(dlg.ResultFileSystem),
-                        NewMbrType = RawDiskEngine.GetDefaultMbrType(dlg.ResultFileSystem),
+                        NewPartitionName = isGpt ? dlg.ResultPartitionName : string.Empty,
+                        NewGptTypeGuid = isGpt ? GptPartitionTypeGuids.ForFileSystem(dlg.ResultFileSystem) : Guid.Empty,
+                        NewMbrType = !isGpt ? mbrType : (byte)0,
+                        NewMbrBoot = !isGpt && dlg.ResultMbrBoot,
                         Summary = string.Format("Create {0} partition ({1}) on {2}",
                             FileSystemColors.GetDisplayName(dlg.ResultFileSystem), ByteFormatter.FormatBytes(dlg.ResultLengthBytes),
                             _currentPreviewDisk.IsVirtualImage ? "Virtual Disk" : "Disk " + _currentPreviewDisk.DiskNumber),
-                        DetailDescription = string.Format("Start 0x{0:X}, Length {1}, Label '{2}'",
+                        DetailDescription = string.Format("{0}, Start 0x{1:X}, Length {2}, Label '{3}'",
+                            isGpt ? "GPT" : string.Format("MBR 0x{0:X2}{1}", mbrType, dlg.ResultMbrBoot ? " (active)" : ""),
                             dlg.ResultStartOffset, ByteFormatter.FormatBytes(dlg.ResultLengthBytes), dlg.ResultLabel),
                         RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "Medium"
                     });
@@ -1754,12 +1767,33 @@ namespace WinParted.UI
                 return;
             }
 
-            using (var dlg = new Form { Text = "Format Partition — " + sel.ShortDeviceName, Size = new Size(448, 277), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
+            bool isGpt = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT;
+            Rectangle wa = Screen.FromControl(this).WorkingArea;
+            int maxW = Math.Max(460, (int)(wa.Width * 0.92));
+            int maxH = Math.Max(300, (int)(wa.Height * 0.92));
+
+            using (var dlg = new Form
+            {
+                Text = string.Format("Format Partition — {0} ({1})", sel.ShortDeviceName, _currentPreviewDisk.PartitionStyle),
+                Size = new Size(Math.Min(560, maxW), Math.Min(360, maxH)),
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterParent,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                Font = new Font("Segoe UI", 9f)
+            })
             {
                 var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F21) };
                 dlg.Controls.Add(root);
 
-                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = ThemeManager.F55, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8) };
+                var btnFlow = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Bottom,
+                    Height = ThemeManager.F55,
+                    WrapContents = false,
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8)
+                };
                 var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(ThemeManager.F89, ThemeManager.F34), Margin = new Padding(ThemeManager.F8, 0, 0, 0) };
                 var btnOk = new Button { Text = "Queue Format", DialogResult = DialogResult.OK, Size = new Size(110, ThemeManager.F34), Margin = new Padding(ThemeManager.F8, 0, 0, 0), Tag = "TonalButton" };
                 var btnFormatNow = new Button { Text = "Format Now", DialogResult = DialogResult.OK, Size = new Size(110, ThemeManager.F34), Margin = new Padding(0), Tag = "PrimaryButton" };
@@ -1770,15 +1804,28 @@ namespace WinParted.UI
                 btnFlow.Controls.Add(btnOk);
                 btnFlow.Controls.Add(btnFormatNow);
 
-                var tbl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
+                var tbl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4 };
                 tbl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
                 tbl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+                tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 tbl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 root.Controls.Add(tbl);
                 root.Controls.Add(btnFlow);
 
-                tbl.Controls.Add(new Label { Text = "File system:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 0);
+                tbl.Controls.Add(new Label { Text = "Partition table:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 7, 12, 6) }, 0, 0);
+                var lblTableType = new Label
+                {
+                    Text = _currentPreviewDisk.PartitionStyle + ": " + RawDiskEngine.DescribePartitionType(_currentPreviewDisk.PartitionStyle, sel.FileSystem),
+                    AutoSize = true,
+                    MaximumSize = new Size(340, 0),
+                    Anchor = AnchorStyles.Left,
+                    Margin = new Padding(0, 7, 0, 6)
+                };
+                tbl.Controls.Add(lblTableType, 1, 0);
+
+                tbl.Controls.Add(new Label { Text = "File system:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 1);
                 var cmbFs = new ComboBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 6, 0, 8) };
                 cmbFs.Items.AddRange(new object[]
                 {
@@ -1788,16 +1835,41 @@ namespace WinParted.UI
                     FileSystemType.LinuxSwap, FileSystemType.LVM2, FileSystemType.APFS, FileSystemType.HFSPlus, FileSystemType.HFS,
                     FileSystemType.RAW
                 });
-                cmbFs.SelectedIndex = 0;
-                tbl.Controls.Add(cmbFs, 1, 0);
+                cmbFs.SelectedItem = cmbFs.Items.Contains(sel.FileSystem) ? (object)sel.FileSystem : FileSystemType.NTFS;
+                if (cmbFs.SelectedIndex < 0) cmbFs.SelectedIndex = 0;
+                tbl.Controls.Add(cmbFs, 1, 1);
 
-                tbl.Controls.Add(new Label { Text = "Volume label:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 1);
+                tbl.Controls.Add(new Label { Text = "Volume label:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 2);
                 var txtLbl = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Text = sel.Label, Margin = new Padding(0, 6, 0, 8) };
-                tbl.Controls.Add(txtLbl, 1, 1);
+                tbl.Controls.Add(txtLbl, 1, 2);
+
+                tbl.Controls.Add(new Label { Text = "Format note:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 7, 12, 6) }, 0, 3);
+                FileSystemType curFsInit = cmbFs.SelectedItem is FileSystemType ? (FileSystemType)cmbFs.SelectedItem : FileSystemType.NTFS;
+                lblTableType.Text = _currentPreviewDisk.PartitionStyle + ": " + RawDiskEngine.DescribePartitionType(_currentPreviewDisk.PartitionStyle, curFsInit);
+                var lblFormatNote = new Label
+                {
+                    Text = RawDiskEngine.GetFormatSupportNote(curFsInit),
+                    AutoSize = true,
+                    MaximumSize = new Size(340, 0),
+                    Anchor = AnchorStyles.Left,
+                    Margin = new Padding(0, 7, 0, 6)
+                };
+                tbl.Controls.Add(lblFormatNote, 1, 3);
+
+                cmbFs.SelectedIndexChanged += (s, e) =>
+                {
+                    if (cmbFs.SelectedItem is FileSystemType)
+                    {
+                        FileSystemType chosen = (FileSystemType)cmbFs.SelectedItem;
+                        lblTableType.Text = _currentPreviewDisk.PartitionStyle + ": " + RawDiskEngine.DescribePartitionType(_currentPreviewDisk.PartitionStyle, chosen);
+                        lblFormatNote.Text = RawDiskEngine.GetFormatSupportNote(chosen);
+                    }
+                };
 
                 dlg.AcceptButton = btnOk;
                 dlg.CancelButton = btnCancel;
                 ThemeManager.ApplyTheme(dlg);
+                btnFlow.Height = Math.Max(ThemeManager.F55, btnOk.Height + 18);
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
                     var fs = (FileSystemType)cmbFs.SelectedItem;
@@ -1812,10 +1884,10 @@ namespace WinParted.UI
                         OriginalLength = sel.PartitionLength,
                         NewFileSystem = fs,
                         NewLabel = txtLbl.Text.Trim(),
-                        NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(fs),
-                        NewMbrType = RawDiskEngine.GetDefaultMbrType(fs),
+                        NewGptTypeGuid = isGpt ? GptPartitionTypeGuids.ForFileSystem(fs) : Guid.Empty,
+                        NewMbrType = !isGpt ? RawDiskEngine.GetDefaultMbrType(fs) : (byte)0,
                         Summary = string.Format("Format {0} as {1}", sel.ShortDeviceName, FileSystemColors.GetDisplayName(fs)),
-                        DetailDescription = string.Format("Label: '{0}'", txtLbl.Text.Trim()),
+                        DetailDescription = string.Format("{0}, Label: '{1}'", RawDiskEngine.DescribePartitionType(_currentPreviewDisk.PartitionStyle, fs), txtLbl.Text.Trim()),
                         RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "High"
                     });
 
@@ -1841,6 +1913,7 @@ namespace WinParted.UI
                 return;
             }
 
+            bool isGpt = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT;
             string label = sel.Label ?? string.Empty;
             TryEnqueue(new PendingOperation
             {
@@ -1852,10 +1925,10 @@ namespace WinParted.UI
                 OriginalLength = sel.PartitionLength,
                 NewFileSystem = fs,
                 NewLabel = label,
-                NewGptTypeGuid = GptPartitionTypeGuids.ForFileSystem(fs),
-                NewMbrType = RawDiskEngine.GetDefaultMbrType(fs),
+                NewGptTypeGuid = isGpt ? GptPartitionTypeGuids.ForFileSystem(fs) : Guid.Empty,
+                NewMbrType = !isGpt ? RawDiskEngine.GetDefaultMbrType(fs) : (byte)0,
                 Summary = string.Format("Format {0} as {1}", sel.ShortDeviceName, FileSystemColors.GetDisplayName(fs)),
-                DetailDescription = string.Format("Label: '{0}'", label),
+                DetailDescription = string.Format("{0}, Label: '{1}'", RawDiskEngine.DescribePartitionType(_currentPreviewDisk.PartitionStyle, fs), label),
                 RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "High"
             });
         }
@@ -1865,12 +1938,22 @@ namespace WinParted.UI
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
 
-            using (var dlg = new Form { Text = "Label Partition — " + sel.ShortDeviceName, Size = new Size(424, 262), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = new Font("Segoe UI", 9f) })
+            bool isGpt = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT;
+            using (var dlg = new Form
+            {
+                Text = string.Format("Label Partition — {0} ({1})", sel.ShortDeviceName, _currentPreviewDisk.PartitionStyle),
+                Size = new Size(440, 268),
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterParent,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                Font = new Font("Segoe UI", 9f)
+            })
             {
                 var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(ThemeManager.F21) };
                 dlg.Controls.Add(root);
 
-                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = ThemeManager.F55, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8) };
+                var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = ThemeManager.F55, WrapContents = false, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, ThemeManager.F8, 0, ThemeManager.F8) };
                 var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Size = new Size(ThemeManager.F89, ThemeManager.F34), Margin = new Padding(ThemeManager.F8, 0, 0, 0) };
                 var btnOk = new Button { Text = "Apply Label", DialogResult = DialogResult.OK, Size = new Size(110, ThemeManager.F34), Margin = new Padding(0), Tag = "PrimaryButton" };
                 btnFlow.Controls.Add(btnCancel);
@@ -1888,15 +1971,25 @@ namespace WinParted.UI
                 var txtLbl = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Text = sel.Label, Margin = new Padding(0, 6, 0, 8) };
                 tbl.Controls.Add(txtLbl, 1, 0);
 
-                tbl.Controls.Add(new Label { Text = "GPT Name:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 1);
-                var txtName = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Text = sel.PartitionName, Enabled = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT, Margin = new Padding(0, 6, 0, 8) };
-                tbl.Controls.Add(txtName, 1, 1);
+                TextBox txtName = null;
+                if (isGpt)
+                {
+                    tbl.Controls.Add(new Label { Text = "GPT Name:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 1);
+                    txtName = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Text = sel.PartitionName, Margin = new Padding(0, 6, 0, 8) };
+                    tbl.Controls.Add(txtName, 1, 1);
+                }
+                else
+                {
+                    tbl.Controls.Add(new Label { Text = "Partition Table:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 12, 8) }, 0, 1);
+                    tbl.Controls.Add(new Label { Text = "MBR (uses Volume Label only)", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 9, 0, 8) }, 1, 1);
+                }
 
                 dlg.AcceptButton = btnOk;
                 dlg.CancelButton = btnCancel;
                 ThemeManager.ApplyTheme(dlg);
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
+                    string partNameVal = (isGpt && txtName != null) ? txtName.Text.Trim() : string.Empty;
                     TryEnqueue(new PendingOperation
                     {
                         Type = OperationType.ChangeLabel,
@@ -1906,9 +1999,9 @@ namespace WinParted.UI
                         OriginalStartOffset = sel.StartingOffset,
                         OriginalLength = sel.PartitionLength,
                         NewLabel = txtLbl.Text.Trim(),
-                        NewPartitionName = txtName.Text.Trim(),
+                        NewPartitionName = partNameVal,
                         Summary = string.Format("Set label of {0} to '{1}'", sel.ShortDeviceName, txtLbl.Text.Trim()),
-                        DetailDescription = "GPT Name: " + txtName.Text.Trim(),
+                        DetailDescription = isGpt ? ("GPT Name: " + partNameVal) : "MBR Volume Label",
                         RiskLevel = "Low"
                     });
                 }
@@ -1920,6 +2013,7 @@ namespace WinParted.UI
             var sel = GetSelectedPartition();
             if (_currentPreviewDisk == null || sel == null || sel.IsUnallocated) return;
 
+            bool isGpt = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT;
             using (var dlg = new ManageFlagsDialog(_currentPreviewDisk, sel))
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK)
@@ -1937,7 +2031,9 @@ namespace WinParted.UI
                         NewMbrType = dlg.ResultMbrType,
                         NewMbrBoot = dlg.ResultMbrBoot,
                         Summary = string.Format("Change flags/type on {0}", sel.ShortDeviceName),
-                        DetailDescription = Win32DiskInterop.FormatGptFlags(dlg.ResultGptTypeGuid, dlg.ResultGptAttributes),
+                        DetailDescription = isGpt
+                            ? Win32DiskInterop.FormatGptFlags(dlg.ResultGptTypeGuid, dlg.ResultGptAttributes)
+                            : string.Format("MBR Type 0x{0:X2}{1}", dlg.ResultMbrType, dlg.ResultMbrBoot ? " (active/boot)" : ""),
                         RiskLevel = "Medium"
                     });
                 }
@@ -2012,6 +2108,10 @@ namespace WinParted.UI
             if (alignedStart + _clipboardPartition.PartitionLength > sel.EndOffset)
                 alignedStart = sel.StartingOffset;
 
+            bool isGpt = _currentPreviewDisk.PartitionStyle == PartitionTableStyle.GPT;
+            byte cloneMbrType = _clipboardPartition.MbrPartitionType != 0
+                ? _clipboardPartition.MbrPartitionType
+                : RawDiskEngine.GetDefaultMbrType(_clipboardPartition.FileSystem);
             TryEnqueue(new PendingOperation
             {
                 Type = OperationType.CopyPartition,
@@ -2025,8 +2125,10 @@ namespace WinParted.UI
                 Length = _clipboardPartition.PartitionLength,
                 NewFileSystem = _clipboardPartition.FileSystem,
                 NewLabel = _clipboardPartition.Label,
-                NewPartitionName = _clipboardPartition.PartitionName,
-                NewGptTypeGuid = _clipboardPartition.GptTypeGuid,
+                NewPartitionName = isGpt ? _clipboardPartition.PartitionName : string.Empty,
+                NewGptTypeGuid = isGpt ? _clipboardPartition.GptTypeGuid : Guid.Empty,
+                NewMbrType = !isGpt ? cloneMbrType : (byte)0,
+                NewMbrBoot = !isGpt && _clipboardPartition.MbrBootable,
                 Summary = string.Format("Paste/Clone {0} ({1}) into unallocated space", _clipboardPartition.ShortDeviceName, ByteFormatter.FormatBytes(_clipboardPartition.PartitionLength)),
                 DetailDescription = string.Format("Source Disk #{0} -> Destination Offset 0x{1:X}", _clipboardSourceDiskNumber, alignedStart),
                 RiskLevel = _currentPreviewDisk.IsVirtualImage ? "Safe (Img)" : "Medium"
