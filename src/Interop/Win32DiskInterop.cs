@@ -1793,5 +1793,249 @@ namespace WinParted.Interop
                 default: return string.Format("BusType({0})", bus);
             }
         }
+
+        /// <summary>
+        /// Holds exclusive volume locks (and dismounted handles) across a physical disk's old/new extent range
+        /// while performing direct <c>\\.\PhysicalDriveN</c> reads and writes for offline filesystem resize/move.
+        /// </summary>
+        public sealed class PhysicalRawSession : IDisposable
+        {
+            private readonly string _devicePath;
+            private readonly int _sectorSize;
+            private readonly List<VolumeMapping> _lockedMappings = new List<VolumeMapping>();
+            private readonly List<SafeFileHandle> _heldHandles = new List<SafeFileHandle>();
+            private readonly List<bool> _heldLocked = new List<bool>();
+            private readonly List<string> _heldTargets = new List<string>();
+            private bool _volumesOfflined;
+            private SafeFileHandle _hDisk;
+
+            public string OriginalDriveLetter { get; private set; }
+            public string OriginalVolumeGuidPath { get; private set; }
+
+            public PhysicalRawSession(int diskNumber, string devicePath, int sectorSize, long oldStart, long oldLen, long newStart, long newLen)
+            {
+                _devicePath = devicePath;
+                _sectorSize = Math.Max(512, sectorSize);
+                OriginalDriveLetter = string.Empty;
+                OriginalVolumeGuidPath = string.Empty;
+
+                if (!IsAdministrator())
+                    throw new UnauthorizedAccessException("Administrator privileges are required for offline physical partition resize.");
+
+                ClearDiskAndPartitionWriteProtection(devicePath, diskNumber, oldStart);
+
+                long minStart = Math.Min(oldStart, newStart);
+                long maxEnd = Math.Max(oldStart + oldLen, newStart + newLen);
+                var allVols = DiscoverVolumeMappings();
+
+                try
+                {
+                    for (int i = 0; i < allVols.Count; i++)
+                    {
+                        VolumeMapping vm = allVols[i];
+                        if (vm.DiskNumber != diskNumber) continue;
+
+                        if (Math.Abs(vm.StartOffset - oldStart) < 2L * 1048576L)
+                        {
+                            if (string.IsNullOrEmpty(OriginalDriveLetter) && !string.IsNullOrEmpty(vm.DriveLetter))
+                                OriginalDriveLetter = vm.DriveLetter;
+                            if (string.IsNullOrEmpty(OriginalVolumeGuidPath) && !string.IsNullOrEmpty(vm.VolumeGuidPath))
+                                OriginalVolumeGuidPath = vm.VolumeGuidPath;
+                        }
+
+                        bool overlaps = vm.StartOffset < maxEnd && (vm.StartOffset + vm.ExtentLength) > minStart;
+                        if (!overlaps && vm.StartOffset != 0L) continue;
+
+                        string target = !string.IsNullOrEmpty(vm.VolumeGuidPath)
+                            ? vm.VolumeGuidPath.TrimEnd('\\')
+                            : (!string.IsNullOrEmpty(vm.DriveLetter) ? @"\\.\" + vm.DriveLetter.TrimEnd('\\') : string.Empty);
+                        if (string.IsNullOrEmpty(target) || _heldTargets.Contains(target))
+                            continue;
+
+                        bool unbuf;
+                        SafeFileHandle hVol = OpenWriteHandle(target, out unbuf);
+                        if (hVol.IsInvalid)
+                        {
+                            int openErr = Marshal.GetLastWin32Error();
+                            hVol.Dispose();
+                            throw new InvalidOperationException(string.Format(
+                                "Cannot open volume {0} exclusively (Win32 error {1}). Close any programs or Explorer windows using this drive and retry.",
+                                !string.IsNullOrEmpty(vm.DriveLetter) ? vm.DriveLetter : target, openErr));
+                        }
+
+                        uint ret;
+                        DeviceIoControl(hVol, IOCTL_VOLUME_ONLINE, null, 0, null, 0, out ret, IntPtr.Zero);
+                        DeviceIoControl(hVol, FSCTL_ALLOW_EXTENDED_DASD_IO, null, 0, null, 0, out ret, IntPtr.Zero);
+
+                        bool locked = false;
+                        for (int attempt = 0; attempt < 4; attempt++)
+                        {
+                            if (DeviceIoControl(hVol, FSCTL_LOCK_VOLUME, null, 0, null, 0, out ret, IntPtr.Zero))
+                            {
+                                locked = true;
+                                break;
+                            }
+                            System.Threading.Thread.Sleep(120);
+                        }
+
+                        if (!locked)
+                        {
+                            int lockErr = Marshal.GetLastWin32Error();
+                            hVol.Dispose();
+                            throw new InvalidOperationException(string.Format(
+                                "Cannot acquire exclusive lock on {0} (Win32 error {1}). Close all open files, Command Prompt windows, or File Explorer tabs on this drive and try again.",
+                                !string.IsNullOrEmpty(vm.DriveLetter) ? vm.DriveLetter : target, lockErr));
+                        }
+
+                        DeviceIoControl(hVol, FSCTL_DISMOUNT_VOLUME, null, 0, null, 0, out ret, IntPtr.Zero);
+                        _lockedMappings.Add(vm);
+                        _heldHandles.Add(hVol);
+                        _heldLocked.Add(true);
+                        _heldTargets.Add(target);
+                    }
+
+                    bool diskUnbuf;
+                    _hDisk = OpenWriteHandle(devicePath, out diskUnbuf);
+                    if (_hDisk.IsInvalid)
+                    {
+                        int dErr = Marshal.GetLastWin32Error();
+                        _hDisk.Dispose();
+                        _hDisk = null;
+                        throw new Win32Exception(dErr, "Cannot open physical drive " + devicePath + " for raw write.");
+                    }
+
+                    ClearDiskReadOnlyAttribute(_hDisk);
+                    uint dasdRet;
+                    DeviceIoControl(_hDisk, FSCTL_ALLOW_EXTENDED_DASD_IO, null, 0, null, 0, out dasdRet, IntPtr.Zero);
+                }
+                catch
+                {
+                    Dispose();
+                    throw;
+                }
+            }
+
+            public byte[] ReadAt(long diskOffset, int length)
+            {
+                if (length <= 0) return new byte[0];
+                byte[] result = new byte[length];
+                const int maxChunk = 1048576;
+                int offset = 0;
+                while (offset < length)
+                {
+                    int n = Math.Min(maxChunk, length - offset);
+                    byte[] chunk;
+                    int err;
+                    if (!TryReadHandleAtOffset(_hDisk, diskOffset + offset, n, out chunk, out err) || chunk == null || chunk.Length < n)
+                        throw new Win32Exception(err, "PhysicalRawSession ReadAt failed at offset 0x" + (diskOffset + offset).ToString("X"));
+                    Array.Copy(chunk, 0, result, offset, n);
+                    offset += n;
+                }
+                return result;
+            }
+
+            public void WriteAt(long diskOffset, byte[] data)
+            {
+                if (data == null || data.Length == 0) return;
+                const int maxChunk = 1048576;
+                int pos = 0;
+                while (pos < data.Length)
+                {
+                    int n = Math.Min(maxChunk, data.Length - pos);
+                    byte[] chunk = data;
+                    if (n != data.Length)
+                    {
+                        chunk = new byte[n];
+                        Array.Copy(data, pos, chunk, 0, n);
+                    }
+                    WriteChunk(diskOffset + pos, chunk);
+                    pos += n;
+                }
+            }
+
+            private void WriteChunk(long diskOffset, byte[] data)
+            {
+                int err;
+                if (TryWriteHandleAtOffset(_hDisk, diskOffset, data, _sectorSize, out err))
+                    return;
+
+                if (!_volumesOfflined && _heldHandles.Count > 0)
+                {
+                    for (int i = 0; i < _heldHandles.Count; i++)
+                    {
+                        if (_heldHandles[i] != null && !_heldHandles[i].IsInvalid)
+                        {
+                            uint oRet;
+                            DeviceIoControl(_heldHandles[i], IOCTL_VOLUME_OFFLINE, null, 0, null, 0, out oRet, IntPtr.Zero);
+                        }
+                    }
+                    _volumesOfflined = true;
+                    if (TryWriteHandleAtOffset(_hDisk, diskOffset, data, _sectorSize, out err))
+                        return;
+                }
+
+                for (int i = 0; i < _lockedMappings.Count; i++)
+                {
+                    VolumeMapping vm = _lockedMappings[i];
+                    if (diskOffset >= vm.StartOffset && diskOffset + data.Length <= vm.StartOffset + vm.ExtentLength)
+                    {
+                        int vErr;
+                        if (TryWriteHandleAtOffset(_heldHandles[i], diskOffset - vm.StartOffset, data, _sectorSize, out vErr))
+                            return;
+                    }
+                }
+
+                throw new Win32Exception(err, "PhysicalRawSession WriteAt failed at offset 0x" + diskOffset.ToString("X"));
+            }
+
+            public void Flush()
+            {
+                if (_hDisk != null && !_hDisk.IsInvalid)
+                    FlushFileBuffers(_hDisk);
+            }
+
+            public void Dispose()
+            {
+                try
+                {
+                    if (_hDisk != null && !_hDisk.IsInvalid)
+                        FlushFileBuffers(_hDisk);
+                }
+                catch { }
+
+                if (_hDisk != null)
+                {
+                    try { _hDisk.Dispose(); } catch { }
+                    _hDisk = null;
+                }
+
+                for (int i = 0; i < _heldHandles.Count; i++)
+                {
+                    SafeFileHandle h = _heldHandles[i];
+                    if (h == null || h.IsInvalid) continue;
+                    try
+                    {
+                        if (_volumesOfflined)
+                        {
+                            uint retOn;
+                            DeviceIoControl(h, IOCTL_VOLUME_ONLINE, null, 0, null, 0, out retOn, IntPtr.Zero);
+                        }
+                        if (i < _heldLocked.Count && _heldLocked[i])
+                        {
+                            uint uRet;
+                            DeviceIoControl(h, FSCTL_UNLOCK_VOLUME, null, 0, null, 0, out uRet, IntPtr.Zero);
+                        }
+                    }
+                    catch { }
+                    try { h.Dispose(); } catch { }
+                }
+                _heldHandles.Clear();
+                _heldLocked.Clear();
+                _heldTargets.Clear();
+                _lockedMappings.Clear();
+
+                NotifyDiskPropertiesUpdated(_devicePath);
+            }
+        }
     }
 }

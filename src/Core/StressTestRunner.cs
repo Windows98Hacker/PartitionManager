@@ -43,6 +43,7 @@ namespace WinParted.Core
                 RunStress8_ReadOnlyNonMicrosoftMountAndBrowse(tempDir, log);
                 RunStress9_BootUnlockFullFormatAndHybridOverlay(tempDir, log);
                 RunStress10_SecureWipeFormatAndDemoResetOverlayPurge(tempDir, log);
+                RunStress11_ExFatOfflineResizeMoveSpec(tempDir, log);
 
                 log("STRESS_TEST_ALL_PASSED");
                 return true;
@@ -2839,6 +2840,546 @@ namespace WinParted.Core
                 throw new Exception("Ext4 FormatPartition script must emit 0x83 on MBR and LinuxFilesystem GUID on GPT.");
 
             log("  -> Verified all " + allFormats.Length + " formattable FileSystemTypes + 2-group Ext2/3/4 + FAT32 (incl. 72 MiB)/FAT16/exFAT + MBR/GPT scripts.");
+        }
+
+        private sealed class SeededExFatFile
+        {
+            public string RelativePath;
+            public byte[] ExpectedContent;
+        }
+
+        private static byte[] MakeDeterministicBytes(int seed, int length)
+        {
+            byte[] buf = new byte[length];
+            uint x = (uint)seed ^ 0x9E3779B9u;
+            for (int i = 0; i < length; i++)
+            {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                buf[i] = (byte)(x & 0xFF);
+            }
+            return buf;
+        }
+
+        private static void WriteExFatFileEntrySet(byte[] dirBuf, int pos, string fileName, ushort fileAttrs, bool noFatChain, uint firstCluster, ulong dataLen)
+        {
+            int nameChars = fileName.Length;
+            int nameEntries = (nameChars + 14) / 15;
+            int totalEntries = 2 + nameEntries;
+            int totalBytes = totalEntries * 32;
+            Array.Clear(dirBuf, pos, totalBytes);
+
+            // 0x85 File Entry
+            dirBuf[pos] = 0x85;
+            dirBuf[pos + 1] = (byte)(totalEntries - 1);
+            BitConverter.GetBytes(fileAttrs).CopyTo(dirBuf, pos + 4);
+
+            // 0xC0 Stream Extension
+            int c0 = pos + 32;
+            dirBuf[c0] = 0xC0;
+            dirBuf[c0 + 1] = (byte)(0x01 | (noFatChain ? 0x02 : 0x00)); // AllocationPossible | NoFatChain
+            dirBuf[c0 + 3] = (byte)nameChars;
+            BitConverter.GetBytes((ushort)0x1234).CopyTo(dirBuf, c0 + 4); // NameHash (non-zero placeholder)
+            BitConverter.GetBytes(dataLen).CopyTo(dirBuf, c0 + 8);        // ValidDataLength
+            BitConverter.GetBytes(firstCluster).CopyTo(dirBuf, c0 + 20);  // FirstCluster
+            BitConverter.GetBytes(dataLen).CopyTo(dirBuf, c0 + 24);       // DataLength
+
+            // 0xC1 File Name entries (15 UTF-16LE chars per entry)
+            for (int ne = 0; ne < nameEntries; ne++)
+            {
+                int c1 = pos + (2 + ne) * 32;
+                dirBuf[c1] = 0xC1;
+                int startCh = ne * 15;
+                int take = Math.Min(15, nameChars - startCh);
+                for (int ci = 0; ci < take; ci++)
+                    BitConverter.GetBytes((ushort)fileName[startCh + ci]).CopyTo(dirBuf, c1 + 2 + ci * 2);
+            }
+
+            ushort chk = ExFatResizer.ComputeExFatEntrySetChecksum(dirBuf, pos, totalBytes);
+            BitConverter.GetBytes(chk).CopyTo(dirBuf, pos + 2);
+        }
+
+        private static byte[] ReadSeededExFatFile(DiskInfo disk, PartitionEntry part, string relPath)
+        {
+            byte[] boot = RawDiskEngine.ReadBytes(disk, part.StartingOffset, 512);
+            int secSize = 1 << boot[0x6C];
+            uint secPerClus = 1u << boot[0x6D];
+            int clusSize = secSize * (int)secPerClus;
+            uint fatOff = BitConverter.ToUInt32(boot, 0x50);
+            uint fatLen = BitConverter.ToUInt32(boot, 0x54);
+            uint heapOff = BitConverter.ToUInt32(boot, 0x58);
+            uint rootFirst = BitConverter.ToUInt32(boot, 0x60);
+
+            byte[] fatRaw = RawDiskEngine.ReadBytes(disk, part.StartingOffset + (long)fatOff * secSize, (int)(fatLen * secSize));
+
+            Func<uint, bool, ulong, byte[]> readObj = delegate(uint firstClus, bool noFatChain, ulong dataLen)
+            {
+                if (firstClus == 0u) return new byte[0];
+                var clusList = new List<uint>();
+                if (noFatChain)
+                {
+                    ulong cnt = dataLen == 0UL ? 1UL : (dataLen + (ulong)clusSize - 1UL) / (ulong)clusSize;
+                    for (uint i = 0; i < (uint)cnt; i++) clusList.Add(firstClus + i);
+                }
+                else
+                {
+                    uint cur = firstClus;
+                    var seen = new HashSet<uint>();
+                    while (true)
+                    {
+                        if (!seen.Add(cur)) throw new Exception("FAT loop reading " + relPath);
+                        clusList.Add(cur);
+                        uint next = BitConverter.ToUInt32(fatRaw, (int)(cur * 4u));
+                        if (next >= 0xFFFFFFF8u) break;
+                        cur = next;
+                    }
+                }
+                byte[] res = new byte[clusList.Count * clusSize];
+                for (int i = 0; i < clusList.Count; i++)
+                {
+                    long off = part.StartingOffset + ((long)heapOff + (long)(clusList[i] - 2u) * secPerClus) * secSize;
+                    byte[] blk = RawDiskEngine.ReadBytes(disk, off, clusSize);
+                    Array.Copy(blk, 0, res, i * clusSize, clusSize);
+                }
+                if (dataLen < (ulong)res.Length)
+                {
+                    byte[] exact = new byte[dataLen];
+                    Array.Copy(res, 0, exact, 0, (int)dataLen);
+                    return exact;
+                }
+                return res;
+            };
+
+            string[] segments = relPath.Trim('/').Split('/');
+            uint curDirClus = rootFirst;
+            for (int si = 0; si < segments.Length; si++)
+            {
+                byte[] dirBytes = readObj(curDirClus, false, ulong.MaxValue);
+                bool found = false;
+                int pos = 0;
+                while (pos + 32 <= dirBytes.Length)
+                {
+                    byte eType = dirBytes[pos];
+                    if (eType == 0x00) break;
+                    if ((eType & 0x80) == 0 || eType == 0x81 || eType == 0x82 || eType == 0x83 || eType == 0xA0)
+                    {
+                        pos += 32;
+                        continue;
+                    }
+                    if (eType == 0x85)
+                    {
+                        int secCnt = dirBytes[pos + 1];
+                        int setBytes = (1 + secCnt) * 32;
+                        int nameLen = dirBytes[pos + 32 + 3];
+                        var sbName = new StringBuilder();
+                        for (int n = 2; n <= secCnt; n++)
+                        {
+                            int nOff = pos + n * 32;
+                            for (int ci = 0; ci < 15 && sbName.Length < nameLen; ci++)
+                                sbName.Append((char)BitConverter.ToUInt16(dirBytes, nOff + 2 + ci * 2));
+                        }
+                        if (string.Equals(sbName.ToString(), segments[si], StringComparison.Ordinal))
+                        {
+                            bool nfc = (dirBytes[pos + 32 + 1] & 0x02) != 0;
+                            uint fClus = BitConverter.ToUInt32(dirBytes, pos + 32 + 20);
+                            ulong dLen = BitConverter.ToUInt64(dirBytes, pos + 32 + 24);
+                            if (si == segments.Length - 1)
+                                return readObj(fClus, nfc, dLen);
+                            if (nfc)
+                                throw new Exception("Expected FAT chain on directory segment " + segments[si]);
+                            curDirClus = fClus;
+                            found = true;
+                            break;
+                        }
+                        pos += setBytes;
+                        continue;
+                    }
+                    pos += 32;
+                }
+                if (!found)
+                    throw new Exception("Seeded exFAT path not found after resize/move: " + relPath);
+            }
+            throw new Exception("Unreachable path search failure for " + relPath);
+        }
+
+        private static List<SeededExFatFile> SeedRealExFatVolumeTree(string imgPath, long partStart, long shrinkBoundaryBytes)
+        {
+            byte[] sec0;
+            using (var fs = new FileStream(imgPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            {
+                fs.Seek(partStart, SeekOrigin.Begin);
+                sec0 = new byte[512];
+                fs.Read(sec0, 0, 512);
+            }
+
+            int secSize = 1 << sec0[0x6C];
+            uint secPerClus = 1u << sec0[0x6D];
+            int clusSize = secSize * (int)secPerClus;
+            uint fatOff = BitConverter.ToUInt32(sec0, 0x50);
+            uint fatLen = BitConverter.ToUInt32(sec0, 0x54);
+            uint heapOff = BitConverter.ToUInt32(sec0, 0x58);
+            uint clusCount = BitConverter.ToUInt32(sec0, 0x5C);
+            uint rootFirst = BitConverter.ToUInt32(sec0, 0x60);
+
+            byte[] fat = new byte[fatLen * secSize];
+            byte[] rootBuf = new byte[clusSize];
+            byte[] bmpBuf;
+
+            using (var fs = new FileStream(imgPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            {
+                fs.Seek(partStart + (long)fatOff * secSize, SeekOrigin.Begin);
+                fs.Read(fat, 0, fat.Length);
+                fs.Seek(partStart + ((long)heapOff + (long)(rootFirst - 2u) * secPerClus) * secSize, SeekOrigin.Begin);
+                fs.Read(rootBuf, 0, rootBuf.Length);
+
+                // Locate 0x81 Allocation Bitmap cluster 2
+                bmpBuf = new byte[clusSize];
+                fs.Seek(partStart + (long)heapOff * secSize, SeekOrigin.Begin);
+                fs.Read(bmpBuf, 0, clusSize);
+            }
+
+            // Free cursor right after initial metadata clusters
+            uint nextSeq = rootFirst + 1u;
+            Action<uint> markAlloc = delegate(uint c)
+            {
+                uint idx = c - 2u;
+                bmpBuf[idx >> 3] |= (byte)(1 << (int)(idx & 7));
+            };
+            Action<uint, uint> setFat = delegate(uint c, uint val)
+            {
+                BitConverter.GetBytes(val).CopyTo(fat, (int)(c * 4u));
+            };
+
+            var files = new List<SeededExFatFile>();
+            byte[] frontContig = MakeDeterministicBytes(101, clusSize * 2 - 123);
+            byte[] tailContigFull = MakeDeterministicBytes(202, clusSize * 2 + 77);
+            byte[] tailContigSplit = MakeDeterministicBytes(303, clusSize * 4 - 41);
+            byte[] fragBytes = MakeDeterministicBytes(404, clusSize * 2 + 512);
+            byte[] nestedBytes = MakeDeterministicBytes(505, clusSize + 999);
+            byte[] deepTargetBytes = MakeDeterministicBytes(606, 2500);
+
+            // Allocate frontContig right at cluster [nextSeq, nextSeq + 1] (NoFatChain = 1, hits K=5 grow zone if nextSeq == 6!)
+            uint cFront = nextSeq;
+            nextSeq += 2u;
+            markAlloc(cFront); markAlloc(cFront + 1u);
+
+            // Allocate fragmented file spanning low and near-shrink clusters (NoFatChain = 0)
+            uint boundaryClus = (uint)Math.Max(nextSeq + 10u, (uint)((shrinkBoundaryBytes / secSize - heapOff) / secPerClus + 1L));
+            uint frag0 = nextSeq++;
+            uint frag1 = nextSeq + 3u;
+            uint frag2 = Math.Min(clusCount + 1u, boundaryClus + 8u);
+            markAlloc(frag0); markAlloc(frag1); markAlloc(frag2);
+            setFat(frag0, frag1); setFat(frag1, frag2); setFat(frag2, 0xFFFFFFFFu);
+
+            // Allocate split contiguous file straddling shrink boundary [boundaryClus - 1 .. boundaryClus + 2] (4 clusters, NoFatChain = 1)
+            uint splitStart = boundaryClus - 1u;
+            for (uint s = 0; s < 4u; s++) markAlloc(splitStart + s);
+
+            // Allocate full tail contiguous file cleanly above shrink boundary [boundaryClus + 10 .. +12] (3 clusters, NoFatChain = 1)
+            uint tailFullStart = Math.Min(clusCount - 2u, boundaryClus + 10u);
+            for (uint s = 0; s < 3u; s++) markAlloc(tailFullStart + s);
+
+            // Allocate 2-cluster /Docs directory (padded with deleted 0x05 placeholders so a 0x85+0xC0+0xC1 EntrySet crosses cluster 0 -> cluster 1!)
+            uint docs0 = boundaryClus - 8u;
+            uint docs1 = boundaryClus + 4u; // non-contiguous 2nd dir cluster in tail!
+            markAlloc(docs0); markAlloc(docs1);
+            setFat(docs0, docs1); setFat(docs1, 0xFFFFFFFFu);
+
+            // Allocate /Docs/Deep subdir in tail
+            uint deepDirClus = Math.Min(clusCount, boundaryClus + 15u);
+            markAlloc(deepDirClus);
+            setFat(deepDirClus, 0xFFFFFFFFu);
+
+            uint nested0 = boundaryClus + 6u;
+            uint nested1 = nextSeq + 5u;
+            markAlloc(nested0); markAlloc(nested1);
+            setFat(nested0, nested1); setFat(nested1, 0xFFFFFFFFu);
+
+            uint deepTargetClus = nextSeq + 6u;
+            markAlloc(deepTargetClus);
+
+            // Build /Docs 2-cluster buffer with Deep + cross-cluster deep_target.bin (starts at offset 4096 - 32 = 4064!)
+            byte[] docsBuf = new byte[clusSize * 2];
+            WriteExFatFileEntrySet(docsBuf, 0, "Deep", 0x0010, false, deepDirClus, (ulong)clusSize);
+            for (int off = 96; off < clusSize - 32; off += 32)
+                docsBuf[off] = 0x05; // deleted file slot padding
+            WriteExFatFileEntrySet(docsBuf, clusSize - 32, "deep_target.bin", 0x0020, true, deepTargetClus, (ulong)deepTargetBytes.Length);
+
+            // Build /Docs/Deep directory buffer
+            byte[] deepDirBuf = new byte[clusSize];
+            WriteExFatFileEntrySet(deepDirBuf, 0, "nested.bin", 0x0020, false, nested0, (ulong)nestedBytes.Length);
+
+            // Append entries into Root Directory after existing 0x81 / 0x82 / 0x83 slots
+            int rootSlot = 0;
+            while (rootSlot + 32 <= rootBuf.Length && rootBuf[rootSlot] != 0x00)
+                rootSlot += 32;
+            WriteExFatFileEntrySet(rootBuf, rootSlot, "empty.txt", 0x0020, false, 0u, 0UL);
+            rootSlot += 96;
+            WriteExFatFileEntrySet(rootBuf, rootSlot, "front_contig.bin", 0x0020, true, cFront, (ulong)frontContig.Length);
+            rootSlot += 128; // "front_contig.bin" = 16 chars -> 1 + 1 + 2 = 4 entries = 128B
+            WriteExFatFileEntrySet(rootBuf, rootSlot, "frag.bin", 0x0020, false, frag0, (ulong)fragBytes.Length);
+            rootSlot += 96;
+            WriteExFatFileEntrySet(rootBuf, rootSlot, "tail_contig_split.bin", 0x0020, true, splitStart, (ulong)tailContigSplit.Length);
+            rootSlot += 128; // 21 chars -> 2 name entries -> 4 * 32 = 128B
+            WriteExFatFileEntrySet(rootBuf, rootSlot, "tail_contig_full.bin", 0x0020, true, tailFullStart, (ulong)tailContigFull.Length);
+            rootSlot += 128;
+            WriteExFatFileEntrySet(rootBuf, rootSlot, "Docs", 0x0010, false, docs0, (ulong)(clusSize * 2));
+
+            // Commit FAT, Bitmap, Root, Dirs, and file payloads to image
+            using (var fs = new FileStream(imgPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            {
+                Action<uint, byte[], int, int> writeClus = delegate(uint c, byte[] src, int sOff, int sLen)
+                {
+                    byte[] cBuf = new byte[clusSize];
+                    Array.Copy(src, sOff, cBuf, 0, Math.Min(sLen, clusSize));
+                    fs.Seek(partStart + ((long)heapOff + (long)(c - 2u) * secPerClus) * secSize, SeekOrigin.Begin);
+                    fs.Write(cBuf, 0, clusSize);
+                };
+
+                fs.Seek(partStart + (long)fatOff * secSize, SeekOrigin.Begin);
+                fs.Write(fat, 0, fat.Length);
+                fs.Seek(partStart + (long)heapOff * secSize, SeekOrigin.Begin);
+                fs.Write(bmpBuf, 0, bmpBuf.Length);
+                writeClus(rootFirst, rootBuf, 0, rootBuf.Length);
+
+                writeClus(cFront, frontContig, 0, clusSize);
+                writeClus(cFront + 1u, frontContig, clusSize, frontContig.Length - clusSize);
+
+                writeClus(frag0, fragBytes, 0, clusSize);
+                writeClus(frag1, fragBytes, clusSize, clusSize);
+                writeClus(frag2, fragBytes, clusSize * 2, fragBytes.Length - clusSize * 2);
+
+                for (int s = 0; s < 4; s++)
+                    writeClus(splitStart + (uint)s, tailContigSplit, s * clusSize, Math.Min(clusSize, tailContigSplit.Length - s * clusSize));
+                for (int s = 0; s < 3; s++)
+                    writeClus(tailFullStart + (uint)s, tailContigFull, s * clusSize, Math.Min(clusSize, tailContigFull.Length - s * clusSize));
+
+                writeClus(docs0, docsBuf, 0, clusSize);
+                writeClus(docs1, docsBuf, clusSize, clusSize);
+                writeClus(deepDirClus, deepDirBuf, 0, clusSize);
+
+                writeClus(nested0, nestedBytes, 0, clusSize);
+                writeClus(nested1, nestedBytes, clusSize, nestedBytes.Length - clusSize);
+                writeClus(deepTargetClus, deepTargetBytes, 0, deepTargetBytes.Length);
+                fs.Flush();
+            }
+
+            files.Add(new SeededExFatFile { RelativePath = "/empty.txt", ExpectedContent = new byte[0] });
+            files.Add(new SeededExFatFile { RelativePath = "/front_contig.bin", ExpectedContent = frontContig });
+            files.Add(new SeededExFatFile { RelativePath = "/frag.bin", ExpectedContent = fragBytes });
+            files.Add(new SeededExFatFile { RelativePath = "/tail_contig_split.bin", ExpectedContent = tailContigSplit });
+            files.Add(new SeededExFatFile { RelativePath = "/tail_contig_full.bin", ExpectedContent = tailContigFull });
+            files.Add(new SeededExFatFile { RelativePath = "/Docs/deep_target.bin", ExpectedContent = deepTargetBytes });
+            files.Add(new SeededExFatFile { RelativePath = "/Docs/Deep/nested.bin", ExpectedContent = nestedBytes });
+            return files;
+        }
+
+        private static void VerifySeededExFatFiles(string imgPath, int diskNum, long partStart, long partLen, List<SeededExFatFile> files, string stage)
+        {
+            using (var vIo = new ExFatResizer.VirtualFileIo(imgPath))
+                ExFatResizer.VerifyExFatVolumeIntegrity(vIo, partStart, partLen);
+
+            var disk = RawDiskEngine.LoadVirtualDisk(imgPath, diskNum);
+            var part = disk.Partitions.FirstOrDefault(p => Math.Abs(p.StartingOffset - partStart) < 512L);
+            if (part == null || part.FileSystem != FileSystemType.exFAT)
+                throw new Exception("exFAT partition missing or misidentified after " + stage);
+
+            for (int i = 0; i < files.Count; i++)
+            {
+                byte[] actual = ReadSeededExFatFile(disk, part, files[i].RelativePath);
+                byte[] exp = files[i].ExpectedContent;
+                if (actual.Length != exp.Length)
+                    throw new Exception(string.Format("exFAT file {0} size mismatch after {1}: {2} != {3}",
+                        files[i].RelativePath, stage, actual.Length, exp.Length));
+                for (int b = 0; b < exp.Length; b++)
+                {
+                    if (actual[b] != exp[b])
+                        throw new Exception(string.Format("exFAT file {0} byte 0x{1:X} corrupted after {2}.",
+                            files[i].RelativePath, b, stage));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Stress 11: Real spec-compliant offline exFAT Grow (K &gt; 0 + Bitmap 1->2 clusters), Shrink (tail evac +
+        /// NoFatChain split + Bitmap 2->1 clusters), Overlap Moves, MBR &amp; GPT support, and Pre-Flight Rejections.
+        /// </summary>
+        private static void RunStress11_ExFatOfflineResizeMoveSpec(string tempDir, Action<string> log)
+        {
+            log("[Stress 11] Spec-Compliant Offline exFAT Resize (Grow K>0, Shrink+NoFatChain Split, Bitmap Multi-Cluster, Overlap Move, Rejections)...");
+
+            // 1. Small MBR test: 8 MiB -> 24 MiB (K > 0 FAT expansion evacuates System clusters [2..5])
+            string mbrImg = Path.Combine(tempDir, "stress11_exfat_mbr.img");
+            var mbrDisk = RawDiskEngine.CreateBlankVirtualDisk(mbrImg, 32L * MiB, PartitionTableStyle.MBR);
+            mbrDisk.DiskNumber = 915;
+            var qmMbr = new OperationQueueManager();
+            qmMbr.SetBaselineDisks(null, new[] { mbrDisk });
+            qmMbr.Enqueue(MakeCreateOp(915, mbrImg, 1L * MiB, 8L * MiB, FileSystemType.exFAT, "MBR_EXFAT"));
+            qmMbr.ApplyAll();
+
+            var mbrFiles = SeedRealExFatVolumeTree(mbrImg, 1L * MiB, 6L * MiB);
+            VerifySeededExFatFiles(mbrImg, 915, 1L * MiB, 8L * MiB, mbrFiles, "MBR Initial Seed");
+
+            mbrDisk = RawDiskEngine.LoadVirtualDisk(mbrImg, 915);
+            qmMbr.SetBaselineDisks(null, new[] { mbrDisk });
+            qmMbr.Enqueue(MakeResizeOp(915, mbrImg, mbrDisk.Partitions[0], 1L * MiB, 24L * MiB));
+            qmMbr.ApplyAll();
+            VerifySeededExFatFiles(mbrImg, 915, 1L * MiB, 24L * MiB, mbrFiles, "MBR Grow 8M->24M (K>0)");
+
+            // 2. Multi-cluster Bitmap & Tree Evac on GPT: 120 MiB -> 140 MiB (1->2 bitmap clusters + K>0) -> 16 MiB (2->1 + split) -> Move R/L
+            string gptImg = Path.Combine(tempDir, "stress11_exfat_gpt.img");
+            var gptDisk = RawDiskEngine.CreateBlankVirtualDisk(gptImg, 160L * MiB, PartitionTableStyle.GPT);
+            gptDisk.DiskNumber = 916;
+            var qmGpt = new OperationQueueManager();
+            qmGpt.SetBaselineDisks(null, new[] { gptDisk });
+            qmGpt.Enqueue(MakeCreateOp(916, gptImg, 1L * MiB, 120L * MiB, FileSystemType.exFAT, "GPT_EXFAT"));
+            qmGpt.ApplyAll();
+
+            // Shrink target later is 16 MiB, so pass 16 MiB as shrink boundary so split file straddles 16 MiB!
+            var gptFiles = SeedRealExFatVolumeTree(gptImg, 1L * MiB, 16L * MiB);
+            VerifySeededExFatFiles(gptImg, 916, 1L * MiB, 120L * MiB, gptFiles, "GPT Initial Seed 120M");
+
+            // 2a. Grow 120 MiB -> 140 MiB: forces Allocation Bitmap 1->2 clusters AND FAT shift K > 0
+            gptDisk = RawDiskEngine.LoadVirtualDisk(gptImg, 916);
+            qmGpt.SetBaselineDisks(null, new[] { gptDisk });
+            qmGpt.Enqueue(MakeResizeOp(916, gptImg, gptDisk.Partitions[0], 1L * MiB, 140L * MiB));
+            qmGpt.ApplyAll();
+            VerifySeededExFatFiles(gptImg, 916, 1L * MiB, 140L * MiB, gptFiles, "GPT Grow 120M->140M (Bitmap 1->2 + K>0)");
+
+            // Confirm Allocation Bitmap DataLength really grew >= 4097 bytes (2 clusters)
+            byte[] root140 = RawDiskEngine.ReadBytes(gptDisk, 1L * MiB, 512);
+            int sec140 = 1 << root140[0x6C];
+            uint heap140 = BitConverter.ToUInt32(root140, 0x58);
+            uint rootC140 = BitConverter.ToUInt32(root140, 0x60);
+            byte[] rDir140 = RawDiskEngine.ReadBytes(gptDisk, 1L * MiB + ((long)heap140 + (long)(rootC140 - 2u) * (1L << root140[0x6D])) * sec140, 4096);
+            ulong bmpLen140 = 0;
+            for (int off = 0; off < 4096 && rDir140[off] != 0; off += 32)
+            {
+                if (rDir140[off] == 0x81) { bmpLen140 = BitConverter.ToUInt64(rDir140, off + 24); break; }
+            }
+            if (bmpLen140 <= 4096UL)
+                throw new Exception("Expected 140 MiB Allocation Bitmap DataLength > 4096 (2 clusters), got " + bmpLen140);
+
+            // 2b. Shrink 140 MiB -> 16 MiB: evacuates tail contiguous & fragmented files + Docs cluster1 + /Docs/Deep + Bitmap 2->1
+            gptDisk = RawDiskEngine.LoadVirtualDisk(gptImg, 916);
+            qmGpt.SetBaselineDisks(null, new[] { gptDisk });
+            qmGpt.Enqueue(MakeResizeOp(916, gptImg, gptDisk.Partitions[0], 1L * MiB, 16L * MiB));
+            qmGpt.ApplyAll();
+            VerifySeededExFatFiles(gptImg, 916, 1L * MiB, 16L * MiB, gptFiles, "GPT Shrink 140M->16M");
+
+            // 2c. Overlap Move Right (1M -> 5M) + Overlap Move Left (5M -> 2M)
+            gptDisk = RawDiskEngine.LoadVirtualDisk(gptImg, 916);
+            qmGpt.SetBaselineDisks(null, new[] { gptDisk });
+            qmGpt.Enqueue(MakeResizeOp(916, gptImg, gptDisk.Partitions[0], 5L * MiB, 16L * MiB));
+            var previewMovedRight = qmGpt.GetPreviewDisk(916).Partitions[0];
+            qmGpt.Enqueue(MakeResizeOp(916, gptImg, previewMovedRight, 2L * MiB, 16L * MiB));
+            qmGpt.ApplyAll();
+            VerifySeededExFatFiles(gptImg, 916, 2L * MiB, 16L * MiB, gptFiles, "GPT Overlap Move R+L");
+
+            // 3. Pre-flight Safety Rejections on dirty/corrupt/orphan/tiny-shrink volumes (zero sectors modified!)
+            string negImg = Path.Combine(tempDir, "stress11_exfat_rejects.img");
+            File.Copy(mbrImg, negImg, true);
+            byte[] preBootSnap;
+            using (var fs = new FileStream(negImg, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                preBootSnap = new byte[12 * 512];
+                fs.Seek(1L * MiB, SeekOrigin.Begin);
+                fs.Read(preBootSnap, 0, preBootSnap.Length);
+            }
+
+            // 3a. Target shrink smaller than header/minimum clusters
+            var negDisk = RawDiskEngine.LoadVirtualDisk(negImg, 917);
+            var qmNeg = new OperationQueueManager();
+            qmNeg.SetBaselineDisks(null, new[] { negDisk });
+            ExpectRejected(delegate
+            {
+                qmNeg.Enqueue(MakeResizeOp(917, negImg, negDisk.Partitions[0], 1L * MiB, 65536L));
+                qmNeg.ApplyAll();
+            }, "Shrink exFAT below minimum clusters");
+
+            // 3b. VolumeDirty flag (0x0002) set at +0x6A must reject immediately without modifying boot region
+            byte[] dirtyBoot = new byte[12 * 512];
+            Array.Copy(preBootSnap, dirtyBoot, preBootSnap.Length);
+            dirtyBoot[0x6A] |= 0x02;
+            using (var fs = new FileStream(negImg, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                fs.Seek(1L * MiB, SeekOrigin.Begin);
+                fs.Write(dirtyBoot, 0, dirtyBoot.Length);
+                fs.Flush();
+            }
+            bool dirtyRejected = false;
+            try
+            {
+                using (var vIo = new ExFatResizer.VirtualFileIo(negImg))
+                    ExFatResizer.ResizeOrMoveExFat(vIo, negDisk.Partitions[0], 1L * MiB, 24L * MiB, 1L * MiB, 16L * MiB, true, null, null);
+            }
+            catch (InvalidOperationException)
+            {
+                dirtyRejected = true;
+            }
+            if (!dirtyRejected)
+                throw new Exception("Dirty exFAT VolumeFlags (0x0002) should have been rejected.");
+
+            // 3c. Corrupted Boot Checksum (sector 11) must reject cleanly
+            byte[] badChkBoot = new byte[12 * 512];
+            Array.Copy(preBootSnap, badChkBoot, preBootSnap.Length);
+            badChkBoot[11 * 512] ^= 0x5A;
+            using (var fs = new FileStream(negImg, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                fs.Seek(1L * MiB, SeekOrigin.Begin);
+                fs.Write(badChkBoot, 0, badChkBoot.Length);
+                fs.Flush();
+            }
+            bool chkRejected = false;
+            try
+            {
+                using (var vIo = new ExFatResizer.VirtualFileIo(negImg))
+                    ExFatResizer.ResizeOrMoveExFat(vIo, negDisk.Partitions[0], 1L * MiB, 24L * MiB, 1L * MiB, 16L * MiB, true, null, null);
+            }
+            catch (InvalidDataException)
+            {
+                chkRejected = true;
+            }
+            if (!chkRejected)
+                throw new Exception("Corrupt exFAT Boot Checksum should have been rejected.");
+
+            // 3d. Orphaned cluster bit inside shrink zone (bitmap mismatch) must restore valid boot first & reject
+            using (var fs = new FileStream(negImg, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                fs.Seek(1L * MiB, SeekOrigin.Begin);
+                fs.Write(preBootSnap, 0, preBootSnap.Length);
+                uint heapMbr = BitConverter.ToUInt32(preBootSnap, 0x58);
+                uint rootClusMbr = BitConverter.ToUInt32(preBootSnap, 0x60);
+                uint spcMbr = 1u << preBootSnap[0x6D];
+                int secMbr = 1 << preBootSnap[0x6C];
+                byte[] rMbr = new byte[spcMbr * secMbr];
+                fs.Seek(1L * MiB + ((long)heapMbr + (long)(rootClusMbr - 2u) * spcMbr) * secMbr, SeekOrigin.Begin);
+                fs.Read(rMbr, 0, rMbr.Length);
+                uint bmpClusMbr = 2u;
+                for (int off = 0; off < rMbr.Length && rMbr[off] != 0; off += 32)
+                {
+                    if (rMbr[off] == 0x81) { bmpClusMbr = BitConverter.ToUInt32(rMbr, off + 20); break; }
+                }
+                long bmpByteOff = 1L * MiB + ((long)heapMbr + (long)(bmpClusMbr - 2u) * spcMbr) * secMbr + 520L; // cluster ~4162 (in tail > 16 MiB)
+                fs.Seek(bmpByteOff, SeekOrigin.Begin);
+                fs.WriteByte(0x80);
+                fs.Flush();
+            }
+            bool orphanRejected = false;
+            try
+            {
+                using (var vIo = new ExFatResizer.VirtualFileIo(negImg))
+                    ExFatResizer.ResizeOrMoveExFat(vIo, negDisk.Partitions[0], 1L * MiB, 24L * MiB, 1L * MiB, 16L * MiB, true, null, null);
+            }
+            catch (InvalidDataException)
+            {
+                orphanRejected = true;
+            }
+            if (!orphanRejected)
+                throw new Exception("Orphaned allocated cluster in exFAT shrink zone should have been rejected.");
+
+            log("  -> Stress 11 PASSED (exFAT MBR/GPT Grow K>0, Multi-cluster Bitmap 1<->2, Tail Evac, NoFatChain Split, Overlap Move, Rejections verified).");
         }
 
         private static void ExpectRejected(Action act, string scenario)

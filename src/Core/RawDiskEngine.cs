@@ -656,12 +656,13 @@ namespace WinParted.Core
         /// Validates and writes a complete MBR or GPT partition table (Protective MBR + Primary/Backup GPT
         /// headers &amp; entry arrays with freshly computed CRC32 checksums) to disk.
         /// </summary>
-        public static void WritePartitionTable(DiskInfo disk)
+        public static void WritePartitionTable(DiskInfo disk, Action<long, byte[]> customWriter = null)
         {
             string valErr;
             if (!ValidatePartitionTable(disk, out valErr))
                 throw new InvalidOperationException("Partition table safety check failed: " + valErr);
 
+            Action<long, byte[]> writeFn = customWriter ?? ((off, data) => WriteBytes(disk, off, data));
             int sec = disk.LogicalSectorSize > 0 ? disk.LogicalSectorSize : 512;
             long totalSectors = disk.TotalSizeBytes / sec;
 
@@ -689,9 +690,9 @@ namespace WinParted.Core
                 mbr[510] = 0x55;
                 mbr[511] = 0xAA;
 
-                WriteBytes(disk, 0, mbr);
+                writeFn(0, mbr);
                 // Clear GPT LBA 1 signature if switching from GPT to MBR
-                WriteBytes(disk, sec, new byte[sec]);
+                writeFn(sec, new byte[sec]);
                 return;
             }
 
@@ -752,13 +753,13 @@ namespace WinParted.Core
             // 4. Backup GPT Header (Last LBA)
             byte[] backupHdr = BuildGptHeader(sec, backupHeaderLba, 1, firstUsableLba, lastUsableLba, disk.GptDiskGuid, backupEntriesLba, numEntries, entrySize, entriesCrc);
 
-            WriteBytes(disk, 0, pmbr);
-            WriteBytes(disk, sec, primaryHdr);
-            WriteBytes(disk, 2L * sec, entries);
+            writeFn(0, pmbr);
+            writeFn(sec, primaryHdr);
+            writeFn(2L * sec, entries);
             if (backupEntriesLba > 34)
             {
-                WriteBytes(disk, backupEntriesLba * sec, entries);
-                WriteBytes(disk, backupHeaderLba * sec, backupHdr);
+                writeFn(backupEntriesLba * sec, entries);
+                writeFn(backupHeaderLba * sec, backupHdr);
             }
             disk.GptCrcValid = true;
         }
@@ -848,19 +849,20 @@ namespace WinParted.Core
                 part.UUID = string.Format("{0:X4}-{1:X4}", (serial >> 16) & 0xFFFF, serial & 0xFFFF);
 
                 // Read native 0x83 Volume Label entry from exFAT Root Directory when valid BPB geometry is present
-                if (data.Length >= 0x70 && data[0x6C] == 9)
+                if (data.Length >= 0x70 && data[0x6C] >= 9 && data[0x6C] <= 12)
                 {
                     try
                     {
+                        long exSecSize = 1L << data[0x6C];
                         uint fatOff = BitConverter.ToUInt32(data, 0x50);
                         uint heapOff = BitConverter.ToUInt32(data, 0x58);
                         uint clusCount = BitConverter.ToUInt32(data, 0x5C);
                         uint rootClus = BitConverter.ToUInt32(data, 0x60);
                         int spcShift = data[0x6D];
-                        if (spcShift <= 20 && fatOff >= 12 && heapOff > fatOff && rootClus >= 2 && rootClus < clusCount + 2u)
+                        if (spcShift <= 25 - data[0x6C] && fatOff >= 24 && heapOff > fatOff && rootClus >= 2 && rootClus < clusCount + 2u)
                         {
-                            long clusBytes = Math.Min(131072L, 512L << spcShift);
-                            long rootByteOff = ((long)heapOff + (long)(rootClus - 2u) * (1L << spcShift)) * 512L;
+                            long clusBytes = Math.Min(131072L, exSecSize << spcShift);
+                            long rootByteOff = ((long)heapOff + (long)(rootClus - 2u) * (1L << spcShift)) * exSecSize;
                             if (rootByteOff + 512L <= part.PartitionLength)
                             {
                                 byte[] rootData = ReadBytes(disk, part.StartingOffset + rootByteOff, (int)Math.Min(clusBytes, part.PartitionLength - rootByteOff));
@@ -2314,6 +2316,15 @@ namespace WinParted.Core
 
             if (MatchesAscii(buf, 3, "EXFAT   "))
             {
+                if (disk.IsVirtualImage && !string.IsNullOrEmpty(disk.BackingFilePath) && oldLength > 0 && part.PartitionLength != oldLength)
+                {
+                    using (var vIo = new ExFatResizer.VirtualFileIo(disk.BackingFilePath))
+                    {
+                        ExFatResizer.ResizeOrMoveExFat(vIo, part, part.StartingOffset, oldLength, part.StartingOffset, part.PartitionLength, true, null, null);
+                    }
+                    return;
+                }
+
                 BitConverter.GetBytes((ulong)totalSectors).CopyTo(buf, 0x48);
                 long used = ReadCustomUsedHint(buf, 0x1C0);
                 if (used < 0 && part.UsedBytes.HasValue) used = part.UsedBytes.Value;
@@ -3093,6 +3104,19 @@ namespace WinParted.Core
                     return "Clears existing superblock headers and leaves the partition unformatted (RAW).";
                 default:
                     return "Writes " + FileSystemColors.GetDisplayName(fs) + " partition type & header structures (Windows cannot natively mount without third-party drivers).";
+            }
+        }
+
+        public static string GetResizeSupportNote(FileSystemType fs)
+        {
+            switch (fs)
+            {
+                case FileSystemType.NTFS:
+                    return "Resized natively via Windows DiskPart (with offline sector move support when Start changes).";
+                case FileSystemType.exFAT:
+                    return "Resized & moved offline directly (locks/dismounts volume, updates Allocation Bitmap, FAT, directory checksums, and boot regions).";
+                default:
+                    return "Delegates extend/shrink to Windows DiskPart where supported; DiskPart rejects resize on unsupported filesystems.";
             }
         }
 
