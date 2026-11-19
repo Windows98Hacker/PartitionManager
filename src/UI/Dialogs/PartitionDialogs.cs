@@ -242,13 +242,15 @@ namespace WinParted.UI.Dialogs
 
             _lblFormatNote = new Label
             {
-                Text = RawDiskEngine.GetFormatSupportNote(initialFs),
+                Text = isCreateMode
+                    ? RawDiskEngine.GetFormatSupportNote(initialFs)
+                    : RawDiskEngine.GetResizeSupportNote(initialFs),
                 AutoSize = true,
                 MaximumSize = new Size(520, 0),
                 Anchor = AnchorStyles.Left,
                 Margin = new Padding(8, 5, 0, 4)
             };
-            AddRow(formTable, rowIdx++, "Format behavior:", _lblFormatNote);
+            AddRow(formTable, rowIdx++, isCreateMode ? "Format behavior:" : "Resize behavior:", _lblFormatNote);
 
             _cmbFs.SelectedIndexChanged += (s, e) =>
             {
@@ -257,7 +259,9 @@ namespace WinParted.UI.Dialogs
                     FileSystemType chosen = (FileSystemType)_cmbFs.SelectedItem;
                     _sliderBar.SetFileSystem(chosen);
                     _lblTableTypeInfo.Text = RawDiskEngine.DescribePartitionType(_disk.PartitionStyle, chosen);
-                    _lblFormatNote.Text = RawDiskEngine.GetFormatSupportNote(chosen);
+                    _lblFormatNote.Text = _isCreateMode
+                        ? RawDiskEngine.GetFormatSupportNote(chosen)
+                        : RawDiskEngine.GetResizeSupportNote(chosen);
                 }
             };
 

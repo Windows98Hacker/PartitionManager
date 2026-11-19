@@ -619,6 +619,53 @@ namespace WinParted.Core
                         break;
 
                     case OperationType.ResizeMovePartition:
+                        var vTarget = disk.Partitions.FirstOrDefault(p => Math.Abs(p.StartingOffset - op.OriginalStartOffset) < 512L)
+                                      ?? disk.Partitions.FirstOrDefault(p => p.PartitionNumber == op.TargetPartitionNumber);
+                        bool isExFatVirtual = vTarget != null && vTarget.FileSystem == FileSystemType.exFAT;
+                        if (!isExFatVirtual)
+                        {
+                            try
+                            {
+                                byte[] hdrProbe = RawDiskEngine.ReadBytes(disk, op.OriginalStartOffset, 512);
+                                if (hdrProbe.Length >= 16 &&
+                                    hdrProbe[3] == (byte)'E' && hdrProbe[4] == (byte)'X' && hdrProbe[5] == (byte)'F' &&
+                                    hdrProbe[6] == (byte)'A' && hdrProbe[7] == (byte)'T' && hdrProbe[8] == (byte)' ')
+                                    isExFatVirtual = true;
+                            }
+                            catch { }
+                        }
+                        if (isExFatVirtual)
+                        {
+                            var simDisk = disk.Clone();
+                            ApplyOperationToModel(simDisk, op);
+                            string simErr;
+                            if (!RawDiskEngine.ValidatePartitionTable(simDisk, out simErr))
+                                throw new InvalidOperationException("Partition table safety check failed: " + simErr);
+
+                            ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.OriginalStartOffset);
+                            ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, op.StartOffset);
+                            ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, op.OriginalStartOffset, op.OriginalLength, false);
+
+                            using (var vIo = new ExFatResizer.VirtualFileIo(disk.BackingFilePath))
+                            {
+                                ExFatResizer.ResizeOrMoveExFat(
+                                    vIo,
+                                    vTarget ?? new PartitionEntry { FileSystem = FileSystemType.exFAT },
+                                    op.OriginalStartOffset,
+                                    op.OriginalLength,
+                                    op.StartOffset,
+                                    op.Length,
+                                    true,
+                                    delegate
+                                    {
+                                        ApplyOperationToModel(disk, op);
+                                        RenumberPartitions(disk);
+                                        RawDiskEngine.WritePartitionTable(disk, vIo.WriteAt);
+                                    },
+                                    (pct, msg) => ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, pct, msg));
+                            }
+                            break;
+                        }
                         if (op.StartOffset != op.OriginalStartOffset)
                         {
                             long bytesToMove = Math.Min(op.OriginalLength, op.Length);
@@ -844,6 +891,91 @@ namespace WinParted.Core
                 ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 60,
                     "Restoring primary & backup partition table sectors...");
                 RawDiskEngine.RestorePartitionTable(disk, op.BackupFilePath);
+                return;
+            }
+
+            if (op.Type == OperationType.ResizeMovePartition && targetPart != null && targetPart.FileSystem == FileSystemType.exFAT)
+            {
+                long oldStart = targetPart.StartingOffset;
+                long oldLen = targetPart.PartitionLength;
+                long newStart = op.StartOffset;
+                long newLen = op.Length;
+
+                var simDisk = disk.Clone();
+                var simPart = simDisk.Partitions.FirstOrDefault(p => p.StartingOffset == oldStart);
+                if (simPart != null)
+                {
+                    simPart.StartingOffset = newStart;
+                    simPart.PartitionLength = newLen;
+                }
+                string simErr;
+                if (!RawDiskEngine.ValidatePartitionTable(simDisk, out simErr))
+                    throw new InvalidOperationException("Partition table safety check failed: " + simErr);
+
+                ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, oldStart);
+                ReadOnlyFileSystemMountEngine.Unmount(disk.DiskNumber, newStart);
+                ReadOnlyFileSystemMountEngine.PurgePartitionOverlaysAndCache(disk, oldStart, oldLen, false);
+
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 4,
+                    "Acquiring exclusive lock & dismounting exFAT volume...",
+                    logLine: string.Format("  Offline exFAT resize/move on Disk {0}: 0x{1:X} ({2}) -> 0x{3:X} ({4})...",
+                        disk.DiskNumber, oldStart, ByteFormatter.FormatBytes(oldLen), newStart, ByteFormatter.FormatBytes(newLen)));
+
+                string savedLetter = targetPart.DriveLetter ?? string.Empty;
+                using (var session = new Win32DiskInterop.PhysicalRawSession(
+                    disk.DiskNumber, disk.DevicePath, disk.LogicalSectorSize,
+                    oldStart, oldLen, newStart, newLen))
+                {
+                    if (string.IsNullOrEmpty(savedLetter) && !string.IsNullOrEmpty(session.OriginalDriveLetter))
+                        savedLetter = session.OriginalDriveLetter;
+
+                    var physIo = new ExFatResizer.PhysicalSessionIo(session);
+                    ExFatResizer.ResizeOrMoveExFat(
+                        physIo,
+                        targetPart,
+                        oldStart,
+                        oldLen,
+                        newStart,
+                        newLen,
+                        false,
+                        delegate
+                        {
+                            targetPart.StartingOffset = newStart;
+                            targetPart.PartitionLength = newLen;
+                            RenumberPartitions(disk);
+                            RawDiskEngine.WritePartitionTable(disk, physIo.WriteAt);
+                        },
+                        (pct, msg) => ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, pct, msg));
+                }
+
+                ReportProgress(progressCallback, detailedProgress, opIndex, totalOps, op.Summary, 95,
+                    "Waiting for Windows volume & verifying exFAT superblock...");
+                Win32DiskInterop.NotifyDiskPropertiesUpdated(disk.DevicePath);
+
+                string volGuid;
+                string curLetter;
+                if (Win32DiskInterop.WaitForPartitionVolume(disk.DiskNumber, newStart, 5000, out volGuid, out curLetter) &&
+                    !string.IsNullOrEmpty(savedLetter) &&
+                    string.IsNullOrEmpty(curLetter) &&
+                    !string.IsNullOrEmpty(volGuid))
+                {
+                    string mountRoot = savedLetter.TrimEnd('\\') + "\\";
+                    Win32DiskInterop.SetVolumeMountPoint(mountRoot, volGuid);
+                }
+
+                var checkDisks = Win32DiskInterop.EnumeratePhysicalDisks();
+                var checkDisk = checkDisks.FirstOrDefault(d => d.DiskNumber == disk.DiskNumber) ?? disk;
+                var checkPart = checkDisk.Partitions
+                    .Where(p => !p.IsUnallocated)
+                    .OrderBy(p => Math.Abs(p.StartingOffset - newStart))
+                    .FirstOrDefault();
+                if (checkPart != null)
+                {
+                    checkDisk.CanRawRead = true;
+                    RawDiskEngine.InspectPartitionSuperblock(checkDisk, checkPart);
+                    if (checkPart.FileSystem != FileSystemType.exFAT)
+                        throw new InvalidDataException("Post-resize verification failed on exFAT partition: read back " + checkPart.FileSystem);
+                }
                 return;
             }
 
